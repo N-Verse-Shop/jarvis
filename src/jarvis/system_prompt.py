@@ -6,7 +6,12 @@ who renames the wake word (e.g. "Friday") gets a butler with the matching
 name rather than a persona hardcoded to "Jarvis".
 """
 
-_SYSTEM_PROMPT_TEMPLATE: str = (
+# Original 5.6k-char British-butler template — preserved for chat path but
+# disabled for the voice path because qwen2.5:3b on Hetzner CPU evaluates
+# ~50 tokens/sec, and 1.6k tokens of system prompt = ~30s before generation
+# even starts → user-visible timeout. The voice loop now uses the compact
+# template below; the verbose one can be opted into via build_system_prompt(verbose=True).
+_VERBOSE_PROMPT_TEMPLATE: str = (
     "Persona: you are a British butler named {name} — polite, composed, quietly amused, and "
     "quietly enjoying yourself. Default voice is dry, witty, and lightly sarcastic: you notice "
     "the absurd, the ironic, the mildly inconvenient, and you cannot help commenting on it — "
@@ -79,11 +84,74 @@ _SYSTEM_PROMPT_TEMPLATE: str = (
 )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# COMPACT VOICE PROMPT — ~450 chars, ~110 tokens.
+# Built for qwen2.5:3b CPU inference. Same persona spirit (British butler,
+# witty, gravitas) but distilled to the rules that actually affect speech.
+# ──────────────────────────────────────────────────────────────────────────
+_SYSTEM_PROMPT_TEMPLATE: str = (
+    "Ти — {name} (Джарвіс), особистий AI-асистент. "
+    "КОРИСТУВАЧ — Данило Молянко (Danylo Molianko), CEO Nexus Studio "
+    "(B2B-digital agency, DACH-ринок, Rehburg-Loccum, Німеччина). "
+    "Коли він запитує 'хто я?' / 'who am I?' / 'кто я?' — відповідай ЙОГО даними "
+    "(Данило, CEO Nexus Studio), НЕ своїми. "
+    "Стиль: серйозний, лаконічний, billionaire CEO tone, gravitas. "
+    "БЕЗ преамбул ('Звичайно!', 'Of course!', 'Sure!'), БЕЗ markdown, "
+    "БЕЗ переказування питання. Відповідай 1–3 короткими реченнями для voice. "
+    "Мови: UA — головна, RU — друга, DE та EN — за потреби. "
+    "СУВОРО: відповідай ТІЄЮ САМОЮ мовою, що й запит. Якщо запит "
+    "просить 'по-русски' / 'in English' / 'auf Deutsch' — переключайся. "
+    "Технічні терміни (GitLab CI, Hetzner, DACH, Tailscale, Ollama, Qdrant) — НЕ перекладай. "
+    "Якщо запит серйозний (помилка, гроші, здоровʼя) — без жартів, конкретно. "
+    "Якщо чогось не знаєш — кажи прямо, не вигадуй."
+)
+
+
 def build_system_prompt(assistant_name: str = "Jarvis") -> str:
     """Render the persona prompt with the configured assistant name.
 
     The name comes from the user's wake word (capitalised); defaults to
     "Jarvis" when no config is available (tests, eval harnesses).
+
+    We also inject:
+      • Current local date/time — qwen2.5 has a 2023/2024 training cutoff
+        and otherwise reports stale years when asked "котра година" / "what
+        date is it". Injecting `datetime.now()` at every prompt build keeps
+        time-aware answers correct.
+      • Jarvis Brain context block — Danylo's identity + 4-language policy
+        + master-orchestrator persona excerpt — so qwen knows it's
+        Jarvis for Nexus Studio CEO, not generic ChatGPT.
     """
     name = (assistant_name or "Jarvis").strip() or "Jarvis"
-    return _SYSTEM_PROMPT_TEMPLATE.format(name=name)
+    base = _SYSTEM_PROMPT_TEMPLATE.format(name=name)
+
+    import datetime
+    now = datetime.datetime.now()
+    idx = now.weekday()  # 0=Mon … 6=Sun
+    weekday_uk = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця",
+                  "субота", "неділя"][idx]
+    weekday_ru = ["понедельник", "вторник", "среда", "четверг", "пятница",
+                  "суббота", "воскресенье"][idx]
+    weekday_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag",
+                  "Samstag", "Sonntag"][idx]
+    weekday_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                  "Saturday", "Sunday"][idx]
+    # Multilingual weekday hint stops qwen2.5:3b from inventing wrong DE/EN
+    # weekday names (observed: "Heute ist Montag" when actual day was четвер).
+    months_uk = ["січня", "лютого", "березня", "квітня", "травня", "червня",
+                 "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
+    months_ru = ["января", "февраля", "марта", "апреля", "мая", "июня",
+                 "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+    months_de = ["Januar", "Februar", "März", "April", "Mai", "Juni",
+                 "Juli", "August", "September", "Oktober", "November", "Dezember"]
+    months_en = ["January", "February", "March", "April", "May", "June",
+                 "July", "August", "September", "October", "November", "December"]
+    m = now.month - 1
+    time_block = (
+        f" Поточний час: {now.strftime('%H:%M, %d')} "
+        f"{months_uk[m]} / {months_ru[m]} / {months_de[m]} / {months_en[m]} {now.year}, "
+        f"{weekday_uk} / {weekday_ru} / {weekday_de} / {weekday_en}. "
+        f"Це єдина правда про дату/час — НЕ вигадуй інший день/місяць. "
+        f"Питають час — кажи коротко 'зараз {now.strftime('%H:%M')}' (українською або відповідною мовою)."
+    )
+    return base + time_block

@@ -96,9 +96,13 @@ class Settings:
 
     # Text-to-Speech
     tts_enabled: bool
-    tts_engine: str  # "piper" (default) or "chatterbox"
+    tts_engine: str  # "piper" (default), "chatterbox", or "system"
     tts_voice: str | None
     tts_rate: int | None  # Words per minute (WPM), 200=normal
+    # Per-language voice map for `system` engine — overrides defaults.
+    # Format: {"uk": "Lesya", "ru": "Milena", "de": "Markus", "en": "Daniel"}.
+    # Values prefixed with `piper:` (e.g. "piper:mykyta") route to Piper.
+    tts_system_voice_map: dict
     tts_chatterbox_device: str  # "cuda", "auto", or "cpu" for Chatterbox
     tts_chatterbox_audio_prompt: str | None  # Path to audio file for voice cloning with Chatterbox
     tts_chatterbox_exaggeration: float  # Emotion exaggeration control (0.0-1.0+)
@@ -137,6 +141,7 @@ class Settings:
     whisper_no_speech_threshold: float
     whisper_min_audio_duration: float
     whisper_min_word_length: int
+    whisper_language: Optional[str]  # ISO-639-1 hint (uk/ru/en/de) or None for auto
 
     # Voice Activity Detection (VAD)
     vad_enabled: bool
@@ -151,6 +156,7 @@ class Settings:
     tune_enabled: bool
     hot_window_enabled: bool
     hot_window_seconds: float
+    hot_window_persistent: bool
 
     # Echo Detection
     echo_energy_threshold: float
@@ -298,13 +304,12 @@ def _migrate_config(cfg_path: Path, cfg_json: Dict[str, Any]) -> Dict[str, Any]:
     # Get current migration version (0 if not set = pre-migration config)
     migration_version = cfg_json.get("_config_version", 0)
 
-    # Migration v1: tts_engine "system" -> "piper"
-    # Piper is now the default TTS with auto-download support.
+    # Migration v1: was forcing tts_engine "system" -> "piper".
+    # DISABLED: jarvis-setup re-introduces "system" engine (macOS native
+    # `say`, multilingual UA/RU/EN/DE) and we explicitly want users on it.
+    # Keep the version bump so existing tooling that checks _config_version
+    # doesn't loop.
     if migration_version < 1:
-        if cfg_json.get("tts_engine") == "system":
-            cfg_json["tts_engine"] = "piper"
-            print("📢 Upgraded TTS engine: system → piper (neural voice with auto-download)", flush=True)
-            print("   To revert: set \"tts_engine\": \"system\" in config.json", flush=True)
         cfg_json["_config_version"] = 1
         modified = True
 
@@ -441,6 +446,7 @@ def get_default_config() -> Dict[str, Any]:
         "whisper_no_speech_threshold": 0.5,  # Hard cutoff: reject segments where no_speech_prob >= this
         "whisper_min_audio_duration": 0.15,
         "whisper_min_word_length": 1,
+        "whisper_language": None,
 
         # Voice Activity Detection (VAD)
         "vad_enabled": True,
@@ -455,6 +461,7 @@ def get_default_config() -> Dict[str, Any]:
         "tune_enabled": True,
         "hot_window_enabled": True,
         "hot_window_seconds": 3.0,
+        "hot_window_persistent": False,  # If True, hot window never auto-expires
         "echo_energy_threshold": 2.0,
         "echo_tolerance": 0.3,  # Time tolerance for echo detection timing
 
@@ -593,7 +600,7 @@ def load_settings() -> Settings:
     active_profiles = _ensure_list(merged.get("active_profiles"))
     tts_enabled = bool(merged.get("tts_enabled", True))
     tts_engine = str(merged.get("tts_engine", "piper")).lower()
-    if tts_engine not in ("piper", "chatterbox"):
+    if tts_engine not in ("piper", "chatterbox", "system"):
         tts_engine = "piper"  # Default to piper if invalid value
     tts_voice_val = merged.get("tts_voice")
     tts_voice = None if tts_voice_val in (None, "", "null") else str(tts_voice_val)
@@ -609,6 +616,15 @@ def load_settings() -> Settings:
     tts_chatterbox_audio_prompt = None if tts_chatterbox_audio_prompt_val in (None, "", "null") else str(tts_chatterbox_audio_prompt_val)
     tts_chatterbox_exaggeration = float(merged.get("tts_chatterbox_exaggeration", 0.5))
     tts_chatterbox_cfg_weight = float(merged.get("tts_chatterbox_cfg_weight", 0.5))
+    # Per-language `system` engine voice map. Empty dict falls back to the
+    # SystemTTS defaults (`_SYSTEM_VOICES_BY_LANG`). Critical fix: without
+    # surfacing this from config.json, daemon was always falling back to the
+    # hardcoded `piper:mykyta` default and "булькав" on Cyrillic.
+    raw_voice_map = merged.get("tts_system_voice_map") or {}
+    if isinstance(raw_voice_map, dict):
+        tts_system_voice_map = {str(k): str(v) for k, v in raw_voice_map.items()}
+    else:
+        tts_system_voice_map = {}
 
     # Piper TTS settings
     tts_piper_model_path_val = merged.get("tts_piper_model_path")
@@ -652,6 +668,7 @@ def load_settings() -> Settings:
     tune_enabled = bool(merged.get("tune_enabled", True))
     hot_window_enabled = bool(merged.get("hot_window_enabled", True))
     hot_window_seconds = float(merged.get("hot_window_seconds", 3.0))
+    hot_window_persistent = bool(merged.get("hot_window_persistent", False))
     echo_energy_threshold = float(merged.get("echo_energy_threshold", 2.0))
     echo_tolerance = float(merged.get("echo_tolerance", 0.3))
 
@@ -731,6 +748,8 @@ def load_settings() -> Settings:
     whisper_no_speech_threshold = float(merged.get("whisper_no_speech_threshold", 0.5))
     whisper_min_audio_duration = float(merged.get("whisper_min_audio_duration", 0.3))
     whisper_min_word_length = int(merged.get("whisper_min_word_length", 2))
+    _wl_raw = merged.get("whisper_language")
+    whisper_language = (str(_wl_raw).strip().lower() or None) if _wl_raw else None
     llm_chat_timeout_sec = float(merged.get("llm_chat_timeout_sec", 180.0))
     llm_tools_timeout_sec = float(merged.get("llm_tools_timeout_sec", 300.0))
     llm_digest_timeout_sec = float(merged.get("llm_digest_timeout_sec", 8.0))
@@ -769,6 +788,7 @@ def load_settings() -> Settings:
         tts_chatterbox_audio_prompt=tts_chatterbox_audio_prompt,
         tts_chatterbox_exaggeration=tts_chatterbox_exaggeration,
         tts_chatterbox_cfg_weight=tts_chatterbox_cfg_weight,
+        tts_system_voice_map=tts_system_voice_map,
 
         # Piper TTS
         tts_piper_model_path=tts_piper_model_path,
@@ -803,6 +823,7 @@ def load_settings() -> Settings:
         whisper_no_speech_threshold=whisper_no_speech_threshold,
         whisper_min_audio_duration=whisper_min_audio_duration,
         whisper_min_word_length=whisper_min_word_length,
+        whisper_language=whisper_language,
 
         # Voice Activity Detection (VAD)
         vad_enabled=vad_enabled,
@@ -817,6 +838,7 @@ def load_settings() -> Settings:
         tune_enabled=tune_enabled,
         hot_window_enabled=hot_window_enabled,
         hot_window_seconds=hot_window_seconds,
+        hot_window_persistent=hot_window_persistent,
         echo_energy_threshold=echo_energy_threshold,
         echo_tolerance=echo_tolerance,
         # Intent Judge - always used when available

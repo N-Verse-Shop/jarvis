@@ -467,6 +467,11 @@ def main() -> None:
         piper_noise_scale=cfg.tts_piper_noise_scale,
         piper_noise_w=cfg.tts_piper_noise_w,
         piper_sentence_silence=cfg.tts_piper_sentence_silence,
+        # CRITICAL: pass through the per-language voice map. Without this,
+        # SystemTTS falls back to its hardcoded defaults (`piper:mykyta` for UA)
+        # which булькає on Cyrillic. With this, the daemon uses whatever the
+        # user configured in `tts_system_voice_map` (e.g. Lesya UA / Milena RU).
+        system_voice_map=cfg.tts_system_voice_map,
     )
     _global_tts_engine = tts  # Expose for face widget speaking animation
     if tts.enabled:

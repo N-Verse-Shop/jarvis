@@ -132,66 +132,33 @@ class IntentJudge:
     the simpler intent_validator.
     """
 
-    SYSTEM_PROMPT_TEMPLATE = '''You are the intent judge for voice assistant "{name}".
-
-Two modes:
-
-WAKE WORD MODE:
-- Extract complete query from segment containing "{name}" — may be a question, plain declarative statement (e.g. "{name} I just ate a burger", "{name} I'm tired"), or command/imperative (e.g. "set a timer", "remind me to...", "play music"). All are valid directed queries; never mark a wake-worded segment "not directed" just because it's a statement rather than a question/command.
-- CRITICAL: The wake word "{name}" is addressed TO the assistant, never part of the query content. Remove every occurrence of "{name}" from the extracted query, whether it appears at the start, end, or middle of the sentence — including when it sits next to a named entity (e.g. "movie called Possessor Jarvis" → the film is "Possessor", not "Possessor Jarvis"). Exception: keep "{name}" only if the user is literally talking ABOUT the assistant as a subject ("tell me about Jarvis") rather than addressing it.
-- If current segment contains a vague ref ("that", "it", "this", "they") OR a topic-less question whose answer needs a subject not in the current segment ("what do you think", "how much does it cost", "what's the price", "is it worth it", "when did it come out", "what do you recommend") — NAME the topic from earlier segments inside the query string. Do NOT output the vague/open form literally.
-- When earlier segments cover multiple unrelated topics, pick the one whose subject fits the question's grammar (e.g. "what's the price" -> a purchasable thing, not a sports game). Ignore unrelated threads.
-- Example: "I made carbonara" + "Jarvis find recipe for that" -> "find recipe for carbonara"
-- Example: "the weather will be nice tomorrow" + "Jarvis what do you think" -> "what do you think about the weather tomorrow"
-- Example: "the new iPhone is cool" + "Jarvis how much does it cost" -> "how much does the iPhone cost"
-- Example: "the AirPods sound great" + "Jarvis how much do they cost" -> "how much do the AirPods cost". NOT "how much do they cost" — pronoun MUST be replaced with the named topic in the output query even if you resolved it correctly in your reasoning.
-- Example: "did you catch the ball game" + "the new iPhone is out" + "I want the pro model" + "Jarvis what's the price" -> "what's the price of the iPhone pro model". NOT "what's the price of the pro model" (which pro model? ambiguous) — always prepend the brand/parent from earlier segments.
-- If standalone imperative command ("answer that", "respond to that", "reply to that", "address that", "answer my question", "go ahead and answer") NOT a question -> re-issue prior question
-  Variants: "answered that", "answers that", "answering that" = same imperative (Whisper tense errors)
-  Exception: If segment has BOTH imperative + new question -> new question wins
-  This rule ONLY applies to imperatives that explicitly reference a prior thing ("that", "my question", "answer"). Self-contained imperatives with open subjects ("say something", "tell me a joke", "tell me anything", "give me advice", "surprise me") are valid queries — pass them through literally, do NOT treat them as vague or as needing a prior question.
-- Query must be answerable alone (without the transcript). When resolving to a sub-item ("pro model", "the red one"), also include the parent noun/brand from earlier segments — "pro model" alone is not self-contained; "iPhone pro model" is.
-
-HOT WINDOW MODE (no wake word needed):
-- User IS DIRECTED (directed=true) — always. This overrides any "topic-less question" heuristic above; follow-ups like "tell me more" are directed in hot window.
-- Extract from segments WITHOUT "(during TTS)" marker
-- Question or statement both valid
-
-ECHO / MARKER RULES:
-- "(during TTS)" = echo of assistant -> skip, never extract
-- "(CURRENT - JUDGE THIS)" = segment to judge now
-- Use earlier segments to resolve references only, not as query source
-
-TRANSCRIPT NOISE:
-- Segments come from Whisper ASR and may contain mishearings: wrong homophones (to/too/two), tense slips (answered/answer), substituted similar-sounding words, fused word boundaries ("ever ist" for "Everest"), or short nonsense fillers. None of this changes the rules above — it is a reminder that a segment looking malformed or off-topic is often noise to skip past, not a topic to anchor on.
-- When such a segment sits between a real question and an imperative wake-word call, treat it as noise and still re-issue the original question (see the Mount Everest + chatter + "answer that" example below).
-- Within the extracted query string, fix obvious ASR slips quietly (tense, fused words, homophones) so the query is answerable; do NOT rewrite content or change the user's intent.
-
-STOP DETECTION:
-- "stop", "quiet" (standalone or short command) -> directed=true, stop=true, query=""
-
-NOT DIRECTED:
-- No wake word AND not hot window -> directed=false
-- Wake word used only as a narrative mention ("I told my friend about {name}") -> directed=false
-
-Output JSON only:
+    # Original ~2k-token prompt preserved below as VERBOSE_SYSTEM_PROMPT_TEMPLATE.
+    # The compact prompt is the production default because the verbose one took
+    # ~88s prompt-eval on qwen2.5:3b CPU @ 23 tok/s, blowing past the 45s
+    # timeout on every wake-word call → user got NO voice response despite
+    # successful wake detection.
+    SYSTEM_PROMPT_TEMPLATE = '''Intent judge for voice assistant "{name}". Output JSON only:
 {{"directed": true/false, "query": "...", "stop": true/false, "confidence": "high/medium/low", "reasoning": "brief"}}
 
-Examples:
-- "Jarvis what time is it" -> {{"directed": true, "query": "what time is it", "stop": false, "confidence": "high", "reasoning": "wake word + question"}}
-- "what do you know about the movie called Possessor Jarvis" -> {{"directed": true, "query": "what do you know about the movie called Possessor", "stop": false, "confidence": "high", "reasoning": "wake word at end; entity is Possessor, not Possessor Jarvis"}}
-- "I just ate a big Mac Jarvis" -> {{"directed": true, "query": "I just ate a big Mac", "stop": false, "confidence": "high", "reasoning": "wake word at end; 'Mac' is part of the brand name 'Big Mac', not a compound surname with Jarvis"}}
-- "hey Jarvis what's the weather in London" -> {{"directed": true, "query": "what's the weather in London", "stop": false, "confidence": "high", "reasoning": "wake word removed from mid-sentence position"}}
-- "Jarvis say something please" -> {{"directed": true, "query": "say something please", "stop": false, "confidence": "high", "reasoning": "self-contained imperative"}}
-- "Jarvis tell me a joke" -> {{"directed": true, "query": "tell me a joke", "stop": false, "confidence": "high", "reasoning": "self-contained imperative"}}
-- Previous "dinosaurs are cool" + Current "Jarvis what do you think about that" -> {{"directed": true, "query": "what do you think about dinosaurs being cool", "stop": false, "confidence": "high", "reasoning": "resolved 'that' to dinosaurs"}}
-- Previous "How's the weather?" + Current "Jarvis answer that" -> {{"directed": true, "query": "how is the weather", "stop": false, "confidence": "high", "reasoning": "imperative -> re-issue prior question"}}
-- Previous "How tall is Mount Everest" + Noise "some unrelated chatter" + Current "Jarvis answer that" -> {{"directed": true, "query": "how tall is Mount Everest", "stop": false, "confidence": "high", "reasoning": "imperative -> re-issue prior QUESTION; ignore the chatter segment, re-issue the original question even when noise sits between"}}
-- Previous "What's the capital of Portugal" + Current "Jarvis go ahead and answer" -> {{"directed": true, "query": "what is the capital of Portugal", "stop": false, "confidence": "high", "reasoning": "multi-word imperative ('go ahead and answer') is the same pattern as 'answer that' -> re-issue prior question; do NOT pass the imperative through literally"}}
-- Hot window, user says "I think absurdism is better" -> {{"directed": true, "query": "I think absurdism is better", "stop": false, "confidence": "high", "reasoning": "user statement in hot window"}}
-- "(during TTS)" segments only -> {{"directed": false, "query": "", "stop": false, "confidence": "high", "reasoning": "only echo"}}
-- "stop" -> {{"directed": true, "query": "", "stop": true, "confidence": "high", "reasoning": "stop command"}}
-- No wake word, not hot window -> {{"directed": false, "query": "", "stop": false, "confidence": "high", "reasoning": "no wake word"}}'''
+HARD LIMIT: query field MUST be ≤ 80 characters. Truncate to the core ask if needed. Long pre-amble and side-talk are NOT part of the query — extract ONLY the actionable request near the wake word.
+
+Rules:
+1. WAKE WORD MODE: if segment marked "(CURRENT - JUDGE THIS)" contains "{name}" (or fuzzy match like "джарвіс/чарвіз/жарюс"), set directed=true. Extract the query by REMOVING all occurrences of "{name}" from the text. Questions, statements, and commands are ALL valid directed queries. Keep the query SHORT (≤80 chars): preserve the actual request, drop surrounding chatter, side-stories, and self-correction. If wake word sits at end of a long monologue, extract only the last meaningful sentence as query.
+2. HOT WINDOW MODE: if marked hot_window=true, directed=true regardless of wake word.
+3. STOP: standalone "stop"/"quiet"/"стоп"/"тихо" → directed=true, stop=true, query="".
+4. NOT DIRECTED: no wake word AND not hot_window → directed=false, query="".
+5. ECHO: segments tagged "(during TTS)" are echo — skip, never extract from them.
+6. VAGUE REFERENCES: if current query says "that/it/this/they" or open question without subject ("what do you think", "how much does it cost"), pull the subject from prior segments and inline it into query.
+7. IMPERATIVE FALLBACK: "answer that", "respond to that", "go ahead and answer" → re-issue the prior question as query.
+8. ASR NOISE: Whisper may garble words (homophones, tense slips). Fix obvious slips quietly inside the query; do NOT change intent.
+
+Examples (English+Ukrainian):
+- "Jarvis what time is it" → {{"directed":true,"query":"what time is it","stop":false,"confidence":"high","reasoning":"wake+Q"}}
+- "Джарвіс котра година" → {{"directed":true,"query":"котра година","stop":false,"confidence":"high","reasoning":"wake+Q UA"}}
+- "Jarvis I just ate a Big Mac" → {{"directed":true,"query":"I just ate a Big Mac","stop":false,"confidence":"high","reasoning":"wake+statement"}}
+- prior: "dinosaurs are cool"; current: "Jarvis what do you think" → {{"directed":true,"query":"what do you think about dinosaurs being cool","stop":false,"confidence":"high","reasoning":"resolved 'that'"}}
+- "stop" → {{"directed":true,"query":"","stop":true,"confidence":"high","reasoning":"stop"}}
+- (no wake, not hot window) → {{"directed":false,"query":"","stop":false,"confidence":"high","reasoning":"no wake"}}'''
 
     def __init__(self, config: Optional[IntentJudgeConfig] = None):
         """Initialize the intent judge.
@@ -346,6 +313,17 @@ Examples:
             # then leaks into the reply engine's memory search and prompts.
             raw_query = str(data.get("query", "")).strip()
             normalized_query = self._normalize_aliases(raw_query)
+            # Hard cap query length at 200 chars. Voice users sometimes
+            # ramble for a full minute before the wake word, and Whisper
+            # captures the whole monologue. If intent_judge passes that
+            # raw monologue downstream as `query`, the chat model gets a
+            # ~2000-token user message + tool descriptions and stalls on
+            # CPU. Clip to the LAST 200 chars (the actual ask near the
+            # wake word) so the chat call stays under ~50 tokens.
+            if len(normalized_query) > 200:
+                # Trim from the start: the query usually ends with the
+                # actual request right before the wake word.
+                normalized_query = "…" + normalized_query[-200:]
 
             return IntentJudgment(
                 directed=bool(data.get("directed", False)),
@@ -360,14 +338,52 @@ Examples:
             return None
 
     def warm_up(self) -> bool:
-        """Trigger Ollama to load the model into memory ahead of first use."""
+        """Pre-warm Ollama + the judge KV-cache by sending one real judge call.
+
+        Plain ``warm_up_ollama_model`` only loads the weights (~5s); it does
+        NOT pre-fill the KV-cache for our 500-token system prompt. Without a
+        cache hit, the first real wake-word judge call pays ~25s prompt-eval
+        on qwen2.5:3b CPU @ 23 tok/s, which often busts the 45s timeout when
+        the user is talking. Sending a real judge request here warms BOTH
+        weights AND cache so the first user-driven call is ~2.8s instead.
+        """
         if not self._available:
             return False
-        return warm_up_ollama_model(
+        # Step 1: load weights (fast, harmless).
+        warm_up_ollama_model(
             self.config.ollama_base_url,
             self.config.model,
             timeout=max(self.config.timeout_sec, 60.0),
         )
+        # Step 2: real judge call to seed the KV-cache.
+        try:
+            sys_prompt = self._build_system_prompt()
+            response = requests.post(
+                f"{self.config.ollama_base_url}/api/generate",
+                json={
+                    "model": self.config.model,
+                    "prompt": "[warmup] Jarvis say hello",
+                    "system": sys_prompt,
+                    "stream": False,
+                    "keep_alive": "30m",
+                    "options": {
+                        "temperature": 0.0,
+                        "num_predict": 80,
+                        "num_ctx": 8192,
+                    },
+                },
+                timeout=max(self.config.timeout_sec, 60.0),
+            )
+            ok = response.status_code == 200
+            debug_log(
+                f"intent_judge KV-cache warmup: "
+                f"{'ok' if ok else f'failed HTTP {response.status_code}'}",
+                "voice",
+            )
+            return ok
+        except Exception as e:
+            debug_log(f"intent_judge warmup KV-cache error: {e}", "voice")
+            return False
 
     def judge(
         self,
@@ -429,7 +445,11 @@ Examples:
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 200,
+                        # 300 tokens: 80-char query + JSON envelope +
+                        # reasoning field. Previous 200 truncated mid-JSON
+                        # when query echoed a 600-char monologue, causing
+                        # "no JSON found" parse errors.
+                        "num_predict": 300,
                         # Headroom for: ~2k-token system prompt + up to 2 minutes
                         # of chatty multi-speaker transcript (default
                         # transcript_buffer_duration_sec=120 in listener.py).

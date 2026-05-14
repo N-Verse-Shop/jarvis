@@ -78,6 +78,46 @@ def _is_apple_silicon() -> bool:
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
+# Single source of truth for the voice-mode system prompt. Used by
+# both _voice_direct_chat() and _start_llm_warmup() so the KV-cache
+# prefix HITS on every real voice turn (prompt-eval drops from
+# 15-25s cold to 1-3s warm on qwen2.5:7b @ Hetzner CCX23 CPU).
+#
+# Keep this STATIC. Dynamic content (language directive, history,
+# query) is appended in separate messages — they evaluate fast
+# without re-evaluating this 500-token prefix.
+VOICE_STATIC_SYSTEM_PROMPT = (
+    "Ти — Джарвіс, особистий AI-асистент Данила Молянка. "
+    "Контекст: Данило Молянко, директор агентства Nexus Studio "
+    "(B2B digital innovation, Rehburg-Loccum, Німеччина, DACH-ринок). "
+    "Стек: Shopify Hydrogen + Cloudflare (IBONS), "
+    "React Native + Expo (Nexus Mobile), Render.com (Founder Cockpit).\n\n"
+    "Як відповідати (голосовий формат — слухаються вголос):\n"
+    "1. ЗМІСТОВНО і КОНКРЕТНО: факти, числа, кроки.\n"
+    "2. Без слів-наповнювачів ('Добре,', 'Зрозумів,', 'Звичайно,').\n"
+    "3. Не знаєш точно — почни з 'Не знаю напевно' (сигнал для веб-пошуку).\n"
+    "4. Без markdown, emoji, формул, посилань.\n"
+    "5. Без повторів вже сказаного.\n"
+    "6. Тон: професійний, дружній технічний радник.\n\n"
+    "ТВОЇ MAC-ДІЇ (для команд керування ПК):\n"
+    "Коли користувач просить дію — скажи рівно одну фразу-тригер, "
+    "потім чекай слова 'виконуй'. Якщо запит вже містить 'виконуй' — дій одразу.\n"
+    "• 'Зараз відкрию <Назва>' (Safari, Telegram, Notion, Mail, VS Code…)\n"
+    "• 'Зараз відкрию <URL>' (наприклад github.com)\n"
+    "• 'Шукаю в Google: <запит>'\n"
+    "• 'Зроблю скріншот'\n"
+    "• 'Запишу нотатку: <текст>'\n"
+    "• 'Поставлю гучність <0-100>' / 'Вимкну звук' / 'Увімкну звук'\n"
+    "• 'Запущу музику' / 'Спаузу музику' / 'Наступний трек'\n"
+    "• 'Прочитаю буфер обміну' / 'Скопіюю в буфер: <текст>'\n"
+    "• 'Знайду <запит>' (Spotlight)\n"
+    "• 'Заблокую екран'\n"
+    "• 'Напишу листа' / 'Напишу листа до <email>'\n"
+    "• 'Подивлюся котра година' / 'Перевірю рівень батареї'\n"
+    "Поза цим списком — 'Поки що я цього не вмію'."
+)
+
+
 def _get_mic_permission_hint() -> str:
     """Return platform-appropriate microphone permission guidance."""
     if sys.platform == 'win32':
@@ -409,7 +449,8 @@ class VoiceListener(threading.Thread):
             hot_window_seconds=float(getattr(self.cfg, "hot_window_seconds", 3.0)),
             echo_tolerance=float(getattr(self.cfg, "echo_tolerance", 0.3)),
             voice_collect_seconds=float(getattr(self.cfg, "voice_collect_seconds", 2.0)),
-            max_collect_seconds=float(getattr(self.cfg, "voice_max_collect_seconds", 60.0))
+            max_collect_seconds=float(getattr(self.cfg, "voice_max_collect_seconds", 60.0)),
+            hot_window_persistent=bool(getattr(self.cfg, "hot_window_persistent", False)),
         )
 
         # Energy tracking for echo detection
@@ -433,6 +474,126 @@ class VoiceListener(threading.Thread):
 
         # Thinking tune player
         self._tune_player: Optional = None
+
+        # Active reply language. Defaults to UA. Switched explicitly via
+        # detect_language_switch() + user confirmation. Resets to UA on
+        # force_end_session().
+        self._active_language: str = "uk"
+        self._pending_lang_switch: Optional[str] = None
+        self._pending_action = None
+        self._pending_upgrade = None
+        self._pending_confirmation = None
+
+        # Persistent dialog memory — JSONL file in ~/.config/jarvis/memory/.
+        # User asked: "нехай зробиться окремий мозочок ... він там записує
+        # всі наші розмови в зжатому форматі щоб він завжди міг памятати
+        # контекст за нашу сесію та між сесіями".
+        # Each user/assistant exchange is appended as one JSON line, and
+        # the most recent N pairs are auto-loaded at startup so Jarvis
+        # remembers across daemon restarts. Compression: we keep only the
+        # text (no metadata bloat) and the per-line tail-load is O(1).
+        self._init_persistent_memory()
+
+    def _init_persistent_memory(self) -> None:
+        """Load recent dialog history from the persistent memory file.
+
+        Writes go to one JSONL per calendar day so we can rotate easily.
+        On startup we load the most recent 8 exchanges (16 messages) so
+        the model has context immediately — no cold start required.
+        """
+        import os
+        import json
+        from datetime import datetime
+        mem_dir = os.path.expanduser("~/.config/jarvis/memory")
+        try:
+            os.makedirs(mem_dir, exist_ok=True)
+        except Exception as e:
+            debug_log(f"could not create memory dir: {e}", "voice")
+            self._dialog_history: list[dict] = []
+            self._memory_file = None
+            return
+        # One file per day — keeps individual files manageable.
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._memory_file = os.path.join(mem_dir, f"dialog-{today}.jsonl")
+        # Also remember yesterday's file for cross-day context loading.
+        loaded: list[dict] = []
+        # Load most recent across last 2 days (today + yesterday).
+        files_to_load: list[str] = []
+        try:
+            all_files = sorted(
+                [f for f in os.listdir(mem_dir) if f.startswith("dialog-") and f.endswith(".jsonl")],
+                reverse=True,
+            )
+            files_to_load = [os.path.join(mem_dir, f) for f in all_files[:2]]
+        except Exception:
+            pass
+        for path in reversed(files_to_load):  # oldest first so latest end up at tail
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if obj.get("role") in ("user", "assistant") and obj.get("content"):
+                                loaded.append({"role": obj["role"], "content": obj["content"]})
+                        except Exception:
+                            continue
+            except Exception as e:
+                debug_log(f"failed to load memory from {path}: {e}", "voice")
+        # Keep only most recent 16 messages (8 pairs).
+        recent = loaded[-16:]
+        # Filter out contaminated non-Ukrainian entries — they pollute
+        # the model's language anchor (it sees RU/EN in history and
+        # switches modes). We're strict: drop any assistant message
+        # without at least 3 distinct Cyrillic UA characters
+        # (а-я,А-Я + ї/є/і/ґ). User messages we keep regardless (the
+        # user is allowed to speak any language).
+        ua_chars = set("абвгґдеєжзиіїйклмнопрстуфхцчшщьюяАБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ")
+        def _is_ua(text: str) -> bool:
+            if not text:
+                return False
+            hits = sum(1 for c in text if c in ua_chars)
+            return hits >= 3
+        cleaned: list[dict] = []
+        dropped = 0
+        for m in recent:
+            if m["role"] == "user":
+                cleaned.append(m)
+            elif _is_ua(m["content"]):
+                cleaned.append(m)
+            else:
+                dropped += 1
+        self._dialog_history: list[dict] = cleaned
+        debug_log(
+            f"persistent memory loaded: {len(self._dialog_history)} messages "
+            f"from {len(files_to_load)} file(s) (dropped {dropped} non-UA)",
+            "voice",
+        )
+
+    def _persist_memory_pair(self, query: str, reply: str) -> None:
+        """Append a (user, assistant) pair to today's memory file.
+
+        One JSON object per line, atomic append. Failure is logged but
+        non-fatal — we never block the voice loop on disk errors.
+        """
+        if not self._memory_file:
+            return
+        import json
+        import time as _t
+        try:
+            with open(self._memory_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"role": "user", "content": query, "ts": _t.time()},
+                    ensure_ascii=False,
+                ) + "\n")
+                f.write(json.dumps(
+                    {"role": "assistant", "content": reply, "ts": _t.time()},
+                    ensure_ascii=False,
+                ) + "\n")
+        except Exception as e:
+            debug_log(f"failed to persist memory: {e}", "voice")
 
     def stop(self) -> None:
         """Stop the voice listener."""
@@ -497,6 +658,21 @@ class VoiceListener(threading.Thread):
         # Track TTS finish time for echo detection
         self.echo_detector.track_tts_finish()
 
+        # Push HUD to LISTENING immediately — don't wait for the
+        # echo_tolerance delay (which would flash IDLE in between).
+        # User complaint: "після короткої відповіді він всерівно
+        # згортається і відкривається по новому". The state_manager's
+        # delayed _activate() would set LISTENING after echo_tolerance,
+        # but in the meantime SPEAKING→IDLE→LISTENING was visible as
+        # a coin pop. Setting LISTENING here closes the gap.
+        try:
+            from desktop_app.face_widget import get_jarvis_state, JarvisState
+            get_jarvis_state().set_state(JarvisState.LISTENING)
+        except ImportError:
+            pass
+        except Exception as e:
+            debug_log(f"failed to pre-set HUD to LISTENING after TTS: {e}", "voice")
+
         # Schedule delayed hot window activation
         debug_log(f"scheduling hot window activation (echo_tolerance={self.state_manager.echo_tolerance}s, hot_window={self.state_manager.hot_window_seconds}s)", "voice")
         self.state_manager.schedule_hot_window_activation(self.cfg.voice_debug)
@@ -522,6 +698,13 @@ class VoiceListener(threading.Thread):
 
         text_lower = text.strip().lower()
 
+        # Block known-bad Whisper hallucination patterns BEFORE any further
+        # processing — they spam intent-judge / fuzzy passes with garbage.
+        if self._is_known_hallucination(text):
+            debug_log(f"rejected known hallucination: '{text[:80]}...'", "voice")
+            self.state_manager.check_hot_window_expiry(self.cfg.voice_debug)
+            return
+
         # Reset wake timestamp — it must reflect only the current utterance.
         # If this utterance contains a wake word, the early-beep check below
         # will set it. Without this reset, a prior rejected wake-worded
@@ -535,6 +718,44 @@ class VoiceListener(threading.Thread):
 
         # Track if this input was received during TTS (for logging purposes)
         received_during_tts = self.tts and self.tts.is_speaking()
+
+        # ─── PRE-EMPTIVE WAKE-WORD INTERRUPT ────────────────────────────
+        # User asked: "коли я знову говорю йому Джарвіс він повинен
+        # зупинятися і починати слухати". Previous wake-interrupt check
+        # ran AFTER echo-rejection — but echo-rejection sometimes
+        # classified "Джарвіс" as part of the TTS echo and dropped it
+        # before the wake check ever ran. So we now check FIRST, before
+        # any echo logic, whenever TTS is speaking. If we see a wake
+        # word, abort TTS and treat the remainder as the new query.
+        if received_during_tts:
+            _ww = getattr(self.cfg, "wake_word", "jarvis")
+            _wal = list(set(getattr(self.cfg, "wake_aliases", [])) | {_ww})
+            _wfr = float(getattr(self.cfg, "wake_fuzzy_ratio", 0.78))
+            if is_wake_word_detected(text_lower, _ww, _wal, _wfr):
+                debug_log(f"pre-emptive wake-interrupt during TTS: '{text_lower[:60]}'", "voice")
+                print(f"  ⏸  Wake interrupt: \"{text_lower[:60]}\"", flush=True)
+                if self.tts:
+                    self.tts.interrupt()
+                try:
+                    while not self._audio_q.empty():
+                        self._audio_q.get_nowait()
+                except Exception:
+                    pass
+                # Clear echo-detector's "last_tts" so the next utterance
+                # isn't classified as echo of the interrupted TTS.
+                try:
+                    self.echo_detector._last_tts_text = ""
+                except Exception:
+                    pass
+                from .wake_detection import extract_query_after_wake
+                extracted = extract_query_after_wake(text_lower, _ww, _wal).strip()
+                if extracted and len(extracted) > 2:
+                    self._dispatch_query(extracted)
+                else:
+                    # Just the wake word — open collection for follow-up.
+                    self.state_manager.start_collection("")
+                    self._set_face_state_listening()
+                return
 
         # --- Early echo check + early beep ---
         # Check for echo BEFORE starting beep and BEFORE intent judge.
@@ -615,6 +836,40 @@ class VoiceListener(threading.Thread):
                     self._start_thinking_tune()
                     self._set_face_state_listening()
                     debug_log("early beep: wake word detected", "voice")
+
+        # Session-end stop commands — UA "стоп"/"досить"/"тиша"/"завершити сесію".
+        # These work BOTH during TTS (interrupt + end session) AND during
+        # hot window (just end session). They're the only voice path out
+        # of a persistent hot window.
+        session_stop_words = getattr(
+            self.cfg, "session_stop_commands",
+            [
+                "стоп", "досить", "тиша", "замовкни",
+                "завершити сесію", "вимкнись", "відбій",
+                "stop session", "end session",
+            ],
+        )
+        if is_stop_command(text_lower, session_stop_words):
+            debug_log(f"session-stop command detected: '{text_lower}'", "voice")
+            print(f"  🛑 Session stop: \"{text_lower[:60]}\"", flush=True)
+            if self.tts and self.tts.enabled and self.tts.is_speaking():
+                self.tts.interrupt()
+            # Wipe dialog history — new session starts with a clean slate
+            # so old context doesn't leak into the next wake.
+            if hasattr(self, "_dialog_history"):
+                self._dialog_history.clear()
+            # Reset language to UA default and clear any pending states.
+            self._active_language = "uk"
+            self._pending_lang_switch = None
+            self._pending_action = None
+            self._pending_upgrade = None
+            self.state_manager.force_end_session()
+            try:
+                while not self._audio_q.empty():
+                    self._audio_q.get_nowait()
+            except Exception:
+                pass
+            return
 
         # Echo rejection & stop commands — only while TTS is actively playing.
         # After TTS finishes, the intent judge handles everything (echo detection,
@@ -738,6 +993,105 @@ class VoiceListener(threading.Thread):
                 f"(ambient: \"{text_lower[:40]}{'...' if len(text_lower) > 40 else ''}\")",
                 "voice",
             )
+
+        # Wake-word FAST-PATH — skip the intent judge entirely when the
+        # wake word fired AT THE START of the current utterance. Background:
+        # on shared-model setups (qwen2.5:3b for both chat AND judge), the
+        # chat warmup evicts the judge's prefix from Ollama's single
+        # KV-cache slot. The first post-warmup wake-word judge call then
+        # pays ~30-40s for cold-cache re-evaluation, which the user
+        # experiences as "Джарвіс дуже довго включає". Skipping the judge
+        # for vocative wake-word matches (where the user is calling out to
+        # Jarvis at the start of their utterance) saves 30-40s.
+        #
+        # Critically, we MUST NOT fast-path a wake-word match buried mid-
+        # sentence — that's almost always referential speech ("сказав
+        # Джарвісу", "це Джарвіс був") or a household member discussing
+        # the daemon, not a directed query. In those cases the leading
+        # words ARE NOT a question for Jarvis. Fall through to the regular
+        # intent-judge path which has the LLM context to decide.
+        if (
+            self._wake_timestamp is not None
+            and not could_be_hot_window
+            and not is_speaking_now
+        ):
+            from .wake_detection import extract_query_after_wake
+            wake_word = getattr(self.cfg, "wake_word", "jarvis")
+            aliases = list(set(getattr(self.cfg, "wake_aliases", [])) | {wake_word})
+            stripped = extract_query_after_wake(text_lower, wake_word, aliases).strip()
+
+            # Decide whether this is a vocative wake (Jarvis at start of
+            # utterance, possibly followed by a question) or a mid-sentence
+            # mention. We look at the FIRST ~30 chars of the original text:
+            # if the wake-word alias appears there, treat as vocative.
+            head = text_lower[:30].lower()
+            is_vocative = False
+            for alias in aliases:
+                if alias.lower() in head:
+                    is_vocative = True
+                    break
+            # Also catch Whisper mishearings that fuzzy/prefix matcher saw
+            # but that aren't in our alias list (e.g. "джагвис", "жаріс").
+            # Heuristic: if the first word is short (3-9 chars) and starts
+            # with one of the wake-sound prefixes, treat as vocative.
+            if not is_vocative:
+                first_word = head.split()[0] if head.split() else ""
+                if (3 <= len(first_word) <= 9
+                        and first_word[0] in "jyчжяeх"
+                        or first_word.startswith(("дж", "ya", "ja"))):
+                    is_vocative = True
+
+            if not is_vocative:
+                # Mid-sentence reference — let the LLM judge decide. Don't
+                # consume the wake timestamp; let the judge see it.
+                debug_log(
+                    f"wake-word fast-path skipped: not vocative "
+                    f"(head: \"{head}\"), falling through to judge",
+                    "voice",
+                )
+            else:
+                # Vocative wake. Extract follow-up:
+                # 1. Take portion after the matched wake fragment.
+                # 2. If the result is suspiciously long (>60 chars), the
+                #    extraction probably failed to find the right boundary
+                #    (fuzzy match wasn't in alias list). Treat as bare
+                #    wake — enter empty collection mode.
+                extracted = stripped
+                if len(extracted) > 60:
+                    debug_log(
+                        f"wake-word fast-path: extracted text too long "
+                        f"({len(extracted)} chars), treating as bare wake "
+                        f"and entering listen mode",
+                        "voice",
+                    )
+                    extracted = ""
+
+                debug_log(
+                    f"wake-word fast-path: judge skipped, extracted='{extracted}'",
+                    "voice",
+                )
+                print(f"  ⚡ Wake fast-path: \"{extracted}\"" if extracted
+                      else "  ⚡ Wake fast-path: (listening for query)", flush=True)
+                self.state_manager.cancel_hot_window_activation()
+                self._transcript_buffer.mark_segment_processed(text_lower)
+                self._clear_audio_buffers()
+                self._wake_timestamp = None  # consumed
+                if extracted:
+                    # We have a full query already ("Джарвіс, привіт" →
+                    # "привіт"). Dispatch IMMEDIATELY — skipping the 1s
+                    # collection wait that's only useful when we need to
+                    # collect a follow-up utterance. This is the path
+                    # that gives sub-1s perceived response on canned
+                    # greetings.
+                    self._dispatch_query(extracted)
+                else:
+                    # User said just "Джарвіс" with no follow-up. Enter
+                    # collection mode so the NEXT utterance becomes the
+                    # query. Collection timeout (configurable, default
+                    # 1.0s) decides when to give up and TTS an ack.
+                    self.state_manager.start_collection(extracted)
+                    self._start_thinking_tune()
+                return
 
         if (
             not skip_intent_judge_during_tts
@@ -1159,6 +1513,654 @@ class VoiceListener(threading.Thread):
         else:
             debug_log(f"input ignored (no wake word{intent_info}): {text_lower}", "voice")
 
+    def _voice_direct_chat(self, query: str) -> str:
+        """Direct LLM chat call with minimal system prompt for voice speed.
+
+        Bypasses the full reply engine (which loads persona + memory digest +
+        graph context + tool descriptions = ~3000-token system prompt that
+        takes 120-240s prompt-eval on qwen2.5:3b CPU). Uses a tiny system
+        prompt + a rolling history of the last N turns so Джарвіс actually
+        remembers what we just discussed within a session.
+
+        Returns the assistant reply, or "" on failure (caller falls back to
+        an apology TTS).
+        """
+        if not query or not query.strip():
+            return ""
+
+        import requests
+        import time as _time
+
+        base_url = getattr(self.cfg, "ollama_base_url", "")
+        model = getattr(self.cfg, "ollama_chat_model", "qwen2.5:3b")
+        if not base_url:
+            return ""
+
+        # Voice-mode system prompt. KV-cache OPTIMIZATION: this whole
+        # block is STATIC (byte-identical across calls and matches the
+        # warmup in _start_llm_warmup). Dynamic content (lang switch,
+        # history, query) goes into separate messages BELOW the static
+        # system prompt, so the prefix cache keeps hitting on every
+        # voice turn — cuts prompt-eval from 15-25s to 1-3s.
+        #
+        # Module-level constant VOICE_STATIC_SYSTEM_PROMPT keeps this
+        # the single source of truth across direct-chat and warmup.
+        system_prompt = VOICE_STATIC_SYSTEM_PROMPT
+
+        # Language is dynamic (UA default, RU/EN/DE on explicit switch)
+        # — passed as a SEPARATE system message so it doesn't bust the
+        # cache on the main prompt. ~30 tokens, evals in <1s.
+        lang_directive = self._language_directive(getattr(self, "_active_language", "uk"))
+
+        # Build messages with rolling dialog history so the model has
+        # context across turns AND across sessions (persistent memory
+        # loaded at startup from ~/.config/jarvis/memory/dialog-YYYY-MM-DD.jsonl).
+        # We pass the last 10 messages (5 pairs) — fits easily in
+        # num_ctx=2560 along with system prompts + current query.
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": lang_directive},
+        ]
+        messages.extend(self._dialog_history[-10:])
+        messages.append({"role": "user", "content": query})
+
+        try:
+            t0 = _time.time()
+            # STREAMING mode: ollama emits NDJSON, each line is a partial
+            # `{"message":{"content":"..."}}`. We accumulate content
+            # token-by-token and SPEAK the first complete sentence the
+            # moment it arrives — drops perceived latency from 15-25s
+            # (whole reply) to 3-6s (first sentence). The remaining
+            # sentences are returned in `content` for the caller to
+            # speak through the normal completion-callback path.
+            import json as _json
+            import re as _re
+            response = requests.post(
+                f"{base_url.rstrip('/')}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": True,
+                    "keep_alive": "30m",
+                    "options": {
+                        "temperature": 0.4,
+                        # 150 tokens for 7b chat. 7b @ Hetzner CCX23 CPU
+                        # ≈ 8 tok/s → 150 tokens = ~18s worst-case warm.
+                        # Most voice answers fit in 80-120 tokens; this
+                        # leaves headroom without paying a full 25s tail.
+                        "num_predict": 120,
+                        "repeat_penalty": 1.25,
+                        "repeat_last_n": 128,
+                        "presence_penalty": 0.4,
+                        "frequency_penalty": 0.3,
+                        # 2560 ctx fits static prompt (~500t) + lang (~30t)
+                        # + 10 history msgs (~1500t) + query (~50t) + reply
+                        # (~200t) with margin. Smaller ctx = faster
+                        # prompt-eval on CPU (linear in ctx size).
+                        "num_ctx": 2560,
+                        # 4 worker threads (Hetzner CCX23 = 4 vCPU).
+                        "num_thread": 4,
+                        # Larger batch = more tokens per prompt-eval pass
+                        # = better CPU throughput.
+                        "num_batch": 256,
+                    },
+                },
+                # 120s hard limit — 7b cold-cache rebuild can hit 60-90s
+                # on first call; warm subsequent calls return in 7-25s.
+                timeout=120.0,
+                stream=True,
+            )
+            if response.status_code != 200:
+                debug_log(
+                    f"voice direct-chat HTTP {response.status_code}",
+                    "voice",
+                )
+                return ""
+
+            content_parts = []
+            buf = ""
+            sentences_spoken: list[str] = []
+            sent_end_re = _re.compile(r"[.!?…]")
+            first_tok_t: Optional[float] = None
+
+            def _flush_sentence(sent: str) -> None:
+                """Sanitize, strip lazy prefix, queue into TTS."""
+                cleaned = self._strip_lazy_prefix(
+                    self._sanitize_for_piper_uk(sent)
+                ).strip()
+                if not cleaned:
+                    return
+                if not (self.tts and self.tts.enabled):
+                    return
+                try:
+                    # First sentence — track for echo detector.
+                    # Subsequent sentences extend the same TTS turn,
+                    # so we update the tracker as new text comes in.
+                    if not sentences_spoken:
+                        self.track_tts_start(cleaned)
+                        debug_log(
+                            f"stream sent #1: {cleaned[:60]}", "voice"
+                        )
+                    else:
+                        debug_log(
+                            f"stream sent #{len(sentences_spoken)+1}: "
+                            f"{cleaned[:60]}",
+                            "voice",
+                        )
+                    self.tts.speak(cleaned)
+                    sentences_spoken.append(cleaned)
+                except Exception as e:
+                    debug_log(f"stream-speak failed: {e}", "voice")
+
+            try:
+                for raw in response.iter_lines(decode_unicode=False):
+                    if not raw:
+                        continue
+                    try:
+                        obj = _json.loads(raw)
+                    except Exception:
+                        continue
+                    chunk = ""
+                    msg = obj.get("message") if isinstance(obj, dict) else None
+                    if isinstance(msg, dict):
+                        chunk = msg.get("content", "") or ""
+                    if chunk:
+                        if first_tok_t is None:
+                            first_tok_t = _time.time() - t0
+                            debug_log(
+                                f"first token in {first_tok_t:.2f}s",
+                                "voice",
+                            )
+                        content_parts.append(chunk)
+                        buf += chunk
+                        # Flush EVERY complete sentence to TTS as soon
+                        # as it's ready. This is the core latency win:
+                        # user hears the reply unfolding token-by-token
+                        # instead of waiting for the full 15-25s
+                        # generation to finish.
+                        while True:
+                            m = sent_end_re.search(buf)
+                            if not m:
+                                break
+                            sentence = buf[: m.end()].strip()
+                            buf = buf[m.end():]
+                            if len(sentence) >= 4:
+                                _flush_sentence(sentence)
+                    if isinstance(obj, dict) and obj.get("done"):
+                        break
+            except Exception as e:
+                debug_log(f"stream iter failed: {e}", "voice")
+
+            # Flush any trailing fragment (no terminal punctuation)
+            tail = buf.strip()
+            if tail and len(tail) >= 2:
+                _flush_sentence(tail)
+
+            elapsed = _time.time() - t0
+            content = "".join(content_parts).strip()
+            # Stash for _dispatch_query so it knows the reply has
+            # ALREADY been queued into TTS — it must NOT speak the
+            # whole thing again. We pass the count so dispatch can
+            # decide whether to schedule a completion-callback poll.
+            self._streamed_sentence_count = len(sentences_spoken)
+            self._streamed_first_sentence = (
+                sentences_spoken[0] if sentences_spoken else ""
+            )
+            self._streamed_full_text = "".join(sentences_spoken)
+            if sentences_spoken:
+                debug_log(
+                    f"voice direct-chat streamed {len(sentences_spoken)} "
+                    f"sentence(s) in {elapsed:.1f}s",
+                    "voice",
+                )
+            if content:
+                # Sanitize Latin words / mixed-script content — Piper UA
+                # model has no English phoneme map and silently TRUNCATES
+                # audio when it hits a Latin word ("Jarvis допоможе" plays
+                # only "Jarvis " worth of silence then cuts the whole rest
+                # of the line). Replace common Latin tokens with Cyrillic
+                # equivalents AFTER the LLM call as a safety net for when
+                # the strict-Cyrillic instruction in the system prompt is
+                # ignored.
+                content = self._sanitize_for_piper_uk(content)
+                content = self._strip_lazy_prefix(content)
+
+                # Web-search fallback: if the model admitted ignorance,
+                # do a DuckDuckGo search and re-prompt with fresh
+                # snippets. This is the "always-internet-access" feature
+                # the user explicitly requested.
+                lc = content.lower()
+                if (
+                    "не знаю напевно" in lc
+                    or "потрібен пошук" in lc
+                    or "потрібен веб-пошук" in lc
+                ) and len(query) > 4:
+                    debug_log(f"web-search fallback for: '{query[:60]}'", "voice")
+                    print(f"  🌐 Шукаю в інтернеті: \"{query[:50]}\"", flush=True)
+                    results = self._web_search(query, max_results=4)
+                    if results:
+                        ctx = "\n".join(
+                            f"- {r['title']}: {r['snippet']}"
+                            for r in results if r.get("snippet")
+                        )
+                        retry_msgs = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content":
+                                f"{query}\n\n[Контекст з веб-пошуку — використай ці факти:]\n{ctx}\n\n"
+                                f"Дай ЗМІСТОВНУ відповідь українською мовою на основі цього контексту."},
+                        ]
+                        try:
+                            t1 = _time.time()
+                            r2 = requests.post(
+                                f"{base_url.rstrip('/')}/api/chat",
+                                json={
+                                    "model": model,
+                                    "messages": retry_msgs,
+                                    "stream": False,
+                                    "keep_alive": "30m",
+                                    "options": {
+                                        "temperature": 0.4,
+                                        "num_predict": 500,
+                                        "repeat_penalty": 1.3,
+                                        "repeat_last_n": 128,
+                                        "presence_penalty": 0.5,
+                                        "frequency_penalty": 0.4,
+                                        "num_ctx": 4096,
+                                    },
+                                },
+                                timeout=90.0,
+                            )
+                            if r2.status_code == 200:
+                                d2 = r2.json()
+                                m2 = d2.get("message", {}) if isinstance(d2, dict) else {}
+                                c2 = (m2.get("content") or "").strip()
+                                if c2 and len(c2) > 20:
+                                    content = self._sanitize_for_piper_uk(c2)
+                                    content = self._strip_lazy_prefix(content)
+                                    debug_log(
+                                        f"web-search retry ok in {_time.time()-t1:.1f}s",
+                                        "voice",
+                                    )
+                        except Exception as e:
+                            debug_log(f"web-search retry error: {e}", "voice")
+                # Append to rolling dialog history AND persist to disk
+                # so Jarvis remembers across daemon restarts.
+                self._dialog_history.append({"role": "user", "content": query})
+                self._dialog_history.append({"role": "assistant", "content": content})
+                # Trim in-memory to last 16 messages (8 turns) to bound
+                # prompt size. Disk has the full history.
+                if len(self._dialog_history) > 16:
+                    self._dialog_history = self._dialog_history[-16:]
+                # Persist asynchronously — disk write is fast (~1ms) but
+                # we still don't want to block the voice loop on it.
+                self._persist_memory_pair(query, content)
+                debug_log(
+                    f"voice direct-chat ok in {elapsed:.1f}s, history={len(self._dialog_history)}: '{content[:80]}{'...' if len(content) > 80 else ''}'",
+                    "voice",
+                )
+            return content
+        except requests.exceptions.Timeout:
+            debug_log("voice direct-chat: timeout after 12s", "voice")
+            return ""
+        except Exception as e:
+            debug_log(f"voice direct-chat error: {e}", "voice")
+            return ""
+
+    def _sanitize_for_piper_uk(self, text: str) -> str:
+        """Replace Latin words/letters with Cyrillic equivalents.
+
+        Piper's uk_UA-ukrainian_tts-medium model has a single-language
+        phoneme map. When it encounters a Latin letter inside a Ukrainian
+        sentence (a wake-word brand name "Jarvis", a typo with mixed-script
+        "бude" where the u is actually U+0075, a stray "OK" / "AI"), the
+        synth either drops the word silently or — worse — cuts the rest of
+        the audio buffer mid-sentence. The user perceives this as Jarvis
+        "не договорює і закривається відразу" (cuts off mid-reply).
+
+        We patch over the most common offenders post-LLM. The LLM is also
+        instructed in its system prompt to avoid Latin, but small models
+        leak through under load.
+        """
+        if not text:
+            return text
+        import re
+        # Common brand/word substitutions — case-insensitive whole word.
+        replacements = [
+            (r"\bJarvis\b", "Джарвіс"),
+            (r"\bJARVIS\b", "Джарвіс"),
+            (r"\bAI\b", "ШІ"),
+            (r"\bOK\b", "добре"),
+            (r"\bok\b", "добре"),
+            (r"\bGPT\b", "Джі-Пі-Ті"),
+            (r"\bLLM\b", "мовна модель"),
+            (r"\bAPI\b", "АПІ"),
+            (r"\bCEO\b", "генеральний директор"),
+            (r"\bUI\b", "інтерфейс"),
+            (r"\bUX\b", "юзабіліті"),
+            (r"\bNexus\b", "Нексус"),
+            (r"\bStudio\b", "Студіо"),
+        ]
+        for pattern, repl in replacements:
+            text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+
+        # Mixed-script word fix: any token that contains BOTH Cyrillic
+        # and Latin letters is almost certainly a homoglyph typo from
+        # the LLM (e.g. "бude" → "буде", "Дanил" → "Данил"). For these,
+        # replace each Latin char with its closest Cyrillic look-alike.
+        latin_to_cyr = {
+            "a": "а", "A": "А",
+            "o": "о", "O": "О",
+            "e": "е", "E": "Е",
+            "c": "с", "C": "С",
+            "p": "р", "P": "Р",
+            "x": "х", "X": "Х",
+            "y": "у", "Y": "У",
+            "u": "и", "U": "И",   # "u" mid-word ≈ "и" (closest sound)
+            "i": "і", "I": "І",
+            "k": "к", "K": "К",
+            "H": "Н", "h": "г",
+            "T": "Т", "t": "т",
+            "B": "В", "b": "б",
+            "M": "М", "m": "м",
+            "n": "н", "N": "Н",
+            "d": "д", "D": "Д",
+            "g": "г", "G": "Г",
+            "s": "с", "S": "С",
+            "r": "р", "R": "Р",
+            "l": "л", "L": "Л",
+            "f": "ф", "F": "Ф",
+            "v": "в", "V": "В",
+            "z": "з", "Z": "З",
+            "j": "й", "J": "Й",
+            "w": "в", "W": "В",
+            "q": "к", "Q": "К",
+        }
+        cyr_re = re.compile(r"[Ѐ-ӿ]")
+        lat_re = re.compile(r"[a-zA-Z]")
+        def _fix_word(m):
+            w = m.group(0)
+            has_cyr = bool(cyr_re.search(w))
+            has_lat = bool(lat_re.search(w))
+            if has_cyr and has_lat:
+                return "".join(latin_to_cyr.get(c, c) for c in w)
+            return w
+        text = re.sub(r"\S+", _fix_word, text)
+
+        # Drop any remaining PURE Latin words >= 2 chars — they're
+        # untranslatable proper nouns, better to silently omit than
+        # crash the synth.
+        text = re.sub(r"\b[a-zA-Z]{2,}\b", "", text)
+        # Tidy double spaces left by removals.
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _web_search(self, query: str, max_results: int = 5) -> list[dict]:
+        """Quick keyless web search via DuckDuckGo HTML endpoint.
+
+        Returns a list of {title, snippet, url} dicts. Used as a fallback
+        when the LLM admits ignorance ("не знаю напевно", "потрібен
+        пошук") — we then re-prompt the model with the snippets as
+        fresh context so the reply has actual web knowledge.
+
+        DDG HTML is keyless and rate-limited only per IP. No registration,
+        no API key. We use a desktop User-Agent so we get the full results
+        page (mobile UA returns a stripped layout).
+        """
+        if not query or not query.strip():
+            return []
+        import requests as _rq
+        from bs4 import BeautifulSoup as _BS
+        try:
+            r = _rq.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query, "kl": "uk-ua"},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                        "Version/17.0 Safari/605.1.15"
+                    ),
+                },
+                timeout=8.0,
+            )
+            if r.status_code != 200:
+                debug_log(f"web search HTTP {r.status_code}", "voice")
+                return []
+            soup = _BS(r.text, "html.parser")
+            results = []
+            for div in soup.select("div.result")[:max_results]:
+                a = div.select_one("a.result__a")
+                snip = div.select_one(".result__snippet")
+                if not a:
+                    continue
+                results.append({
+                    "title": a.get_text(strip=True),
+                    "snippet": snip.get_text(strip=True) if snip else "",
+                    "url": a.get("href", ""),
+                })
+            debug_log(f"web search '{query[:40]}' → {len(results)} results", "voice")
+            return results
+        except Exception as e:
+            debug_log(f"web search error: {e}", "voice")
+            return []
+
+    def _strip_lazy_prefix(self, text: str) -> str:
+        """Strip filler prefixes like 'Добре, ...' that 1.5b model adds.
+
+        The qwen2.5:1.5b model frequently violates system prompt rule #2
+        and starts replies with conversational fillers — 'Добре,',
+        'Зрозумів,', 'Так,', 'Звичайно,', 'Звісно,', 'Гаразд,',
+        'Окей,', 'Авжеж,' — even though we explicitly forbid these.
+        With num_predict=40, that filler eats 4-6 tokens of generation
+        budget, leaving the actual answer truncated. Worse, when the
+        prefix happens to be ALL the model output (model finishes a
+        sentence like 'Добре. Я не знаю.'), the user perceives a
+        useless 'Добре' reply.
+
+        We strip these prefixes after sanitization. If the entire
+        response was just filler, we return empty so the caller can
+        fall back to a different path (canned reply / engine).
+        """
+        if not text:
+            return text
+        import re
+        # Filler patterns we want to strip from the START of replies.
+        # Each is matched case-insensitively, optionally followed by
+        # punctuation + whitespace. Include the bare word too (no
+        # trailing comma) for cases where the LLM stops at just the
+        # filler word.
+        fillers = (
+            r"добре", r"зрозуміло", r"зрозумів", r"гаразд",
+            r"так(?:,\s*я)?", r"звичайно", r"звісно",
+            r"окей", r"ок", r"авжеж", r"я можу",
+            r"я знаю", r"я готовий", r"я тут",
+        )
+        # Build alternation. Allow up to 3 fillers chained
+        # ('Добре, зрозумів, я...') by running the strip 3×.
+        pattern = re.compile(
+            r"^\s*(?:" + "|".join(fillers) + r")\s*[,.\!\?:;—–-]*\s*",
+            re.IGNORECASE,
+        )
+        prev = None
+        for _ in range(3):
+            stripped = pattern.sub("", text)
+            if stripped == prev:
+                break
+            prev = stripped
+            text = stripped
+            if not text.strip():
+                break
+        # Capitalize the new first letter if we ate the original cap.
+        text = text.strip()
+        if text and text[0].islower():
+            text = text[0].upper() + text[1:]
+        return text
+
+    def _canned_voice_reply(self, query: str) -> str:
+        """Return a canned reply for very short voice queries, or ''.
+
+        This is a latency hack for qwen2.5:3b CPU. The Jarvis reply engine
+        builds a 3000+ token system prompt (persona + memory digest + tool
+        descriptions); even with a primed KV-cache, evaluation on a
+        4-vCPU Hetzner CCX23 takes 30-180s depending on cache hits. For
+        the small set of voice queries that don't actually need any
+        reasoning (greetings, thanks, farewells), it's better UX to skip
+        the LLM entirely.
+
+        We deliberately keep the trigger list narrow — anything that
+        could plausibly need the LLM (e.g. "як справи з проектом?")
+        must fall through to the real engine. Match is on exact
+        normalized query equality or membership in a small alias set.
+
+        Returns reply text on match, or empty string on miss.
+        """
+        if not query:
+            return ""
+        # Normalize: lower, strip punctuation/spaces, collapse common
+        # Whisper mishearings ("певіт" instead of "привіт", "джавіс"
+        # at the start) so the same canned reply fires regardless of
+        # transcription quality.
+        import re
+        q = query.lower().strip()
+        q = re.sub(r"[!?,.;:\"'`()\[\]{}«»…]+", " ", q)
+        q = re.sub(r"\s+", " ", q).strip()
+        # Drop any leading wake-word fragment if intent-judge missed it.
+        for wake in ("джарвіс", "джарвис", "ярвіс", "ярвис", "jarvis",
+                     "джарвес", "джарваз", "джавіс", "ярвес"):
+            if q.startswith(wake + " "):
+                q = q[len(wake) + 1:].strip()
+                break
+
+        # Greetings — Ukrainian first (primary language), then RU/EN.
+        greetings = {
+            "привіт", "превіт", "певіт", "приіт",
+            "здоров", "здорова", "здоровенькі", "здоровеньки", "здоровенький були",
+            "вітаю", "вітання", "доброго дня", "добрий день", "доброго ранку",
+            "добрий вечір", "добрий ранок", "добридень",
+            "привет", "здравствуй", "здравствуйте", "доброе утро",
+            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+            "hallo", "guten tag", "guten morgen",
+        }
+        if q in greetings:
+            return "Привіт, Даниле! Чим можу допомогти?"
+
+        # Acknowledgements/thanks.
+        thanks = {
+            "дякую", "дяки", "спасибі", "вдячний",
+            "спасибо", "благодарю",
+            "thanks", "thank you", "thx",
+            "danke", "vielen dank",
+        }
+        if q in thanks:
+            return "Прошу. Звертайтесь."
+
+        # Farewells.
+        farewells = {
+            "па", "пока", "бувай", "до побачення", "побачимось", "па-па",
+            "bye", "goodbye", "see you", "cya",
+            "tschüss", "auf wiedersehen",
+        }
+        if q in farewells:
+            return "До зустрічі, Даниле."
+
+        # Status check — "як справи?" / "як ти?" / "як ся маєш?"
+        status = {
+            "як справи", "як ти", "як ся маєш", "як ся маєте", "як настрій",
+            "як дела", "как дела", "как ты",
+            "how are you", "how's it going", "what's up",
+        }
+        if q in status:
+            return "Все добре, працюю. А у вас?"
+
+        # Single-word "test"/"перевірка"/"чуєш мене" — confirm liveness.
+        liveness = {
+            "тест", "перевірка", "тестування", "чуєш", "чуєш мене", "ти тут",
+            "test", "testing", "are you there", "can you hear me",
+            "проверка", "слышишь меня",
+        }
+        if q in liveness:
+            return "Чую вас. Працюю."
+
+        return ""
+
+    def _lang_name(self, code: str) -> str:
+        """Human-readable Ukrainian name of a language code."""
+        return {
+            "uk": "українською",
+            "ru": "російською",
+            "en": "англійською",
+            "de": "німецькою",
+        }.get(code, code)
+
+    def _language_directive(self, code: str) -> str:
+        """Return the system-prompt clause that locks reply language."""
+        directives = {
+            "uk": (
+                "МОВА ВІДПОВІДІ: Українська (кирилиця). Завжди українською, "
+                "навіть якщо в історії є RU/EN/DE — не повторюй той вибір. "
+                "Замість 'Jarvis' пиши 'Джарвіс'."
+            ),
+            "ru": (
+                "ЯЗЫК ОТВЕТА: Русский. Пользователь явно попросил перейти "
+                "на русский — отвечай только на русском, кириллицей."
+            ),
+            "en": (
+                "REPLY LANGUAGE: English. User explicitly requested English — "
+                "respond only in English. Use 'Jarvis' for the assistant name."
+            ),
+            "de": (
+                "ANTWORTSPRACHE: Deutsch. Der Nutzer hat explizit Deutsch "
+                "verlangt — antworte nur auf Deutsch."
+            ),
+        }
+        return directives.get(code, directives["uk"])
+
+    def _run_self_upgrade_async(self, user_request: str) -> None:
+        """Spawn Claude Code in a background thread to self-upgrade."""
+        import threading as _t
+        def _runner():
+            try:
+                from ..agent.self_upgrade import (
+                    write_upgrade_brief, spawn_claude,
+                    wait_for_completion_and_restart,
+                )
+                brief = write_upgrade_brief(user_request)
+                proc = spawn_claude(brief)
+                if proc is None:
+                    self._speak_and_continue(
+                        "Не знайшов Claude Code CLI. Встанови його через "
+                        "npm install minus g at-anthropic-ai-claude-code."
+                    )
+                    return
+                ok, summary = wait_for_completion_and_restart(proc)
+                # After kickstart we'll be dead — speak BEFORE restart.
+                if ok and "Перезапускаюсь" in summary:
+                    self._speak_and_continue(summary)
+                    # Daemon will be killed by kickstart; new instance loads.
+                else:
+                    self._speak_and_continue(summary)
+            except Exception as e:
+                debug_log(f"self-upgrade thread error: {e}", "voice")
+                self._speak_and_continue(f"Помилка самооновлення: {e}")
+        _t.Thread(target=_runner, daemon=True, name="self-upgrade").start()
+
+    def _speak_and_continue(self, text: str) -> None:
+        """Speak `text` via TTS and keep the hot window active.
+
+        Used after action execution / cancellation so the user can
+        immediately continue the conversation without re-saying the
+        wake word.
+        """
+        if not text:
+            return
+        if not (self.tts and self.tts.enabled):
+            print(f"📢 {text}", flush=True)
+            return
+        def _done():
+            self.activate_hot_window()
+        self.track_tts_start(text)
+        self.tts.speak(text, completion_callback=_done)
+
     def _dispatch_query(self, query: str) -> None:
         """
         Dispatch a complete query to the reply engine.
@@ -1167,6 +2169,96 @@ class VoiceListener(threading.Thread):
             query: Complete user query to process
         """
         debug_log(f"dispatching query: '{query}'", "voice")
+
+        # Language switch check: "говори російською" / "switch to English"
+        # → stage with confirmation. Active language defaults to UA on
+        # daemon start and after force_end_session.
+        try:
+            from .action_dispatcher import detect_language_switch
+            lang_req = detect_language_switch(query)
+            if lang_req is not None and not getattr(self, "_pending_lang_switch", None):
+                lang_code, ack = lang_req
+                current = getattr(self, "_active_language", "uk")
+                if lang_code != current:
+                    self._pending_lang_switch = lang_code
+                    self._speak_and_continue(
+                        f"Хочеш щоб я говорив {self._lang_name(lang_code)}? "
+                        f"Підтверди — скажи 'виконуй'."
+                    )
+                    return
+            if getattr(self, "_pending_lang_switch", None):
+                from .action_dispatcher import is_confirmation as _ic, is_denial as _id
+                if _ic(query):
+                    new_lang = self._pending_lang_switch
+                    self._pending_lang_switch = None
+                    self._active_language = new_lang
+                    debug_log(f"language switched to {new_lang}", "voice")
+                    # Acknowledge in the new language so user hears the
+                    # voice immediately.
+                    acks = {
+                        "uk": "Перейшов на українську.",
+                        "ru": "Перешёл на русский.",
+                        "en": "Switched to English.",
+                        "de": "Auf Deutsch gewechselt.",
+                    }
+                    self._speak_and_continue(acks.get(new_lang, "OK"))
+                    return
+                if _id(query):
+                    self._pending_lang_switch = None
+                    self._speak_and_continue("Скасовано, залишаюсь на українській.")
+                    return
+                self._pending_lang_switch = None
+        except Exception as e:
+            debug_log(f"language-switch check error: {e}", "voice")
+
+        # Self-upgrade check: "Джарвіс, я хочу щоб ти краще ..." →
+        # stage an upgrade request, ask for confirmation, then spawn
+        # Claude Code under user's Max subscription.
+        try:
+            from ..agent.self_upgrade import is_upgrade_request
+            if is_upgrade_request(query) and not getattr(self, "_pending_upgrade", None):
+                self._pending_upgrade = query
+                self._speak_and_continue(
+                    "Запускаю самооновлення через Claude Code. "
+                    "Це може зайняти 5-15 хвилин. Підтверди — скажи 'виконуй'."
+                )
+                return
+            if getattr(self, "_pending_upgrade", None):
+                from .action_dispatcher import is_confirmation as _is_conf, is_denial as _is_den
+                if _is_conf(query):
+                    req = self._pending_upgrade
+                    self._pending_upgrade = None
+                    self._speak_and_continue("Починаю самооновлення.")
+                    self._run_self_upgrade_async(req)
+                    return
+                if _is_den(query):
+                    self._pending_upgrade = None
+                    self._speak_and_continue("Скасовано.")
+                    return
+                self._pending_upgrade = None
+        except Exception as e:
+            debug_log(f"upgrade-check error: {e}", "voice")
+
+        # Confirmation flow: if there's a pending action and the user
+        # is confirming/denying, run/cancel BEFORE going to LLM.
+        from .action_dispatcher import (
+            parse_action, is_confirmation, is_denial,
+        )
+        pending = getattr(self, "_pending_action", None)
+        if pending is not None:
+            if is_confirmation(query):
+                debug_log(f"executing pending action: {pending.name}", "voice")
+                ok, msg = pending.fn()
+                self._pending_action = None
+                self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+                return
+            if is_denial(query):
+                debug_log(f"cancelled pending action: {pending.name}", "voice")
+                self._pending_action = None
+                self._speak_and_continue("Скасовано.")
+                return
+            # Otherwise — user said something new, drop the pending action.
+            self._pending_action = None
 
         # Clear audio buffers to prevent stale audio from next query
         self._clear_audio_buffers()
@@ -1180,24 +2272,68 @@ class VoiceListener(threading.Thread):
         except Exception as e:
             debug_log(f"failed to set face state to THINKING: {e}", "voice")
 
-        # Import reply engine
-        from ..reply.engine import run_reply_engine
+        # Voice fast-path: short canned replies for greetings/acks/farewells.
+        #
+        # On qwen2.5:3b CPU Hetzner CCX23 the full reply engine pays ~120-240s
+        # for prompt-eval on cold cache (3000-token Jarvis system prompt +
+        # tool descriptions). Users perceive this as a hang — the HUD coin
+        # spins for 3+ minutes with no audible response. For the most common
+        # voice queries — "привіт" / "hi" / "як справи?" / "дякую" — we
+        # bypass the engine entirely and return a canned response. Saves the
+        # full LLM round-trip and gives <500ms voice feedback.
+        canned = self._canned_voice_reply(query)
+        if canned:
+            debug_log(f"voice fast-path: canned reply for '{query}' → '{canned}'", "voice")
+            reply = canned
+        else:
+            # NOTE: instant feedback ("Угу.") was already spoken in
+            # _finalize_utterance() the moment VAD detected end of
+            # speech — ~300-500ms before this code runs. Adding
+            # another ack here would overlap or feel verbose. For
+            # genuinely LONG queries (>100 chars, likely 20s+ LLM
+            # time) we add ONE more "Шукаю відповідь." — but only
+            # then. Most queries skip this entirely.
+            if (
+                self.tts
+                and self.tts.enabled
+                and len(query) >= 100
+            ):
+                try:
+                    debug_log("speaking long-query bridge ack", "voice")
+                    self.tts.speak("Шукаю відповідь.")
+                except Exception as e:
+                    debug_log(f"bridge ack failed: {e}", "voice")
+            # Try direct chat (bypass full reply engine) for SPEED. The full
+            # engine builds a 3000+ token system prompt (persona + memory
+            # digest + tool descriptions) that takes ~120-240s prompt-eval
+            # on qwen2.5:3b CPU. Voice users want <3s response. The direct
+            # path uses a minimal ~80-token system prompt and skips tools,
+            # memory, and graph context — giving ~2-5s responses on warm
+            # cache. If it fails or times out, fall back to the engine.
+            reply = self._voice_direct_chat(query)
+            if not reply:
+                debug_log(
+                    "voice direct-chat returned empty/timeout — apology reply",
+                    "voice",
+                )
+                reply = "Вибач, не встиг подумати. Спробуй ще раз."
 
-        # Process the query (keep thinking tune playing during processing)
-        try:
-            reply = run_reply_engine(
-                self.db, self.cfg, None, query, self.dialogue_memory,
-                language=self._last_detected_language,
-            )
-        except Exception as e:
-            # Log the error visibly - this should never happen silently
-            print(f"\n  ❌ Reply engine error: {e}", flush=True)
-            debug_log(f"reply engine exception: {e}", "voice")
-            self._stop_thinking_tune()
-            # Provide user feedback via TTS
-            if self.tts and self.tts.enabled:
-                self.tts.speak("Sorry, I encountered an error processing your request.")
-            return
+        # Check if the reply contains a PC-control action plan.
+        # If user already said "виконуй" in the original query, execute
+        # immediately without asking. Otherwise stage the action and
+        # ask for confirmation.
+        action = parse_action(reply)
+        if action is not None:
+            if is_confirmation(query):
+                # Inline confirm — user said "виконуй ..." right away.
+                debug_log(f"inline-confirmed action: {action.name}", "voice")
+                ok, msg = action.fn()
+                reply = f"{action.description}. {msg}" if ok else f"Не вийшло: {msg}"
+            else:
+                # Stage for the next utterance's confirmation.
+                self._pending_action = action
+                if "підтверди" not in reply.lower():
+                    reply = reply.rstrip(".!?") + ". Підтверди — скажи 'виконуй'."
 
         # Handle TTS with proper callbacks
         if reply and self.tts and self.tts.enabled:
@@ -1216,12 +2352,46 @@ class VoiceListener(threading.Thread):
                 if self.echo_detector:
                     self.echo_detector._tts_exact_duration = duration
 
-            # Track TTS start for echo detection with actual text
-            self.track_tts_start(reply)
-            debug_log(f"starting TTS for reply ({len(reply)} chars)", "voice")
+            # If _voice_direct_chat already streamed the WHOLE reply
+            # sentence-by-sentence to TTS, we just need to wait for
+            # the queue to drain and then activate the hot window.
+            # No additional speak() — that would dupe everything.
+            streamed_count = int(getattr(self, "_streamed_sentence_count", 0) or 0)
+            self._streamed_sentence_count = 0
+            self._streamed_first_sentence = ""
+            self._streamed_full_text = ""
 
-            self.tts.speak(reply, completion_callback=_on_tts_complete,
-                          duration_callback=_on_duration_known)
+            if streamed_count > 0:
+                debug_log(
+                    f"reply already streamed ({streamed_count} sentences) "
+                    "— scheduling hot-window activation",
+                    "voice",
+                )
+                # Activate hot window after the TTS queue drains.
+                def _wait_and_activate():
+                    import time as _t
+                    while self.tts and self.tts.is_speaking():
+                        _t.sleep(0.1)
+                    _t.sleep(0.2)  # echo settle
+                    _on_tts_complete()
+                threading.Thread(
+                    target=_wait_and_activate,
+                    daemon=True,
+                    name="jarvis-hotwin-wait",
+                ).start()
+            else:
+                # Non-streamed path: canned reply / action result /
+                # web-search fallback. Speak the full reply normally.
+                self.track_tts_start(reply)
+                debug_log(
+                    f"starting TTS for reply ({len(reply)} chars)",
+                    "voice",
+                )
+                self.tts.speak(
+                    reply,
+                    completion_callback=_on_tts_complete,
+                    duration_callback=_on_duration_known,
+                )
         else:
             debug_log(f"no TTS output: reply={bool(reply)}, tts={bool(self.tts)}, enabled={getattr(self.tts, 'enabled', False) if self.tts else False}", "voice")
             # Stop thinking tune if no TTS response
@@ -1408,12 +2578,58 @@ class VoiceListener(threading.Thread):
 
         return False
 
+    def _is_known_hallucination(self, text: str) -> bool:
+        """Block Whisper's known-bad hallucination outputs on Cyrillic silence.
+
+        Whisper consistently regurgitates the same UA-tokenized noise patterns
+        when the audio is mostly silence — the model was likely trained on
+        webscrapes where these phrases repeat heavily. They never appear in
+        legitimate user speech, so we can hard-block them upstream of
+        repetitive-detection (saves CPU on intent-judge / fuzzy passes).
+        """
+        if not text:
+            return False
+        lower = text.lower()
+        # Known idle-noise patterns. Each phrase observed multiple times in
+        # production logs with `whisper_no_speech_threshold` ≥ 0.85.
+        KNOWN_PATTERNS = (
+            "дмитро павловський",
+            "білян ліна керівськ",
+            "білян ліпчук",
+            "хіднось продавав",
+            "thank you",            # English silence hallucination
+            "thanks for watching",  # YouTube-style training-data leakage
+            "subscribe to",
+            "see you next",
+        )
+        for pat in KNOWN_PATTERNS:
+            if pat in lower:
+                return True
+        return False
+
     def _check_query_timeout(self) -> None:
         """Check if there's a pending query that has timed out, and check hot window expiry."""
         if self.state_manager.check_collection_timeout():
             query = self.state_manager.clear_collection()
             if query.strip():
                 self._dispatch_query(query)
+            else:
+                # Empty collection on timeout — user said just "Джарвіс"
+                # with no follow-up question. Without this branch the daemon
+                # went silent (no dispatch, no reply), leaving the HUD coin
+                # stuck on LISTENING with no audible response. Speak a
+                # short prompt so the user knows Jarvis is awake and waiting,
+                # AND reset the face state so the next "Джарвіс" can fire.
+                debug_log("collection timed out with empty query — speaking ack", "voice")
+                self._stop_thinking_tune()
+                if self.tts and self.tts.enabled:
+                    self.tts.speak("Слухаю, Даниле.")
+                # Reset HUD to IDLE so coin doesn't stay on LISTENING.
+                try:
+                    from desktop_app.face_widget import get_jarvis_state, JarvisState
+                    get_jarvis_state().set_state(JarvisState.IDLE)
+                except Exception:
+                    pass
 
         # Also check hot window expiry - this ensures the timeout is enforced
         # even when there's no audio being processed
@@ -1428,6 +2644,100 @@ class VoiceListener(threading.Thread):
             chunk = (indata.copy() if hasattr(indata, "copy") else indata)
             try:
                 self._audio_q.put_nowait(chunk)
+            except Exception:
+                pass
+            # Energy-spike interrupt — DISABLED BY DEFAULT.
+            #
+            # The original idea: monitor mic RMS during TTS, fire when
+            # it exceeds a baseline. PROBLEM: when TTS plays through
+            # external speakers (or even Mac speakers with low volume),
+            # the mic never picks up TTS echo. So baseline stays at
+            # room-noise level (~0.004 RMS). Any user speech (~0.04
+            # RMS) then triggers — but instantly, on the FIRST frame.
+            # Worse: the interrupt fires before TTS gets to say a
+            # single word, so the assistant looks like it can't speak.
+            # User report: "у нього дуже короткий час прослуховування
+            # і він відразу… переходить в жовтий вигляд".
+            #
+            # Cleaner approaches that DO work:
+            #   1. HUD coin click → write control.json "interrupt_tts"
+            #   2. Wake-word "Джарвіс" mid-TTS — handled in
+            #      _process_transcript pre-emptive check
+            #   3. Stop-word "стоп"/"досить" — same path
+            # The energy-spike code stays in place but gated by
+            # cfg.voice_interrupt_energy_enabled (default False).
+            try:
+                if (
+                    self.tts is not None
+                    and self.tts.is_speaking()
+                    and np is not None
+                    and bool(getattr(self.cfg, "voice_interrupt_energy_enabled", False))
+                ):
+                    arr = chunk if hasattr(chunk, "shape") else None
+                    if arr is None:
+                        return
+                    if arr.ndim > 1:
+                        arr = arr[:, 0]
+                    rms = float(np.sqrt(np.mean(np.square(arr.astype(np.float32)))))
+                    # Initialise the rolling state lazily.
+                    if not hasattr(self, "_tts_rms_baseline"):
+                        self._tts_rms_baseline = rms
+                        self._tts_spike_frames = 0
+                        self._tts_last_interrupt_ts = 0.0
+                    # Exponential moving average of TTS-echo baseline
+                    # (slow update — only when we're NOT spiking, so
+                    # spikes don't pollute the baseline).
+                    spike_ratio = float(getattr(self.cfg, "voice_interrupt_spike_ratio", 1.5))
+                    if rms < self._tts_rms_baseline * spike_ratio:
+                        # Calm period — update baseline.
+                        self._tts_rms_baseline = 0.95 * self._tts_rms_baseline + 0.05 * rms
+                        self._tts_spike_frames = max(0, self._tts_spike_frames - 1)
+                    else:
+                        # Spike! count consecutive elevated frames.
+                        self._tts_spike_frames += 1
+                    # ABSOLUTE threshold — when user yells or just speaks
+                    # at a normal volume while TTS plays through external
+                    # speakers (mic doesn't hear TTS echo, so the
+                    # relative-baseline check never triggers). 0.025 is
+                    # ~normal speaking voice; below that mic baseline noise.
+                    abs_rms = float(getattr(self.cfg, "voice_interrupt_absolute_rms", 0.025))
+                    abs_spike = rms >= abs_rms
+                    if abs_spike:
+                        self._tts_spike_frames = max(self._tts_spike_frames, 8)
+                    # 20ms per frame × 8 = 160ms of sustained spike
+                    spike_threshold = int(getattr(self.cfg, "voice_interrupt_spike_frames", 8))
+                    now = time_info.inputBufferAdcTime if time_info else 0.0
+                    cooldown = 1.0  # don't fire more than once per 1.0s
+                    if (self._tts_spike_frames >= spike_threshold
+                            and (now - self._tts_last_interrupt_ts) > cooldown):
+                        self._tts_last_interrupt_ts = now
+                        self._tts_spike_frames = 0
+                        debug_log(
+                            f"⚡ TTS interrupted by mic energy spike "
+                            f"(rms={rms:.4f} baseline={self._tts_rms_baseline:.4f})",
+                            "voice",
+                        )
+                        try:
+                            print("  ⏸  Перебиваю — чую тебе", flush=True)
+                            self.tts.interrupt()
+                            # Clear echo-detector's last_tts so the next
+                            # transcript isn't auto-rejected as echo.
+                            try:
+                                self.echo_detector._last_tts_text = ""
+                            except Exception:
+                                pass
+                            # Drop queued mic audio (likely TTS echo).
+                            while not self._audio_q.empty():
+                                self._audio_q.get_nowait()
+                            self.state_manager.start_collection("")
+                            self._set_face_state_listening()
+                        except Exception as e:
+                            debug_log(f"interrupt-on-spike failed: {e}", "voice")
+                else:
+                    # Not speaking — clear spike counter so old spikes
+                    # don't bleed into the next TTS session.
+                    if hasattr(self, "_tts_spike_frames"):
+                        self._tts_spike_frames = 0
             except Exception:
                 pass
         except Exception:
@@ -1525,6 +2835,59 @@ class VoiceListener(threading.Thread):
         if chat_model and base_url:
             def _warm_chat() -> None:
                 ok = warm_up_ollama_model(base_url, chat_model, timeout=chat_timeout)
+                # Additional KV-cache prefill with a realistic-sized chat
+                # system prompt. Bare weight-load (above) leaves the cache
+                # cold, so the first real "Джарвіс, привіт" pays ~120-180s
+                # prompt-eval on qwen2.5:3b CPU @ ~25 tok/s and busts the
+                # chat timeout. Pre-feeding ~1500 tokens of representative
+                # context primes the prefix cache so the first real chat
+                # call is ~4-8s instead.
+                if ok:
+                    try:
+                        import requests as _rq
+                        # CRITICAL: must match _voice_direct_chat() exactly,
+                        # otherwise KV-cache prefix doesn't hit and the first
+                        # real voice call pays cold-cache latency. Both pull
+                        # from VOICE_STATIC_SYSTEM_PROMPT (module constant)
+                        # so they CAN'T drift.
+                        warm_lang = self._language_directive("uk")
+                        warm_resp = _rq.post(
+                            f"{base_url.rstrip('/')}/api/chat",
+                            json={
+                                "model": chat_model,
+                                "messages": [
+                                    {"role": "system", "content": VOICE_STATIC_SYSTEM_PROMPT},
+                                    {"role": "system", "content": warm_lang},
+                                    {"role": "user", "content": "[warmup] привіт"},
+                                ],
+                                "stream": False,
+                                "keep_alive": "30m",
+                                "options": {
+                                    # Match _voice_direct_chat options
+                                    # EXACTLY so warmup primes the same
+                                    # cache slot. Any drift = cache miss
+                                    # on first real call = 15-25s pause.
+                                    "temperature": 0.4,
+                                    "num_predict": 120,
+                                    "repeat_penalty": 1.25,
+                                    "repeat_last_n": 128,
+                                    "presence_penalty": 0.4,
+                                    "frequency_penalty": 0.3,
+                                    "num_ctx": 2560,
+                                    "num_thread": 4,
+                                    "num_batch": 256,
+                                },
+                            },
+                            timeout=240.0,
+                        )
+                        chat_warm_ok = warm_resp.status_code == 200
+                        debug_log(
+                            f"chat KV-cache warmup: "
+                            f"{'ok' if chat_warm_ok else f'failed HTTP {warm_resp.status_code}'}",
+                            "voice",
+                        )
+                    except Exception as e:
+                        debug_log(f"chat KV-cache warmup error: {e}", "voice")
                 self._llm_warmup_results["chat"] = (chat_model, ok)
                 # When chat and judge share a model, one warmup covers both.
                 if shared_judge:
@@ -1535,7 +2898,13 @@ class VoiceListener(threading.Thread):
 
             threads.append(threading.Thread(target=_warm_chat, daemon=True, name="warmup-chat"))
 
-        if judge is not None and not shared_judge:
+        # ALWAYS run judge.warm_up() — even when shared_judge=True. The chat
+        # warmup loads weights but does NOT seed the judge's KV-cache for its
+        # 500-token system prompt. Without cache seeding, the first wake-word
+        # judge call pays ~25s prompt-eval and busts the 45s timeout. The
+        # weights are already resident at this point so this is effectively a
+        # KV-cache prefill only.
+        if judge is not None:
             def _warm_judge() -> None:
                 ok = judge.warm_up()
                 self._llm_warmup_results["judge"] = (judge_model, ok)
@@ -1561,6 +2930,91 @@ class VoiceListener(threading.Thread):
             "voice",
         )
         return threads
+
+    def _start_hud_control_watcher(self) -> None:
+        """Poll the HUD→daemon control file for session-management commands.
+
+        The Electron HUD writes JSON like {"action":"end_session","ts":...}
+        into `~/Library/Application Support/jarvis/control.json` when the
+        user right-clicks the coin and picks an action from the context
+        menu. This watcher polls the file once per second and dispatches:
+
+          * end_session  → state_manager.force_end_session()
+          * mute         → tts.interrupt() (handled here for symmetry)
+
+        The file is deleted after each successful action so the same
+        command never fires twice. Polling (not fs.watch) is used because
+        fs.watch on macOS is unreliable across FUSE/network mounts and
+        the user's ~/Library/ on iCloud Drive sometimes misses events.
+        """
+        import os
+        import json
+        import threading as _t
+
+        ctrl_dir = os.path.expanduser("~/Library/Application Support/jarvis")
+        ctrl_path = os.path.join(ctrl_dir, "control.json")
+        try:
+            os.makedirs(ctrl_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        def _watch():
+            last_ts = 0.0
+            while not getattr(self.state_manager, "_should_stop", False):
+                try:
+                    if os.path.exists(ctrl_path):
+                        with open(ctrl_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        ts = float(data.get("ts", 0))
+                        action = str(data.get("action", "")).lower().strip()
+                        if ts > last_ts and action:
+                            last_ts = ts
+                            debug_log(f"HUD control: action='{action}' ts={ts}", "voice")
+                            if action in ("end_session", "stop_session", "session_end"):
+                                if self.tts and self.tts.enabled and self.tts.is_speaking():
+                                    self.tts.interrupt()
+                                if hasattr(self, "_dialog_history"):
+                                    self._dialog_history.clear()
+                                self.state_manager.force_end_session()
+                                print("  🛑 Session ended (HUD right-click)", flush=True)
+                            elif action in ("interrupt_tts", "stop_speaking", "interrupt"):
+                                # Just stop the current TTS, keep the
+                                # hot window active so the user can
+                                # immediately ask a follow-up.
+                                if self.tts and self.tts.enabled and self.tts.is_speaking():
+                                    self.tts.interrupt()
+                                    print("  ⏸  TTS interrupted (HUD click)", flush=True)
+                                # Clear echo-detector last_tts so the
+                                # next utterance isn't auto-rejected.
+                                try:
+                                    self.echo_detector._last_tts_text = ""
+                                except Exception:
+                                    pass
+                                self._set_face_state_listening()
+                            elif action == "confirm":
+                                # User confirmed a pending action — flag
+                                # is read by the next dispatch turn.
+                                self._pending_confirmation = "yes"
+                                print("  ✅ Confirmed (HUD)", flush=True)
+                            elif action == "deny":
+                                self._pending_confirmation = "no"
+                                print("  ❌ Denied (HUD)", flush=True)
+                            elif action == "mute":
+                                if self.tts and self.tts.enabled:
+                                    self.tts.interrupt()
+                                print("  🔇 TTS muted (HUD right-click)", flush=True)
+                            # Delete to avoid re-firing on next poll.
+                            try:
+                                os.remove(ctrl_path)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    debug_log(f"HUD control watcher error: {e}", "voice")
+                time.sleep(0.5)
+
+        t = _t.Thread(target=_watch, daemon=True, name="hud-control-watcher")
+        t.start()
+        debug_log(f"HUD control watcher started ({ctrl_path})", "voice")
 
     def _weather_example(self, wake_title: str) -> str:
         """Return the weather query example for the startup banner.
@@ -1684,6 +3138,10 @@ class VoiceListener(threading.Thread):
         print("  🔥 Warming up models...", flush=True)
         self._llm_warmup_started_at = time.time()
         self._llm_warmup_threads = self._start_llm_warmup()
+
+        # Start HUD control-file watcher — picks up "end_session" / "stop"
+        # commands written by the HUD's right-click menu.
+        self._start_hud_control_watcher()
 
         # Determine and initialise Whisper backend
         self._whisper_backend = self._determine_whisper_backend()
@@ -2316,15 +3774,60 @@ class VoiceListener(threading.Thread):
             self.state_manager.check_hot_window_expiry(self.cfg.voice_debug)
             return
 
+        # INSTANT VAD-finalize ack: speak a tiny <0.4s acknowledgement
+        # the MOMENT speech endpoint is detected, BEFORE Whisper runs.
+        # Whisper medium takes 1-3s on long utterances; without this
+        # feedback the user hears NOTHING for 5-10s and assumes Jarvis
+        # is hung. This puts an audible response within ~300-500ms of
+        # them finishing their sentence.
+        #
+        # CRITICAL guardrail: only ack when we're ALREADY in the hot
+        # window (= post-wake-word, user is actively talking to Jarvis).
+        # Without this we'd ack on every household noise, TV chatter,
+        # or distant conversation that crosses VAD threshold — exactly
+        # the "Jarvis randomly says 'Угу' when nobody called him" bug.
+        try:
+            tts_busy = bool(self.tts and self.tts.is_speaking())
+        except Exception:
+            tts_busy = False
+        try:
+            in_hot_window = self.state_manager.is_hot_window_active()
+        except Exception:
+            in_hot_window = False
+        if (
+            self.tts
+            and self.tts.enabled
+            and audio_duration >= 1.0
+            and not tts_busy
+            and in_hot_window
+        ):
+            import random
+            # Use SHORT (≤0.4s) Ukrainian acks.
+            # CAUTION: don't use "ага" / "так" / "так-так" here —
+            # those are in CONFIRM_WORDS and a stray echo through the
+            # mic could falsely auto-confirm a pending PC-action.
+            quick_acks = ["Угу.", "Хм.", "М-м.", "Зрозумів."]
+            try:
+                self.tts.speak(random.choice(quick_acks))
+            except Exception:
+                pass
+
         # Speech recognition with appropriate backend
         try:
             if self._whisper_backend == "mlx":
                 # MLX Whisper transcription
                 with self.transcribe_lock:
+                    # Forced language hint — Whisper auto-detect on short
+                    # wake-word audio routinely guesses English (training
+                    # imbalance) and hallucinates "Thank you" / "Charlie's"
+                    # over real Ukrainian. Forcing 'uk' keeps it on the
+                    # right phonetic map and still transcribes RU and most
+                    # EN wake-word mishearings acceptably.
+                    forced_lang = getattr(self.cfg, "whisper_language", None) or None
                     result = mlx_whisper.transcribe(
                         audio,
                         path_or_hf_repo=self._mlx_model_repo,
-                        language=None,
+                        language=forced_lang,
                     )
 
                 # Capture Whisper's auto-detected language (ISO-639-1) so
@@ -2406,6 +3909,14 @@ class VoiceListener(threading.Thread):
         separator = "" if self._first_utterance else f"\n{'─' * 50}"
         self._first_utterance = False
         print(f"{separator}\n📝 Heard: \"{text}\"", flush=True)
+
+        # Filter out known-bad Whisper hallucination outputs on silence
+        # (these appear repeatedly with `whisper_no_speech_threshold` permissive
+        # and would otherwise spam intent-judge / fuzzy passes).
+        if self._is_known_hallucination(text):
+            debug_log(f"rejected known hallucination: '{text[:80]}...'", "voice")
+            self.state_manager.check_hot_window_expiry(self.cfg.voice_debug)
+            return
 
         # Filter out repetitive hallucinations (e.g., "don't don't don't...")
         if self._is_repetitive_hallucination(text):

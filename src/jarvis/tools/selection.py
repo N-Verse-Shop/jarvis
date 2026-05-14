@@ -145,8 +145,17 @@ def _select_keyword(
     matched = _ensure_always_included(matched, builtin_tools, mcp_tools)
 
     if len(matched) <= len(_ALWAYS_INCLUDED):
-        debug_log("Keyword tool selection found no matches, falling back to all tools", "planning")
-        return _all_tool_names(builtin_tools, mcp_tools)
+        # CHANGED: don't fall back to "all tools" — on a small voice model
+        # (qwen2.5:3b CPU) the 11-tool catalogue inflates the chat prompt to
+        # ~2000 tokens and blows the call past llm_chat_timeout_sec. The
+        # mandatory `stop` tool is enough for greetings / casual chat where
+        # no specific tool was matched. The model can still summon other
+        # tools via the conversation loop if it needs them (it returns a
+        # `toolSearchTool` request and we re-enter selection with a wider
+        # net). For most short voice queries, "stop only" lets the model
+        # reply directly in ~3-6s instead of timing out.
+        debug_log("Keyword tool selection found no matches, returning ALWAYS_INCLUDED only", "planning")
+        return [t for t in _ALWAYS_INCLUDED if t in builtin_tools or t in mcp_tools]
 
     debug_log(f"Keyword tool selection: {len(matched)}/{len(builtin_tools) + len(mcp_tools)} tools selected", "planning")
     return matched
@@ -375,6 +384,19 @@ def _select_llm(
 # Public API
 # ---------------------------------------------------------------------------
 
+_VOICE_HARD_CAP = 3
+"""Voice-mode safety: cap chat-prompt tool count at this number.
+
+On qwen2.5:3b CPU (Hetzner CCX23 @ ~23 tok/s), each tool description
+adds ~120 tokens of JSON schema to the chat prompt. With 11 tools that
+is ~1300 extra tokens, pushing the chat call past `llm_chat_timeout_sec`
+and producing the "Sorry, I had trouble processing that" English error
+that Piper UA sometimes garbles ("булькання"). Capping at 3 means the
+worst-case prompt stays under ~600 tokens of tool catalogue + ~1100
+tokens of system prompt = chat replies in ~6s instead of ~90s.
+"""
+
+
 def select_tools(
     query: str,
     builtin_tools: Dict[str, "Tool"],
@@ -405,17 +427,32 @@ def select_tools(
         List of tool name strings.
     """
     if strategy == ToolSelectionStrategy.KEYWORD:
-        return _select_keyword(query, builtin_tools, mcp_tools)
+        selected = _select_keyword(query, builtin_tools, mcp_tools)
     elif strategy == ToolSelectionStrategy.EMBEDDING:
-        return _select_embedding(
+        selected = _select_embedding(
             query, builtin_tools, mcp_tools,
             llm_base_url, embed_model, embed_timeout_sec,
         )
     elif strategy == ToolSelectionStrategy.LLM:
-        return _select_llm(
+        selected = _select_llm(
             query, builtin_tools, mcp_tools,
             llm_base_url, llm_model, llm_timeout_sec,
             context_hint=context_hint,
         )
     else:
-        return _all_tool_names(builtin_tools, mcp_tools)
+        selected = _all_tool_names(builtin_tools, mcp_tools)
+
+    # Apply voice hard cap. Always keep ALWAYS_INCLUDED (stop) so users can
+    # interrupt. Cap remaining tools at _VOICE_HARD_CAP-1 to keep chat-prompt
+    # token count manageable on CPU-served small models.
+    if len(selected) > _VOICE_HARD_CAP:
+        always = [t for t in selected if t in _ALWAYS_INCLUDED]
+        extra = [t for t in selected if t not in _ALWAYS_INCLUDED]
+        max_extra = max(0, _VOICE_HARD_CAP - len(always))
+        selected = always + extra[:max_extra]
+        debug_log(
+            f"Voice hard cap applied: {_VOICE_HARD_CAP} tools max "
+            f"(kept always-included + {max_extra} highest-scoring extras)",
+            "planning",
+        )
+    return selected

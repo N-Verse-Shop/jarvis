@@ -20,7 +20,8 @@ class StateManager:
     """Manages listening state transitions and timing."""
 
     def __init__(self, hot_window_seconds: float = 3.0, echo_tolerance: float = 0.3,
-                 voice_collect_seconds: float = 2.0, max_collect_seconds: float = 60.0):
+                 voice_collect_seconds: float = 2.0, max_collect_seconds: float = 60.0,
+                 hot_window_persistent: bool = False):
         """
         Initialize state manager.
 
@@ -29,11 +30,17 @@ class StateManager:
             echo_tolerance: Delay before activating hot window (for echo suppression)
             voice_collect_seconds: Silence timeout for query collection
             max_collect_seconds: Maximum time to collect a single query
+            hot_window_persistent: If True, hot window never auto-expires;
+                stays active until user says a stop command or right-clicks
+                the HUD coin to "End session". Disables the expiry timer
+                entirely and makes `_should_expire_hot_window()` always
+                return False.
         """
         self.hot_window_seconds = hot_window_seconds
         self.echo_tolerance = echo_tolerance
         self.voice_collect_seconds = voice_collect_seconds
         self.max_collect_seconds = max_collect_seconds
+        self.hot_window_persistent = hot_window_persistent
 
         # Current state
         self._state = ListeningState.WAKE_WORD
@@ -249,6 +256,38 @@ class StateManager:
                 self._hot_window_activation_timer = None
                 debug_log("cancelled pending hot window activation", "state")
 
+    def force_end_session(self) -> None:
+        """Force-exit hot window and return to wake-word listening.
+
+        Called when user says a stop command ("стоп", "досить", "тиша")
+        OR clicks "End session" in the HUD right-click menu. Works even
+        when `hot_window_persistent=True` — this is the ONLY way to leave
+        a persistent session.
+
+        Cancels both activation and expiry timers, flips state to
+        WAKE_WORD, and pushes the HUD to IDLE.
+        """
+        self.cancel_hot_window_activation()
+        self._cancel_hot_window_expiry_timer()
+        with self._state_lock:
+            was_hot = (self._state == ListeningState.HOT_WINDOW)
+            self._state = ListeningState.WAKE_WORD
+            self._hot_window_span_end = time.time()
+        debug_log(f"session force-ended (was_hot={was_hot})", "state")
+
+        # Push HUD to IDLE so the coin disappears.
+        try:
+            from desktop_app.face_widget import get_jarvis_state, JarvisState
+            get_jarvis_state().set_state(JarvisState.IDLE)
+        except ImportError:
+            pass
+        except Exception as e:
+            debug_log(f"force_end_session: failed to set HUD IDLE: {e}", "state")
+        try:
+            print("💤 Session ended — say 'Джарвіс' to start again\n", flush=True)
+        except Exception:
+            pass
+
     def _cancel_hot_window_expiry_timer(self) -> None:
         """Cancel the hot window expiry timer."""
         with self._timer_lock:
@@ -290,8 +329,14 @@ class StateManager:
         """Schedule hot window expiry timer.
 
         This timer guarantees expiry will fire even if no audio is being processed.
+
+        Skips entirely when `hot_window_persistent=True` — user explicitly
+        asked for sessions that stay alive until manually terminated.
         """
         self._cancel_hot_window_expiry_timer()
+        if self.hot_window_persistent:
+            debug_log("hot window expiry skipped (persistent mode)", "state")
+            return
 
         def _expire():
             with self._state_lock:
@@ -407,7 +452,12 @@ class StateManager:
 
         Note: With timer-based expiry, this is now mainly a fallback check.
         The timer should handle expiry automatically.
+
+        Always returns False when persistent mode is on — the session only
+        ends via explicit stop command or HUD right-click "End session".
         """
+        if self.hot_window_persistent:
+            return False
         if not self.is_hot_window_active():
             return False
         current_time = time.time()
