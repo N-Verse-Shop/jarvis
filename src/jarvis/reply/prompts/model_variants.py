@@ -23,11 +23,20 @@ class ModelSize(Enum):
 
 
 # Model size patterns - models matching these are considered SMALL
+# SMALL means: needs explicit tool constraints AND must use text-based
+# tool descriptions (in system prompt) rather than native tools API.
+# Add 8b/9b/gemma2/aya here because:
+#  - gemma2:9b doesn't support Ollama's native /api/chat tools= param
+#  - aya:8b same — multilingual but no native tool API
+#  - All ≤9B models benefit from explicit text-based tool guidance
 _SMALL_MODEL_PATTERNS = (
-    ":1b", ":3b", ":7b",
-    "-1b", "-3b", "-7b",
-    "_1b", "_3b", "_7b",
-    "gemma4",  # Gemma 4 - always small regardless of tag
+    ":1b", ":3b", ":7b", ":8b", ":9b",
+    "-1b", "-3b", "-7b", "-8b", "-9b",
+    "_1b", "_3b", "_7b", "_8b", "_9b",
+    "gemma4",   # Gemma 4 - always small regardless of tag
+    "gemma2",   # Gemma 2 - no native tools API
+    "aya",      # Cohere Aya - no native tools API
+    "mistral-nemo",  # 12B but uses text tools more reliably than native
 )
 
 

@@ -76,7 +76,7 @@ def check_ollama_endpoint() -> tuple[str, str, str]:
 def check_ollama_models() -> tuple[str, str, str]:
     """Required models present on Ollama server."""
     url = os.environ.get("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-    required = ["qwen2.5:7b", "qwen2.5:3b"]
+    required = ["gemma2:9b", "qwen2.5:3b"]
     try:
         with urllib.request.urlopen(f"{url}/api/tags", timeout=5) as r:
             import json
@@ -226,7 +226,7 @@ def check_disk_space() -> tuple[str, str, str]:
 CHECKS: list[tuple[str, Callable[[], tuple[str, str, str]]]] = [
     ("Python version", check_python_version),
     ("Ollama endpoint", check_ollama_endpoint),
-    ("Ollama models (qwen2.5:7b, 3b)", check_ollama_models),
+    ("Ollama models (gemma2:9b, qwen2.5:3b)", check_ollama_models),
     ("Piper TTS voice (uk_UA)", check_piper_voice),
     ("Whisper STT model cache", check_whisper_model),
     ("Audio input devices", check_audio_devices),
