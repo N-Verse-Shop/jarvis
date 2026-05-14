@@ -319,6 +319,24 @@ def main() -> None:
     print(f"🧠 Using chat model: {cfg.ollama_chat_model}", flush=True)
     print(f"🎤 Using whisper model: {cfg.whisper_model}", flush=True)
 
+    # Typed event: daemon startup. Single source of truth for HUD +
+    # observers to discover model/version without polling state.json.
+    try:
+        from .ipc import get_stream
+        from . import get_version
+        version, channel = get_version()
+        get_stream().emit(
+            "daemon_startup",
+            version=version,
+            channel=channel,
+            pid=os.getpid(),
+            chat_model=cfg.ollama_chat_model,
+            judge_model=getattr(cfg, "intent_judge_model", ""),
+            whisper_model=cfg.whisper_model,
+        )
+    except Exception as _e:
+        debug_log(f"failed to emit daemon_startup: {_e}", "jarvis")
+
     # MCP preflight: discover and cache external MCP tools
     mcps = getattr(cfg, "mcps", {}) or {}
     if mcps:
@@ -662,6 +680,16 @@ def main() -> None:
 
         debug_log("daemon stopped", "jarvis")
         print("👋 Daemon stopped", flush=True)
+
+        # Final typed event so HUD knows daemon went down cleanly
+        # (vs SIGKILL — observers can distinguish absence-of-event).
+        try:
+            from .ipc import get_stream
+            stream = get_stream()
+            stream.emit("daemon_shutdown", reason="orderly")
+            stream.disable()  # quiet rotations / writes after this point
+        except Exception:
+            pass
 
         # Skip Python's normal exit path to avoid torch destructor race.
         # PyTorch's c10::Dispatcher::deregisterFallback_ has a known

@@ -1660,6 +1660,17 @@ class VoiceListener(threading.Thread):
                 ).strip()
                 if not cleaned:
                     return
+                # Emit typed sentence event regardless of TTS being on
+                # (consumers like Telegram bridge may want text only).
+                try:
+                    from ..ipc import get_stream
+                    get_stream().emit(
+                        "sentence",
+                        text=cleaned,
+                        idx=len(sentences_spoken),
+                    )
+                except Exception:
+                    pass
                 if not (self.tts and self.tts.enabled):
                     return
                 try:
@@ -2263,6 +2274,17 @@ class VoiceListener(threading.Thread):
             query: Complete user query to process
         """
         debug_log(f"dispatching query: '{query}'", "voice")
+        # Emit typed STT-final event for HUD + any other consumers.
+        try:
+            from ..ipc import get_stream
+            get_stream().emit(
+                "stt_final",
+                text=query,
+                lang=getattr(self, "_active_language", "uk"),
+                confidence=1.0,
+            )
+        except Exception:
+            pass
 
         # Language switch check: "говори російською" / "switch to English"
         # → stage with confirmation. Active language defaults to UA on

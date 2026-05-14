@@ -60,14 +60,54 @@ _ACTION_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jarvis-acti
 
 
 def _run_async(fn: Callable[[], tuple[bool, str]], action_name: str) -> Future:
-    """Submit an action to the worker pool, logging result when done."""
+    """Submit an action to the worker pool, logging result when done.
+
+    Emits typed tool_call events at start and finish so HUD / debug
+    viewer / external observers can show progress without polling.
+    """
+    # Lazy import to avoid circular dep on ..ipc → ..debug → ...
+    try:
+        from ..ipc import get_stream
+        _stream = get_stream()
+    except Exception:
+        _stream = None
+
+    start_ts = time.time()
+    if _stream is not None:
+        try:
+            _stream.emit("tool_call", tool=action_name, status="starting")
+        except Exception:
+            pass
+
     def _wrap():
         try:
             ok, msg = fn()
             debug_log(f"async action {action_name}: ok={ok} msg={msg!r}", "voice")
+            if _stream is not None:
+                try:
+                    _stream.emit(
+                        "tool_call",
+                        tool=action_name,
+                        status="completed" if ok else "failed",
+                        result={"ok": ok, "message": msg},
+                        duration_ms=int((time.time() - start_ts) * 1000),
+                    )
+                except Exception:
+                    pass
             return ok, msg
         except Exception as e:
             debug_log(f"async action {action_name} crashed: {e}", "voice")
+            if _stream is not None:
+                try:
+                    _stream.emit(
+                        "tool_call",
+                        tool=action_name,
+                        status="failed",
+                        error=str(e),
+                        duration_ms=int((time.time() - start_ts) * 1000),
+                    )
+                except Exception:
+                    pass
             return False, f"Помилка: {e}"
     return _ACTION_POOL.submit(_wrap)
 

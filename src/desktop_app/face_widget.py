@@ -161,10 +161,24 @@ class JarvisStateManager(QObject):
     def set_state(self, state: JarvisState) -> None:
         """Set the Jarvis state (thread-safe, cross-process)."""
         with self._state_lock:
+            old = self._state
             self._state = state
 
         # Write to file for cross-process communication
         self._write_state(state)
+
+        # Emit typed event for HUD + observers (skip no-op transitions).
+        if old != state:
+            try:
+                from jarvis.ipc import get_stream
+                get_stream().emit(
+                    "state",
+                    state=state.value.upper(),
+                    previous=old.value.upper() if old else None,
+                    level=0.0,
+                )
+            except Exception:
+                pass
 
         # Emit signal for same-process listeners
         try:
