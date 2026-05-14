@@ -462,6 +462,17 @@ class VoiceListener(threading.Thread):
         self._silence_frames = 0
         self._utterance_frames: list = []
         self._frame_samples = 0
+        # Live transcription bookkeeping — sample buffer counter so we
+        # only emit a vad/level event every N frames (avoid event flood).
+        self._vad_emit_counter = 0
+        # Last time we kicked off a partial transcribe (per-utterance).
+        self._last_partial_ts = 0.0
+        # Set to True by force_finalize control action — voice loop
+        # immediately calls _finalize_utterance() on next iteration.
+        self._force_finalize_requested = False
+        # Set to True by cancel_utterance control action — voice loop
+        # drops accumulated frames without dispatching.
+        self._cancel_utterance_requested = False
         self._samplerate = int(getattr(self.cfg, "sample_rate", 16000))
         self._vad: Optional = None
 
@@ -3192,6 +3203,27 @@ class VoiceListener(threading.Thread):
                                 if self.tts and self.tts.enabled:
                                     self.tts.interrupt()
                                 print("  🔇 TTS muted (HUD right-click)", flush=True)
+                            elif action in ("force_finalize", "confirm_input"):
+                                # User clicked ✓ — finalise current
+                                # utterance NOW, don't wait for VAD pause.
+                                if self.is_speech_active:
+                                    self._force_finalize_requested = True
+                                    print("  ✓ Force-finalise (HUD)", flush=True)
+                                else:
+                                    debug_log(
+                                        "force_finalize ignored — no active speech",
+                                        "voice",
+                                    )
+                            elif action in ("cancel_utterance", "reset_input"):
+                                # User clicked ✗ — drop accumulated audio.
+                                if self.is_speech_active:
+                                    self._cancel_utterance_requested = True
+                                    print("  ✗ Cancel utterance (HUD)", flush=True)
+                                else:
+                                    debug_log(
+                                        "cancel_utterance ignored — no active speech",
+                                        "voice",
+                                    )
                             # Delete to avoid re-firing on next poll.
                             try:
                                 os.remove(ctrl_path)
@@ -3881,6 +3913,13 @@ class VoiceListener(threading.Thread):
                                 self._utterance_frames.extend(list(self._pre_roll))
                             self._utterance_frames.append(frame.copy())
                             self._silence_frames = 0
+                            self._last_partial_ts = time.time()
+                            # Emit speech-start so HUD can show "listening" UI
+                            try:
+                                from ..ipc import get_stream
+                                get_stream().emit("vad", speaking=True, level=0.0)
+                            except Exception:
+                                pass
                         else:
                             # Maintain pre-roll buffer
                             self._pre_roll.append(frame.copy())
@@ -3890,6 +3929,28 @@ class VoiceListener(threading.Thread):
                                 except Exception:
                                     break
                     else:
+                        # Control: force-finalize (user clicked ✓) → cut now
+                        if self._force_finalize_requested:
+                            self._force_finalize_requested = False
+                            debug_log("force-finalize requested by user", "voice")
+                            self._finalize_utterance()
+                            self._pre_roll.clear()
+                            continue
+                        # Control: cancel (user clicked ✗) → drop frames
+                        if self._cancel_utterance_requested:
+                            self._cancel_utterance_requested = False
+                            debug_log("cancel-utterance requested by user", "voice")
+                            self._utterance_frames = []
+                            self.is_speech_active = False
+                            self._silence_frames = 0
+                            self._pre_roll.clear()
+                            try:
+                                from ..ipc import get_stream
+                                get_stream().emit("vad", speaking=False, level=0.0)
+                                get_stream().emit("stt_partial", text="", lang=None)
+                            except Exception:
+                                pass
+                            continue
                         if is_voice:
                             self._utterance_frames.append(frame.copy())
                             self._silence_frames = 0
@@ -3900,6 +3961,27 @@ class VoiceListener(threading.Thread):
                             if self._silence_frames >= endpoint_silence_frames or len(self._utterance_frames) >= current_max_frames:
                                 self._finalize_utterance()
                                 self._pre_roll.clear()
+
+                        # Live UX:
+                        # 1) Emit VAD-level every ~100ms so HUD level meter
+                        #    pulses with real audio energy (not the random
+                        #    "thinking" shimmer it falls back to).
+                        # 2) Kick a background partial-transcribe every 2s
+                        #    while speech is active — gives user live caption
+                        #    BEFORE final endpoint silence.
+                        self._vad_emit_counter += 1
+                        if self._vad_emit_counter >= 5:  # frame_ms=20 → every 100ms
+                            self._vad_emit_counter = 0
+                            try:
+                                level = float(min(1.0, abs(frame).mean() * 8.0))
+                                from ..ipc import get_stream
+                                get_stream().emit("vad", speaking=True, level=level)
+                            except Exception:
+                                pass
+                        now_ts = time.time()
+                        if (now_ts - self._last_partial_ts) >= 2.0 and len(self._utterance_frames) > 10:
+                            self._last_partial_ts = now_ts
+                            self._schedule_partial_transcribe()
 
                     # Check for query timeouts
                     self._check_query_timeout()
@@ -3914,6 +3996,60 @@ class VoiceListener(threading.Thread):
                                 self._pre_roll.popleft()
                             except Exception:
                                 break
+
+    def _schedule_partial_transcribe(self) -> None:
+        """Spawn a background thread to transcribe current speech buffer.
+
+        Emits an stt_partial event with the partial text. Non-blocking —
+        the audio loop continues capturing without waiting for the result.
+        Uses a copy of _utterance_frames so the live loop can keep
+        appending without racing on the buffer.
+        """
+        if np is None or not self._utterance_frames:
+            return
+        if mlx_whisper is None or self._mlx_model_repo is None:
+            return  # only MLX path supports cheap partial right now
+        # Copy frames so we don't race with the audio thread mutating
+        # _utterance_frames while we're concatenating.
+        frames_copy = list(self._utterance_frames)
+
+        def _run():
+            try:
+                audio = np.concatenate(frames_copy, axis=0).flatten()
+                # Cheap transcribe — single temperature, no beam search,
+                # no logprob filtering. This is intentional: we're
+                # showing a hint to the user, not the canonical result.
+                forced_lang = getattr(self.cfg, "whisper_language", None) or None
+                with self.transcribe_lock:
+                    result = mlx_whisper.transcribe(
+                        audio,
+                        path_or_hf_repo=self._mlx_model_repo,
+                        language=forced_lang,
+                        temperature=0.0,
+                        condition_on_previous_text=False,
+                    )
+                text = (result.get("text") or "").strip()
+                if not text:
+                    return
+                # Drop known Whisper silence-hallucinations
+                low = text.lower()
+                if any(hallu in low for hallu in (
+                    "субтитри", "subtitles by", "thank you for watching",
+                    "продолжение следует", "music",
+                )):
+                    return
+                lang = result.get("language") or forced_lang
+                try:
+                    from ..ipc import get_stream
+                    get_stream().emit("stt_partial", text=text, lang=lang)
+                except Exception:
+                    pass
+            except Exception as e:
+                debug_log(f"partial transcribe failed: {e}", "voice")
+
+        threading.Thread(
+            target=_run, daemon=True, name="jarvis-partial-stt"
+        ).start()
 
     def _finalize_utterance(self) -> None:
         """Process completed utterance through speech recognition."""
