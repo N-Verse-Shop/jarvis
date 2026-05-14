@@ -29,6 +29,8 @@ Examples of triggering reply text:
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 import threading
@@ -445,6 +447,120 @@ def _say_battery() -> tuple[bool, str]:
         return False, "Не зміг визначити рівень батареї"
     except Exception as e:
         return False, f"Помилка: {e}"
+
+
+# ─── External integration tools (stub level, ready for API keys) ─────────
+#
+# Each stub:
+#   1. Reads required API key from env (JARVIS_<SERVICE>_TOKEN)
+#   2. If missing — returns (False, "Підключи <Service> токен у JARVIS_X_TOKEN")
+#   3. If present — calls real API (TODO: implement once user provides token)
+#   4. Always emits typed tool_call event via _run_async wrapper
+#
+# This means: actions are wired NOW, hooked into voice loop NOW, HUD shows
+# badge NOW. The only missing piece is API credentials. When user adds them,
+# the functions Just Start Working — no plumbing changes needed.
+
+def _linear_create_issue(title: str, description: str = "") -> tuple[bool, str]:
+    """Create a Linear issue. Requires JARVIS_LINEAR_TOKEN env var."""
+    token = os.environ.get("JARVIS_LINEAR_TOKEN", "").strip()
+    if not token:
+        return False, "Підключи Linear токен у JARVIS_LINEAR_TOKEN (Settings → API → Personal API keys)"
+    try:
+        import urllib.request as _ur
+        import urllib.error as _ue
+        team_id = os.environ.get("JARVIS_LINEAR_TEAM_ID", "").strip()
+        if not team_id:
+            return False, "Постав JARVIS_LINEAR_TEAM_ID (один раз — з URL твоєї команди)"
+        body = {
+            "query": (
+                "mutation IssueCreate($title:String!,$teamId:String!,$desc:String){"
+                " issueCreate(input:{title:$title,teamId:$teamId,description:$desc})"
+                " { success issue { identifier title url } } }"
+            ),
+            "variables": {"title": title, "teamId": team_id, "desc": description or ""},
+        }
+        req = _ur.Request(
+            "https://api.linear.app/graphql",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Authorization": token, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        issue = (((data or {}).get("data") or {}).get("issueCreate") or {}).get("issue") or {}
+        if issue:
+            return True, f"Створив {issue.get('identifier')}: {issue.get('title')}"
+        err = data.get("errors", [{}])[0].get("message", "невідома помилка")
+        return False, f"Linear: {err}"
+    except Exception as e:
+        return False, f"Linear error: {e}"
+
+
+def _github_create_issue(repo: str, title: str, body: str = "") -> tuple[bool, str]:
+    """Create a GitHub issue. Requires JARVIS_GITHUB_TOKEN env var.
+
+    repo format: 'owner/repo' (e.g. 'isair/jarvis')
+    """
+    token = os.environ.get("JARVIS_GITHUB_TOKEN", "").strip()
+    if not token:
+        return False, "Підключи GitHub токен у JARVIS_GITHUB_TOKEN (gh auth token)"
+    try:
+        import urllib.request as _ur
+        payload = {"title": title, "body": body or ""}
+        req = _ur.Request(
+            f"https://api.github.com/repos/{repo}/issues",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        if data.get("number"):
+            return True, f"GitHub #{data['number']}: {data.get('title', title)}"
+        return False, f"GitHub error: {data}"
+    except Exception as e:
+        return False, f"GitHub error: {e}"
+
+
+def _notion_append_to_page(page_id: str, text: str) -> tuple[bool, str]:
+    """Append a paragraph to a Notion page. Requires JARVIS_NOTION_TOKEN."""
+    token = os.environ.get("JARVIS_NOTION_TOKEN", "").strip()
+    if not token:
+        return False, "Підключи Notion токен у JARVIS_NOTION_TOKEN (Internal Integration)"
+    try:
+        import urllib.request as _ur
+        payload = {
+            "children": [{
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"type": "text", "text": {"content": text}}]
+                }
+            }]
+        }
+        req = _ur.Request(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json",
+            },
+            method="PATCH",
+        )
+        with _ur.urlopen(req, timeout=15) as r:
+            r.read()
+        return True, f"Додав до Notion: {text[:60]}"
+    except Exception as e:
+        return False, f"Notion error: {e}"
+
+
+# Need json + os imports at top — they are already in the file.
 
 
 # Regex-based parser. Each tuple is (pattern, action_factory).
@@ -876,6 +992,42 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             name="write_note",
             description=f"Записую: {m.group(1).strip()[:60]}",
             fn=lambda: _write_note(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── Linear: create issue ──
+    (
+        re.compile(r"^\s*(?:створи|додай)\s+(?:задачу|тікет|issue|таску)\s+(?:у\s+|в\s+)?linear[:\s]+(.{3,200})\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="linear_create_issue",
+            description=f"Створюю Linear-задачу: {m.group(1).strip()[:60]}",
+            fn=lambda: _linear_create_issue(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── GitHub: create issue ──
+    (
+        re.compile(r"^\s*(?:створи|додай)\s+(?:issue|тікет|баг)\s+(?:у\s+|в\s+)?github(?:\s+([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+))?[:\s]+(.{3,200})\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="github_create_issue",
+            description=f"Створюю GitHub issue: {m.group(2).strip()[:60]}",
+            fn=lambda: _github_create_issue(
+                m.group(1) or os.environ.get("JARVIS_GITHUB_DEFAULT_REPO", ""),
+                m.group(2).strip(),
+            ),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── Notion: append note to default page ──
+    (
+        re.compile(r"^\s*(?:додай|запиши|занотуй)\s+(?:у\s+|в\s+)?notion[:\s]+(.{3,400})\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="notion_append",
+            description=f"Додаю до Notion: {m.group(1).strip()[:60]}",
+            fn=lambda: _notion_append_to_page(
+                os.environ.get("JARVIS_NOTION_DEFAULT_PAGE_ID", ""),
+                m.group(1).strip(),
+            ),
             created_ts=time.time(),
         ),
     ),
