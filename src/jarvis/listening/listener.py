@@ -98,7 +98,12 @@ VOICE_STATIC_SYSTEM_PROMPT = (
     "3. Не знаєш точно — почни з 'Не знаю напевно' (сигнал для веб-пошуку).\n"
     "4. Без markdown, emoji, формул, посилань.\n"
     "5. Без повторів вже сказаного.\n"
-    "6. Тон: професійний, дружній технічний радник.\n\n"
+    "6. Тон: професійний, дружній технічний радник.\n"
+    "7. КОЖНА НОВА РЕПЛІКА КОРИСТУВАЧА — НОВА ТЕМА. Відповідай на ПОТОЧНИЙ "
+    "запит. Не повертайся до попередньої теми (наприклад: пропонував "
+    "відкрити Safari, а тепер питають про погоду — відповідай про погоду, "
+    "забудь Safari). Контекст потрібен лише якщо новий запит явно "
+    "посилається на попередній ('а ще…', 'так само…', 'а той файл').\n\n"
     "ТВОЇ MAC-ДІЇ (для команд керування ПК):\n"
     "Коли користувач просить дію — скажи рівно одну фразу-тригер, "
     "потім чекай слова 'виконуй'. Якщо запит вже містить 'виконуй' — дій одразу.\n"
@@ -1561,7 +1566,12 @@ class VoiceListener(threading.Thread):
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": lang_directive},
         ]
-        messages.extend(self._dialog_history[-10:])
+        # Use only the last 4 messages (2 turns) for context. On a 7b
+        # CPU model, more history causes "positional anchoring": the
+        # model latches onto the previous topic and ignores new
+        # queries. 2 turns is enough to maintain coherent dialogue
+        # without dragging stale context.
+        messages.extend(self._dialog_history[-4:])
         messages.append({"role": "user", "content": query})
 
         try:
@@ -2257,8 +2267,25 @@ class VoiceListener(threading.Thread):
                 self._pending_action = None
                 self._speak_and_continue("Скасовано.")
                 return
-            # Otherwise — user said something new, drop the pending action.
+            # Otherwise — user said something new (not confirm/deny).
+            # Drop the pending action AND remove the "Зараз відкрию X.
+            # Підтверди..." proposal from dialog history, otherwise the
+            # LLM keeps anchoring the next reply to that abandoned
+            # action and ignores the actual new query.
             self._pending_action = None
+            try:
+                if (
+                    self._dialog_history
+                    and self._dialog_history[-1].get("role") == "assistant"
+                    and "підтверди" in self._dialog_history[-1].get("content", "").lower()
+                ):
+                    # Pop the orphan assistant proposal + its paired user msg
+                    self._dialog_history.pop()
+                    if self._dialog_history and self._dialog_history[-1].get("role") == "user":
+                        self._dialog_history.pop()
+                    debug_log("removed abandoned action proposal from history", "voice")
+            except Exception:
+                pass
 
         # Clear audio buffers to prevent stale audio from next query
         self._clear_audio_buffers()

@@ -72,6 +72,37 @@ def _get_jarvis_state_file() -> str:
     return os.path.join(tempfile.gettempdir(), "jarvis_state")
 
 
+def _get_hud_state_file() -> str:
+    """JSON state path consumed by the Electron HUD overlay (mac-client/hud).
+
+    The HUD watches this file with fs.watch + 250ms poll and renders the
+    corresponding 3D-coin animation. Kept separate from the legacy plain-text
+    file so the existing face widget keeps working untouched."""
+    base = os.path.expanduser("~/Library/Application Support/jarvis")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(base, "state.json")
+
+
+def _write_hud_state(state_value: str, level: float = 0.0) -> None:
+    """Atomically push a state payload to the HUD overlay.
+
+    Writes to a temp file then os.replace so the HUD never reads a torn JSON.
+    Silent on failure — HUD is a non-critical visual addon."""
+    import json
+    payload = {"state": state_value.upper(), "ts": _time.time(), "level": float(level)}
+    target = _get_hud_state_file()
+    tmp = target + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(payload))
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
 class JarvisStateManager(QObject):
     """Global singleton for Jarvis state management.
 
@@ -119,6 +150,13 @@ class JarvisStateManager(QObject):
         except OSError:
             # File write failed - state won't be shared across processes
             pass
+        # Mirror to the HUD overlay's JSON path so the Electron coin reacts
+        # in lock-step with the face widget. ASLEEP collapses to IDLE for
+        # the HUD's state machine (HUD hides on IDLE, no "ASLEEP" concept).
+        hud_state = state.value
+        if hud_state == "asleep":
+            hud_state = "idle"
+        _write_hud_state(hud_state)
 
     def set_state(self, state: JarvisState) -> None:
         """Set the Jarvis state (thread-safe, cross-process)."""
