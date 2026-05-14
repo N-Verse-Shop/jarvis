@@ -110,20 +110,28 @@ VOICE_STATIC_SYSTEM_PROMPT = (
     "• Перед видачею ПРОЧИТАЙ свою відповідь подумки і перевір "
     "кожне закінчення. Якщо сумніваєшся — використовуй простіше слово.\n\n"
     "Як відповідати (голосовий формат — слухаються вголос):\n"
-    "1. ЗМІСТОВНО і КОНКРЕТНО: факти, числа, кроки.\n"
+    "1. ЗМІСТОВНО, ПОВНО і КОНКРЕТНО: факти, числа, кроки, причини, поради. "
+    "НЕ обрізай відповідь штучно. Якщо тема потребує 5 речень — давай 5. "
+    "Якщо 1 — давай 1. Користувач прибрав обмеження на довжину.\n"
     "2. Без слів-наповнювачів ('Добре,', 'Зрозумів,', 'Звичайно,', 'Угу', 'Хм').\n"
     "3. БЕЗ ВИГУКІВ ВЗАГАЛІ — ніколи не починай з 'Угу/Ага/М-м/Зараз думаю'.\n"
-    "4. Не знаєш точно — почни з 'Не знаю напевно' (сигнал для веб-пошуку).\n"
-    "5. Без markdown, emoji, формул, посилань.\n"
-    "6. Без повторів вже сказаного.\n"
-    "7. Тон: професійний, дружній технічний радник, лаконічний.\n"
-    "8. КОЖНА НОВА РЕПЛІКА КОРИСТУВАЧА — НОВА ТЕМА. Відповідай на ПОТОЧНИЙ "
+    "4. Не зрозумів запит чітко — ОДНИМ коротким реченням перепитай "
+    "('Уточни — ти про X чи про Y?'). Краще запитати, ніж дати неправильну "
+    "відповідь.\n"
+    "5. Не знаєш точно — почни з 'Не знаю напевно' (сигнал для веб-пошуку), "
+    "потім давай те що знаєш.\n"
+    "6. Без markdown, emoji, формул, посилань — текст для синтезу голосу.\n"
+    "7. Без повторів вже сказаного.\n"
+    "8. Тон: професійний, дружній технічний радник. Лаконічно ≠ обрізано — "
+    "розкривай тему повністю, але без води.\n"
+    "9. КОЖНА НОВА РЕПЛІКА КОРИСТУВАЧА — НОВА ТЕМА. Відповідай на ПОТОЧНИЙ "
     "запит. Не повертайся до попередньої теми (наприклад: пропонував "
     "відкрити Safari, а тепер питають про погоду — відповідай про погоду, "
     "забудь Safari). Контекст потрібен лише якщо новий запит явно "
     "посилається на попередній ('а ще…', 'так само…', 'а той файл').\n"
-    "9. РЕЧЕННЯ КОРОТКІ (5-12 слів). Голос складно слухати довгі — "
-    "розбивай на 2-3 короткі замість одного довгого.\n\n"
+    "10. РЕЧЕННЯ ОПТИМАЛЬНО 8-15 слів. Голос складно слухати дуже довгі — "
+    "розбивай на 2-3 коротких замість одного довжелезного. АЛЕ кількість "
+    "речень не обмежена — давай стільки скільки треба для повної відповіді.\n\n"
     "ТВОЇ MAC-ДІЇ (для команд керування ПК):\n"
     "Коли користувач просить дію — скажи рівно одну фразу-тригер, "
     "потім чекай слова 'виконуй'. Якщо запит вже містить 'виконуй' — дій одразу.\n"
@@ -1614,20 +1622,23 @@ class VoiceListener(threading.Thread):
                     "keep_alive": "30m",
                     "options": {
                         "temperature": 0.4,
-                        # 150 tokens for 7b chat. 7b @ Hetzner CCX23 CPU
-                        # ≈ 8 tok/s → 150 tokens = ~18s worst-case warm.
-                        # Most voice answers fit in 80-120 tokens; this
-                        # leaves headroom without paying a full 25s tail.
-                        "num_predict": 120,
-                        "repeat_penalty": 1.25,
-                        "repeat_last_n": 128,
-                        "presence_penalty": 0.4,
-                        "frequency_penalty": 0.3,
-                        # 2560 ctx fits static prompt (~500t) + lang (~30t)
-                        # + 10 history msgs (~1500t) + query (~50t) + reply
-                        # (~200t) with margin. Smaller ctx = faster
-                        # prompt-eval on CPU (linear in ctx size).
-                        "num_ctx": 2560,
+                        # 600 tokens — user explicitly removed the cap
+                        # ("прибрати ограніченіє на коротки відповіді").
+                        # gemma2:9b ~6-7 tok/s on CCX23 CPU → 600 toks
+                        # = ~90s worst-case. Streaming TTS speaks
+                        # sentence-by-sentence so user starts hearing
+                        # at ~3-5s anyway — full generation only matters
+                        # if the answer NEEDS the full length.
+                        "num_predict": 600,
+                        "repeat_penalty": 1.2,
+                        "repeat_last_n": 192,
+                        "presence_penalty": 0.3,
+                        "frequency_penalty": 0.2,
+                        # 4096 ctx — leaves room for longer prompts
+                        # (long history, multi-turn context) and
+                        # longer replies. gemma2:9b handles 4096 fine
+                        # at ~3-4s prompt-eval per kilo-token warm.
+                        "num_ctx": 4096,
                         # 4 worker threads (Hetzner CCX23 = 4 vCPU).
                         "num_thread": 4,
                         # Larger batch = more tokens per prompt-eval pass
@@ -1635,9 +1646,10 @@ class VoiceListener(threading.Thread):
                         "num_batch": 256,
                     },
                 },
-                # 120s hard limit — 7b cold-cache rebuild can hit 60-90s
-                # on first call; warm subsequent calls return in 7-25s.
-                timeout=120.0,
+                # 240s hard limit — gemma2:9b cold-cache rebuild can
+                # hit 60-90s on first call; warm subsequent calls
+                # return in 8-30s. 600 num_predict at 6 tok/s = 100s.
+                timeout=240.0,
                 stream=True,
             )
             if response.status_code != 200:
@@ -3045,12 +3057,12 @@ class VoiceListener(threading.Thread):
                                     # cache slot. Any drift = cache miss
                                     # on first real call = 15-25s pause.
                                     "temperature": 0.4,
-                                    "num_predict": 120,
-                                    "repeat_penalty": 1.25,
-                                    "repeat_last_n": 128,
-                                    "presence_penalty": 0.4,
-                                    "frequency_penalty": 0.3,
-                                    "num_ctx": 2560,
+                                    "num_predict": 600,
+                                    "repeat_penalty": 1.2,
+                                    "repeat_last_n": 192,
+                                    "presence_penalty": 0.3,
+                                    "frequency_penalty": 0.2,
+                                    "num_ctx": 4096,
                                     "num_thread": 4,
                                     "num_batch": 256,
                                 },
@@ -3970,10 +3982,31 @@ class VoiceListener(threading.Thread):
                     # right phonetic map and still transcribes RU and most
                     # EN wake-word mishearings acceptably.
                     forced_lang = getattr(self.cfg, "whisper_language", None) or None
+                    # Better recognition: temperature fallback (default
+                    # only [0.0] — adding fallbacks lets Whisper retry
+                    # when confidence drops), wider beam search for
+                    # tricky accents/dialects. Cost: ~30% slower on
+                    # marginal audio, but user explicitly asked
+                    # "краще навчити джарвіса розуміти мене".
                     result = mlx_whisper.transcribe(
                         audio,
                         path_or_hf_repo=self._mlx_model_repo,
                         language=forced_lang,
+                        temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+                        # condition_on_previous_text=False prevents
+                        # Whisper from "remembering" the previous
+                        # utterance and bleeding into the next — common
+                        # cause of "repeated phrase" hallucinations in
+                        # back-to-back queries.
+                        condition_on_previous_text=False,
+                        # Compression ratio threshold: if Whisper's
+                        # output is too repetitive (signs of decoding
+                        # collapse), reject and retry with higher temp.
+                        compression_ratio_threshold=2.4,
+                        # If logprob drops below this, retry. Default
+                        # -1.0; -1.2 is more permissive — keeps hard
+                        # accents from being dropped.
+                        logprob_threshold=-1.2,
                     )
 
                 # Capture Whisper's auto-detected language (ISO-639-1) so
