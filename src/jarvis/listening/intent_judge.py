@@ -24,11 +24,14 @@ except ImportError:
 
 
 def warm_up_ollama_model(base_url: str, model: str, timeout: float) -> bool:
-    """Ask Ollama to load ``model`` into memory with a 30m keep_alive.
+    """Ask Ollama to load ``model`` into memory with a 24h keep_alive.
 
     Issues a minimal ``/api/generate`` request so the weights are resident
-    before the first real request. Best-effort — errors are logged and
-    swallowed so callers never crash on warmup failure.
+    before the first real request. 24h keep_alive means the model never
+    gets unloaded during normal use — critical for warm-cache TTFT
+    (time-to-first-token) of ~1.2s vs ~5-15s on cold load.
+    Best-effort — errors are logged and swallowed so callers never crash
+    on warmup failure.
     """
     if not REQUESTS_AVAILABLE or not base_url or not model:
         return False
@@ -39,7 +42,7 @@ def warm_up_ollama_model(base_url: str, model: str, timeout: float) -> bool:
                 "model": model,
                 "prompt": "",
                 "stream": False,
-                "keep_alive": "30m",
+                "keep_alive": "24h",
                 "options": {"num_predict": 1},
             },
             timeout=timeout,
@@ -365,7 +368,7 @@ Examples (English+Ukrainian):
                     "prompt": "[warmup] Jarvis say hello",
                     "system": sys_prompt,
                     "stream": False,
-                    "keep_alive": "30m",
+                    "keep_alive": "24h",
                     "options": {
                         "temperature": 0.0,
                         "num_predict": 80,
@@ -442,7 +445,7 @@ Examples (English+Ukrainian):
                     "system": system_prompt,
                     "stream": False,
                     "think": self.config.thinking,
-                    "keep_alive": "30m",
+                    "keep_alive": "24h",
                     "options": {
                         "temperature": 0.0,
                         # 300 tokens: 80-char query + JSON envelope +

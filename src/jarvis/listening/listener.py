@@ -1630,7 +1630,7 @@ class VoiceListener(threading.Thread):
                     "model": model,
                     "messages": messages,
                     "stream": True,
-                    "keep_alive": "30m",
+                    "keep_alive": "24h",
                     "options": {
                         "temperature": 0.4,
                         # 600 tokens — user explicitly removed the cap
@@ -1821,7 +1821,7 @@ class VoiceListener(threading.Thread):
                                     "model": model,
                                     "messages": retry_msgs,
                                     "stream": False,
-                                    "keep_alive": "30m",
+                                    "keep_alive": "24h",
                                     "options": {
                                         "temperature": 0.4,
                                         "num_predict": 500,
@@ -3061,7 +3061,7 @@ class VoiceListener(threading.Thread):
                                     {"role": "user", "content": "[warmup] привіт"},
                                 ],
                                 "stream": False,
-                                "keep_alive": "30m",
+                                "keep_alive": "24h",
                                 "options": {
                                     # Match _voice_direct_chat options
                                     # EXACTLY so warmup primes the same
