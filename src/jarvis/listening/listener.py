@@ -2105,11 +2105,75 @@ class VoiceListener(threading.Thread):
         # Single-word "test"/"перевірка"/"чуєш мене" — confirm liveness.
         liveness = {
             "тест", "перевірка", "тестування", "чуєш", "чуєш мене", "ти тут",
+            "ти мене чуєш", "чути", "ти живий", "ти працюєш",
             "test", "testing", "are you there", "can you hear me",
             "проверка", "слышишь меня",
         }
         if q in liveness:
             return "Чую вас. Працюю."
+
+        # Confirmations / brief acks — bypass intent judge entirely.
+        # These phrases ALONE shouldn't trigger the LLM at all.
+        # NOTE: these are also CONFIRM_WORDS for pending actions — that
+        # path handles them in _dispatch_query BEFORE we reach canned.
+        # Here we only hit them as standalone utterances when no action
+        # is pending — in which case we acknowledge and stay quiet.
+        bare_acks = {
+            "ок", "окей", "ага", "так", "добре", "гаразд", "зрозумів",
+            "ok", "okay", "yep", "yeah", "sure",
+            "хорошо", "понятно", "ладно",
+        }
+        if q in bare_acks:
+            return "Гаразд."
+
+        # Identity / who-are-you — common test phrases.
+        identity = {
+            "хто ти", "як тебе звати", "ти хто", "представся",
+            "who are you", "what are you", "what's your name",
+            "кто ты", "как тебя зовут",
+        }
+        if q in identity:
+            return "Я — Джарвіс, ваш AI-асистент. Готовий допомогти."
+
+        # Sorry / apology — symmetric ack.
+        apologies = {
+            "вибач", "вибачте", "пробач", "прости", "перепрошую",
+            "sorry", "my bad", "excuse me",
+            "извини", "извините",
+        }
+        if q in apologies:
+            return "Нічого, працюємо далі."
+
+        # Quick yes/no questions about Jarvis capability are misleading
+        # to canned — leave to LLM.
+
+        # Common short questions that don't really need LLM — answer
+        # straight away.
+        if q in {"котра година", "котра зараз година", "скільки часу", "який час"}:
+            from datetime import datetime
+            now = datetime.now()
+            weekday = ["понеділок", "вівторок", "середа", "четвер",
+                       "п'ятниця", "субота", "неділя"][now.weekday()]
+            return f"Зараз {now.strftime('%H:%M')}, {weekday}."
+
+        if q in {"яке сьогодні число", "яка дата", "який сьогодні день",
+                 "який день тижня", "сьогодні який день"}:
+            from datetime import datetime
+            now = datetime.now()
+            months = ["січня", "лютого", "березня", "квітня", "травня", "червня",
+                      "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
+            weekday = ["понеділок", "вівторок", "середа", "четвер",
+                       "п'ятниця", "субота", "неділя"][now.weekday()]
+            return f"Сьогодні {weekday}, {now.day} {months[now.month-1]} {now.year} року."
+
+        # Compliment / nice — friendly echo.
+        compliments = {
+            "ти класний", "молодець", "круто", "супер", "відмінно",
+            "good job", "well done", "nice",
+            "молодец", "класс",
+        }
+        if q in compliments:
+            return "Дякую! Радий допомогти."
 
         return ""
 
@@ -2327,7 +2391,9 @@ class VoiceListener(threading.Thread):
         # so ACTION_PATTERNS never matched on its reply. Direct parser
         # solves that by skipping the LLM for unambiguous commands.
         try:
-            from .action_dispatcher import parse_user_command
+            from .action_dispatcher import (
+                parse_user_command, _run_async, SYNC_ACTIONS,
+            )
             direct = parse_user_command(query)
             if direct is not None:
                 debug_log(
@@ -2339,8 +2405,21 @@ class VoiceListener(threading.Thread):
                     get_jarvis_state().set_state(JarvisState.SPEAKING)
                 except Exception:
                     pass
-                ok, msg = direct.fn()
-                self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+                # SYNC actions (battery/time/clipboard) return data the
+                # user needs to hear — must run inline.
+                # ASYNC actions (open_app/lock/mute/etc) — submit to
+                # worker pool and speak the description immediately so
+                # voice loop doesn't block on 10s subprocess timeout.
+                if direct.name in SYNC_ACTIONS:
+                    ok, msg = direct.fn()
+                    spoken = msg if ok else f"Не вийшло. {msg}"
+                else:
+                    _run_async(direct.fn, direct.name)
+                    # User hears the description ("Відкриваю Safari") —
+                    # action completes in background, status is logged.
+                    spoken = direct.description
+                    msg = spoken  # for dialog history
+                self._speak_and_continue(spoken)
                 # Store in dialog history so context stays coherent
                 try:
                     self._dialog_history.append({"role": "user", "content": query})

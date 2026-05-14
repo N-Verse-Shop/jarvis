@@ -31,11 +31,54 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..debug import debug_log
+
+
+# ─── async worker pool ───────────────────────────────────────────────────
+#
+# Subprocess-based actions (open -a Safari, pmset, osascript) can take
+# 5-10s on cold system caches. Running them inline blocks the voice
+# loop — TTS doesn't speak the "Відкриваю Safari" confirmation until
+# AFTER Safari is fully launched. From user POV: voice freezes.
+#
+# Solution: ThreadPoolExecutor runs the subprocess work in background.
+# Voice loop speaks the ack immediately, action completes async, the
+# result message is logged only (TTS already done). For actions that
+# MUST report a result (battery level, clipboard read), we still run
+# sync — those return data the user needs to hear.
+#
+# Worker pool is module-global, max 4 concurrent — enough for chained
+# voice commands ("відкрий Safari та зменши гучність") without burst.
+
+_ACTION_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jarvis-action")
+
+
+def _run_async(fn: Callable[[], tuple[bool, str]], action_name: str) -> Future:
+    """Submit an action to the worker pool, logging result when done."""
+    def _wrap():
+        try:
+            ok, msg = fn()
+            debug_log(f"async action {action_name}: ok={ok} msg={msg!r}", "voice")
+            return ok, msg
+        except Exception as e:
+            debug_log(f"async action {action_name} crashed: {e}", "voice")
+            return False, f"Помилка: {e}"
+    return _ACTION_POOL.submit(_wrap)
+
+
+# Actions that SHOULD run sync because they return data the user needs:
+SYNC_ACTIONS = {
+    "battery",      # returns "Батарея 80%, заряджається"
+    "say_time",     # returns "Зараз 14:30, четвер"
+    "clipboard",    # returns "В буфері: ..."
+    "read_clipboard",
+}
 
 
 # ─── action definitions ──────────────────────────────────────────────────
