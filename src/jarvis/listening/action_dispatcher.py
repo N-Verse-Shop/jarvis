@@ -549,3 +549,183 @@ def detect_language_switch(user_text: str) -> tuple[str, str] | None:
         if pat.search(user_text):
             return lang, ack
     return None
+
+
+# ─── DIRECT user-command parser ──────────────────────────────────────────
+#
+# Bypass the LLM entirely for unambiguous PC-control phrases. The user
+# complained: "він всерівно неможе навіть відкрити сафарі" — qwen2.5:7b
+# on CPU was either inventing JSON, mis-quoting, or just answering with
+# text that didn't match ACTION_PATTERNS. So for the most common
+# imperative voice commands we skip the LLM round-trip and execute
+# directly. Latency: ~50ms vs 15-25s.
+#
+# Patterns target what the USER says, not what the LLM says:
+#   "відкрий Safari" → _open_app("Safari")
+#   "запусти Telegram" → _open_app("Telegram")
+#   "гучність 30" → _set_volume(30)
+#   "пауза" / "наступний трек" → music
+#   "котра година" → say_time
+#   "вимкни звук" → mute
+#   "заблокуй екран" → lock
+#
+# These run WITHOUT confirmation — user already said the imperative.
+# If the parse is ambiguous, we fall through to the LLM as before.
+
+USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
+    # ── URL open ── (MUST come before open_app — URLs contain dots)
+    (
+        re.compile(r"^\s*(?:від|за)крий(?:те)?\s+(?:сайт\s+|сторінку\s+)?((?:https?://)?[a-z0-9-]+\.[a-z]{2,}(?:/\S*)?)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="open_url",
+            description=f"Відкриваю {m.group(1).strip()}",
+            fn=lambda: _open_url(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── apps ── (must match clean imperatives, no dots)
+    (
+        re.compile(r"^\s*(?:а\s+)?(?:будь\s+ласка\s+)?(?:від|за)крий(?:те)?\s+(?:додаток\s+|програму\s+)?([A-Za-zА-Яа-яЇїІіЄєҐґ][A-Za-zА-Яа-яЇїІіЄєҐґ0-9\s-]{1,30})\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="open_app",
+            description=f"Відкриваю {m.group(1).strip()}",
+            fn=lambda: _open_app(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    (
+        re.compile(r"^\s*(?:будь\s+ласка\s+)?запусти(?:те)?\s+(?:додаток\s+|програму\s+)?([A-Za-zА-Яа-яЇїІіЄєҐґ][A-Za-zА-Яа-яЇїІіЄєҐґ0-9\s-]{1,30})\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="open_app",
+            description=f"Запускаю {m.group(1).strip()}",
+            fn=lambda: _open_app(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── volume ──
+    (
+        re.compile(r"^\s*(?:встав|постав|зроби|постав\s+на)\s+гучн[іо]ст[ьі]?\s+(?:на\s+|до\s+)?(\d{1,3})\s*(?:відсотк|процент)?\w*\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="set_volume",
+            description=f"Гучність {m.group(1)}",
+            fn=lambda: _set_volume(int(m.group(1))),
+            created_ts=time.time(),
+        ),
+    ),
+    (
+        re.compile(r"^\s*гучн[іо]ст[ьі]?\s+(\d{1,3})\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="set_volume",
+            description=f"Гучність {m.group(1)}",
+            fn=lambda: _set_volume(int(m.group(1))),
+            created_ts=time.time(),
+        ),
+    ),
+    (
+        re.compile(r"^\s*вимкни\s+звук\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="mute", description="Вимикаю звук", fn=_mute_system, created_ts=time.time()),
+    ),
+    (
+        re.compile(r"^\s*увімкни\s+звук\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="unmute", description="Увімкаю звук", fn=_unmute_system, created_ts=time.time()),
+    ),
+    # ── screen ──
+    (
+        re.compile(r"^\s*(?:за)?блокуй(?:те)?\s+(?:екран|комп[`']?ютер|маку?|ноут(?:бук)?)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="lock", description="Блокую екран", fn=_lock_screen, created_ts=time.time()),
+    ),
+    (
+        re.compile(r"^\s*(?:зроби|зробити)\s+скрін(?:шот)?\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="screenshot", description="Роблю скріншот", fn=_show_screen, created_ts=time.time()),
+    ),
+    # ── music ──
+    (
+        re.compile(r"^\s*(?:пауза|спаузу|постав\s+на\s+паузу|зупини\s+музику)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="music_pause", description="Пауза", fn=_play_pause_music, created_ts=time.time()),
+    ),
+    (
+        re.compile(r"^\s*(?:увімкни|включи|запусти)\s+музику\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="music_play", description="Вмикаю музику", fn=_play_pause_music, created_ts=time.time()),
+    ),
+    (
+        re.compile(r"^\s*(?:наступн\w+\s+трек|далі|перемкни\s+трек)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="next_track", description="Наступний трек", fn=_next_track, created_ts=time.time()),
+    ),
+    # ── info ──
+    (
+        re.compile(r"^\s*(?:котра\s+(?:зараз\s+)?година|скільки\s+(?:зараз\s+)?часу|який\s+зараз\s+час)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="say_time", description="Дивлюся час", fn=_say_time, created_ts=time.time()),
+    ),
+    (
+        re.compile(r"^\s*(?:рівень\s+)?батаре[яюїіея]\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="battery", description="Перевіряю батарею", fn=_say_battery, created_ts=time.time()),
+    ),
+    (
+        re.compile(r"^\s*(?:скільки|який)\s+(?:заряд|рівень)\s+(?:батаре[яюїіея])\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="battery", description="Перевіряю батарею", fn=_say_battery, created_ts=time.time()),
+    ),
+    # ── clipboard ──
+    (
+        re.compile(r"^\s*(?:що|що\s+там)\s+(?:у|в)\s+буфер[іе](?:\s+обміну)?\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="clipboard", description="Дивлюся буфер", fn=_read_clipboard, created_ts=time.time()),
+    ),
+    # ── web search ──
+    (
+        re.compile(r"^\s*(?:знайди|шукай|пошукай)\s+(?:в\s+google|в\s+гугл[іе]|у?\s*браузер[іе])\s+(.{2,80})\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="web_search",
+            description=f"Шукаю: {m.group(1).strip()[:50]}",
+            fn=lambda: _web_search(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── URL open ──
+    (
+        re.compile(r"^\s*(?:від|за)крий(?:те)?\s+(?:сайт\s+|сторінку\s+)?((?:https?://)?[a-z0-9-]+\.[a-z]{2,}(?:/\S*)?)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="open_url",
+            description=f"Відкриваю {m.group(1).strip()}",
+            fn=lambda: _open_url(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── notes ──
+    (
+        re.compile(r"^\s*(?:запиши|занотуй|занеси|створи)\s+нотатку[:\s]+(.{3,200})\s*$", re.IGNORECASE),
+        lambda m: Action(
+            name="write_note",
+            description=f"Записую: {m.group(1).strip()[:60]}",
+            fn=lambda: _write_note(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+]
+
+
+def parse_user_command(user_text: str) -> Optional[Action]:
+    """Try to extract a DIRECT user command (skip LLM).
+
+    Returns the first match. The action runs IMMEDIATELY without
+    confirmation — the user already issued an imperative.
+    Returns None if no clear command pattern matches.
+    """
+    if not user_text:
+        return None
+    text = user_text.strip()
+    # Strip trailing/leading punctuation for cleaner matching
+    text = re.sub(r"^[\s,\.!?]+|[\s,\.!?]+$", "", text)
+    if not text:
+        return None
+    for pattern, factory in USER_COMMAND_PATTERNS:
+        m = pattern.match(text) or pattern.search(text)
+        if m:
+            try:
+                action = factory(m)
+                debug_log(
+                    f"DIRECT user command: {action.name} — {action.description}",
+                    "voice",
+                )
+                return action
+            except Exception as e:
+                debug_log(f"direct cmd factory failed: {e}", "voice")
+    return None

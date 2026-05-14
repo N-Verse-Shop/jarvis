@@ -2202,7 +2202,15 @@ class VoiceListener(threading.Thread):
                     new_lang = self._pending_lang_switch
                     self._pending_lang_switch = None
                     self._active_language = new_lang
-                    debug_log(f"language switched to {new_lang}", "voice")
+                    # CRITICAL: flush dialog history when switching
+                    # language. Otherwise the model keeps seeing the
+                    # last 4 messages in the OLD language and copies
+                    # that style — producing mixed output ("конфліктують").
+                    try:
+                        self._dialog_history.clear()
+                    except Exception:
+                        pass
+                    debug_log(f"language switched to {new_lang}; history cleared", "voice")
                     # Acknowledge in the new language so user hears the
                     # voice immediately.
                     acks = {
@@ -2290,6 +2298,39 @@ class VoiceListener(threading.Thread):
         # Clear audio buffers to prevent stale audio from next query
         self._clear_audio_buffers()
 
+        # ── DIRECT USER COMMAND (no LLM) ─────────────────────────────
+        # If the user just said a clear imperative ("відкрий Safari",
+        # "вимкни звук", "котра година"), execute IMMEDIATELY and skip
+        # the LLM round-trip. ~50ms latency vs 15-25s LLM path. User
+        # complained: "він всерівно неможе навіть відкрити сафарі" —
+        # the 7b CPU model was either inventing JSON or mis-phrasing
+        # so ACTION_PATTERNS never matched on its reply. Direct parser
+        # solves that by skipping the LLM for unambiguous commands.
+        try:
+            from .action_dispatcher import parse_user_command
+            direct = parse_user_command(query)
+            if direct is not None:
+                debug_log(
+                    f"DIRECT command bypassing LLM: {direct.name} — {direct.description}",
+                    "voice",
+                )
+                try:
+                    from desktop_app.face_widget import get_jarvis_state, JarvisState
+                    get_jarvis_state().set_state(JarvisState.SPEAKING)
+                except Exception:
+                    pass
+                ok, msg = direct.fn()
+                self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+                # Store in dialog history so context stays coherent
+                try:
+                    self._dialog_history.append({"role": "user", "content": query})
+                    self._dialog_history.append({"role": "assistant", "content": msg})
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            debug_log(f"direct user-command parse failed: {e}", "voice")
+
         # Set face state to THINKING
         try:
             from desktop_app.face_widget import get_jarvis_state, JarvisState
@@ -2313,23 +2354,11 @@ class VoiceListener(threading.Thread):
             debug_log(f"voice fast-path: canned reply for '{query}' → '{canned}'", "voice")
             reply = canned
         else:
-            # NOTE: instant feedback ("Угу.") was already spoken in
-            # _finalize_utterance() the moment VAD detected end of
-            # speech — ~300-500ms before this code runs. Adding
-            # another ack here would overlap or feel verbose. For
-            # genuinely LONG queries (>100 chars, likely 20s+ LLM
-            # time) we add ONE more "Шукаю відповідь." — but only
-            # then. Most queries skip this entirely.
-            if (
-                self.tts
-                and self.tts.enabled
-                and len(query) >= 100
-            ):
-                try:
-                    debug_log("speaking long-query bridge ack", "voice")
-                    self.tts.speak("Шукаю відповідь.")
-                except Exception as e:
-                    debug_log(f"bridge ack failed: {e}", "voice")
+            # NO interjections at all — user explicitly demanded
+            # ("прибери повністю всі вигуки!!"). All ack words removed:
+            # no "Угу/Хм/Зрозумів/Шукаю відповідь." Streaming TTS
+            # (sentence-by-sentence) already provides perceived
+            # feedback at ~3-5s — that's our only "I heard you" signal.
             # Try direct chat (bypass full reply engine) for SPEED. The full
             # engine builds a 3000+ token system prompt (persona + memory
             # digest + tool descriptions) that takes ~120-240s prompt-eval
@@ -3801,43 +3830,12 @@ class VoiceListener(threading.Thread):
             self.state_manager.check_hot_window_expiry(self.cfg.voice_debug)
             return
 
-        # INSTANT VAD-finalize ack: speak a tiny <0.4s acknowledgement
-        # the MOMENT speech endpoint is detected, BEFORE Whisper runs.
-        # Whisper medium takes 1-3s on long utterances; without this
-        # feedback the user hears NOTHING for 5-10s and assumes Jarvis
-        # is hung. This puts an audible response within ~300-500ms of
-        # them finishing their sentence.
-        #
-        # CRITICAL guardrail: only ack when we're ALREADY in the hot
-        # window (= post-wake-word, user is actively talking to Jarvis).
-        # Without this we'd ack on every household noise, TV chatter,
-        # or distant conversation that crosses VAD threshold — exactly
-        # the "Jarvis randomly says 'Угу' when nobody called him" bug.
-        try:
-            tts_busy = bool(self.tts and self.tts.is_speaking())
-        except Exception:
-            tts_busy = False
-        try:
-            in_hot_window = self.state_manager.is_hot_window_active()
-        except Exception:
-            in_hot_window = False
-        if (
-            self.tts
-            and self.tts.enabled
-            and audio_duration >= 1.0
-            and not tts_busy
-            and in_hot_window
-        ):
-            import random
-            # Use SHORT (≤0.4s) Ukrainian acks.
-            # CAUTION: don't use "ага" / "так" / "так-так" here —
-            # those are in CONFIRM_WORDS and a stray echo through the
-            # mic could falsely auto-confirm a pending PC-action.
-            quick_acks = ["Угу.", "Хм.", "М-м.", "Зрозумів."]
-            try:
-                self.tts.speak(random.choice(quick_acks))
-            except Exception:
-                pass
+        # NO VAD-finalize ack — user explicitly asked to remove all
+        # interjections. The streaming-first-sentence path provides
+        # fast feedback (~3-5s) by speaking the LLM reply as it
+        # generates, without adding extra "Угу/Хм" sounds that the
+        # user found annoying and confused them with confirmation
+        # words.
 
         # Speech recognition with appropriate backend
         try:
