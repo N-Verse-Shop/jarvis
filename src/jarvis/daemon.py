@@ -663,6 +663,25 @@ def main() -> None:
         debug_log("daemon stopped", "jarvis")
         print("👋 Daemon stopped", flush=True)
 
+        # Skip Python's normal exit path to avoid torch destructor race.
+        # PyTorch's c10::Dispatcher::deregisterFallback_ has a known
+        # SIGSEGV at interpreter shutdown when atexit handlers run in
+        # the "wrong" order across libtorch_cpu.dylib and Python's
+        # module teardown. We've already done our orderly cleanup
+        # above (dictation, voice thread, diary, MCP, db) so it's
+        # safe to bypass the rest of Python's teardown. _exit(0) calls
+        # _exit(2) syscall directly — no Python finalizers, no torch
+        # destructors, no segfault in crash logs.
+        import os as _os
+        _os.stdout.flush() if hasattr(_os, 'stdout') else None
+        try:
+            import sys as _sys
+            _sys.stdout.flush()
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        _os._exit(0)
+
 
 if __name__ == "__main__":
     main()

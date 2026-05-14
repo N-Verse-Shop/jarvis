@@ -49,16 +49,112 @@ class Action:
     created_ts: float
 
 
+# App name aliases — Whisper often transcribes English app names in
+# Ukrainian transliteration ("Сафарі" instead of "Safari"). macOS
+# `open -a` needs the canonical English name, so we normalise first.
+# Maps both Ukrainian and Russian transliterations to canonical names.
+APP_ALIASES = {
+    # Browsers
+    "сафарі": "Safari", "сафари": "Safari", "safari": "Safari",
+    "хром": "Google Chrome", "chrome": "Google Chrome", "гугл хром": "Google Chrome",
+    "фаерфокс": "Firefox", "файрфокс": "Firefox", "firefox": "Firefox",
+    "арк": "Arc", "arc": "Arc",
+    # Messaging
+    "телеграм": "Telegram", "телеграмм": "Telegram", "telegram": "Telegram",
+    "вотсап": "WhatsApp", "ватсап": "WhatsApp", "whatsapp": "WhatsApp",
+    "slack": "Slack", "слак": "Slack", "слек": "Slack",
+    "diskord": "Discord", "дискорд": "Discord", "discord": "Discord",
+    "сігнал": "Signal", "сигнал": "Signal", "signal": "Signal",
+    "imessage": "Messages", "айместрітч": "Messages", "повідомлення": "Messages",
+    # Productivity
+    "notion": "Notion", "ноушн": "Notion", "ноушен": "Notion",
+    "obsidian": "Obsidian", "обсідіан": "Obsidian", "обсидіан": "Obsidian",
+    "todoist": "Todoist", "тудуіст": "Todoist",
+    "ноутс": "Notes", "нотатки": "Notes", "notes": "Notes",
+    "календар": "Calendar", "calendar": "Calendar",
+    "пошта": "Mail", "mail": "Mail",
+    "контакти": "Contacts", "contacts": "Contacts",
+    "файндер": "Finder", "finder": "Finder",
+    "налаштування": "System Settings", "settings": "System Settings",
+    "system settings": "System Settings",
+    # Dev
+    "вс код": "Visual Studio Code", "вс-код": "Visual Studio Code",
+    "vs code": "Visual Studio Code", "vscode": "Visual Studio Code",
+    "termінал": "Terminal", "термінал": "Terminal", "terminal": "Terminal",
+    "iterm": "iTerm", "айтерм": "iTerm", "iterm2": "iTerm",
+    "warp": "Warp", "ворп": "Warp",
+    "ghostty": "Ghostty", "ґостті": "Ghostty",
+    "хорхе": "Cursor", "курсор": "Cursor", "cursor": "Cursor",
+    "ксcode": "Xcode", "ікскод": "Xcode", "xcode": "Xcode",
+    "docker": "Docker", "докер": "Docker",
+    "github desktop": "GitHub Desktop", "гітхаб": "GitHub Desktop",
+    # Media
+    "спотіфай": "Spotify", "спотифай": "Spotify", "spotify": "Spotify",
+    "музика": "Music", "music": "Music", "apple music": "Music",
+    "youtube": "YouTube", "ютуб": "YouTube",
+    "netflix": "Netflix", "нетфлікс": "Netflix",
+    # Meeting
+    "zoom": "zoom.us", "зум": "zoom.us",
+    "google meet": "Google Meet", "гугл міт": "Google Meet",
+    "teams": "Microsoft Teams", "тімс": "Microsoft Teams",
+    # AI
+    "клод": "Claude", "claude": "Claude",
+    "чат гпт": "ChatGPT", "chatgpt": "ChatGPT", "гпт": "ChatGPT",
+    "perplexity": "Perplexity", "перплексіті": "Perplexity",
+    # System
+    "calculator": "Calculator", "калькулятор": "Calculator",
+    "preview": "Preview", "preview app": "Preview", "перегляд": "Preview",
+    "spotlight": "Spotlight",
+}
+
+
+def _resolve_app_name(raw: str) -> str:
+    """Normalize transliterated app name to canonical macOS name.
+
+    Whisper STT transcribes "Safari" as "Сафарі" in Ukrainian context.
+    `open -a Сафарі` fails because Mac only knows "Safari". This
+    function does case-insensitive lookup in APP_ALIASES, falling
+    back to the raw name if no alias matches (might still work for
+    apps named with cyrillic, e.g. "Telegram" is fine either way).
+    """
+    if not raw:
+        return raw
+    key = raw.strip().lower()
+    # Direct match
+    if key in APP_ALIASES:
+        return APP_ALIASES[key]
+    # Try without trailing punctuation
+    key2 = re.sub(r"[\.,!?;:]+$", "", key)
+    if key2 in APP_ALIASES:
+        return APP_ALIASES[key2]
+    return raw.strip()
+
+
 def _open_app(app_name: str) -> tuple[bool, str]:
-    """Open a macOS app via `open -a`."""
+    """Open a macOS app via `open -a`.
+
+    Tries canonical name first (via alias map), then falls back to
+    -b bundle-id lookup if direct -a fails. Returns (ok, message).
+    """
+    canonical = _resolve_app_name(app_name)
     try:
         r = subprocess.run(
-            ["open", "-a", app_name],
+            ["open", "-a", canonical],
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0:
-            return True, f"Відкрив {app_name}"
-        return False, f"Не зміг відкрити {app_name}: {r.stderr.strip()[:100]}"
+            return True, f"Відкрив {canonical}"
+        # Try once more with the raw (untransformed) name in case
+        # the user said the canonical name and we mis-aliased.
+        if canonical != app_name.strip():
+            r2 = subprocess.run(
+                ["open", "-a", app_name.strip()],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r2.returncode == 0:
+                return True, f"Відкрив {app_name.strip()}"
+        err = (r.stderr or "").strip()[:120]
+        return False, f"Не зміг відкрити {canonical}. {err}"
     except Exception as e:
         return False, f"Помилка: {e}"
 
@@ -572,6 +668,17 @@ def detect_language_switch(user_text: str) -> tuple[str, str] | None:
 # These run WITHOUT confirmation — user already said the imperative.
 # If the parse is ambiguous, we fall through to the LLM as before.
 
+def _make_open_app_action(raw: str, verb_present: str) -> Action:
+    """Factory for open_app action — pre-resolves alias for nicer TTS."""
+    canonical = _resolve_app_name(raw)
+    return Action(
+        name="open_app",
+        description=f"{verb_present} {canonical}",
+        fn=lambda: _open_app(raw),  # _open_app re-resolves internally
+        created_ts=time.time(),
+    )
+
+
 USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     # ── URL open ── (MUST come before open_app — URLs contain dots)
     (
@@ -586,21 +693,11 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     # ── apps ── (must match clean imperatives, no dots)
     (
         re.compile(r"^\s*(?:а\s+)?(?:будь\s+ласка\s+)?(?:від|за)крий(?:те)?\s+(?:додаток\s+|програму\s+)?([A-Za-zА-Яа-яЇїІіЄєҐґ][A-Za-zА-Яа-яЇїІіЄєҐґ0-9\s-]{1,30})\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(
-            name="open_app",
-            description=f"Відкриваю {m.group(1).strip()}",
-            fn=lambda: _open_app(m.group(1).strip()),
-            created_ts=time.time(),
-        ),
+        lambda m: _make_open_app_action(m.group(1).strip(), "Відкриваю"),
     ),
     (
         re.compile(r"^\s*(?:будь\s+ласка\s+)?запусти(?:те)?\s+(?:додаток\s+|програму\s+)?([A-Za-zА-Яа-яЇїІіЄєҐґ][A-Za-zА-Яа-яЇїІіЄєҐґ0-9\s-]{1,30})\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(
-            name="open_app",
-            description=f"Запускаю {m.group(1).strip()}",
-            fn=lambda: _open_app(m.group(1).strip()),
-            created_ts=time.time(),
-        ),
+        lambda m: _make_open_app_action(m.group(1).strip(), "Запускаю"),
     ),
     # ── volume ──
     (
