@@ -1631,6 +1631,15 @@ class VoiceListener(threading.Thread):
                     "messages": messages,
                     "stream": True,
                     "keep_alive": "24h",
+                    # qwen3 thinking mode spends 50-300 tokens on
+                    # `<think>...</think>` before producing the user-
+                    # facing answer, blowing the num_predict budget
+                    # and often returning empty content. Top-level
+                    # `think: false` disables it natively (cleaner
+                    # than `/no_think` directive in the prompt). For
+                    # non-thinking models (gemma2, qwen2.5, llama3.x)
+                    # Ollama silently ignores this field — safe default.
+                    "think": False,
                     "options": {
                         "temperature": 0.4,
                         # 600 tokens — user explicitly removed the cap
@@ -1822,6 +1831,7 @@ class VoiceListener(threading.Thread):
                                     "messages": retry_msgs,
                                     "stream": False,
                                     "keep_alive": "24h",
+                                    "think": False,  # qwen3 — see _voice_direct_chat above
                                     "options": {
                                         "temperature": 0.4,
                                         "num_predict": 500,
@@ -3062,6 +3072,11 @@ class VoiceListener(threading.Thread):
                                 ],
                                 "stream": False,
                                 "keep_alive": "24h",
+                                # Match _voice_direct_chat's think=False EXACTLY,
+                                # otherwise qwen3 KV-cache slot is different
+                                # (thinking vs non-thinking prefix) → first
+                                # real call pays cold-cache rebuild.
+                                "think": False,
                                 "options": {
                                     # Match _voice_direct_chat options
                                     # EXACTLY so warmup primes the same
