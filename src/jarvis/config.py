@@ -133,7 +133,12 @@ class Settings:
 
     # Whisper Speech Recognition
     whisper_model: str
-    whisper_backend: str  # "auto", "mlx", or "faster-whisper"
+    whisper_backend: str  # "auto", "mlx", "faster-whisper", or "remote"
+    # Remote (HTTP) backend offloads STT to a server running whisper-service.
+    # When backend="remote" the Mac client doesn't load any local model —
+    # massive RAM win on memory-tight machines (M1 8GB).
+    whisper_remote_url: str  # e.g. "http://100.101.199.68:8005"
+    whisper_remote_token: str  # X-Jarvis-Token header value
     whisper_device: str  # "cuda", "auto", or "cpu" (only for faster-whisper)
     whisper_compute_type: str
     whisper_vad: bool
@@ -438,7 +443,9 @@ def get_default_config() -> Dict[str, Any]:
 
         # Whisper Speech Recognition
         "whisper_model": "medium",
-        "whisper_backend": "auto",  # "auto" (MLX on Apple Silicon, else faster-whisper), "mlx", or "faster-whisper"
+        "whisper_backend": "auto",  # "auto" / "mlx" / "faster-whisper" / "remote"
+        "whisper_remote_url": "",     # e.g. "http://100.101.199.68:8005"
+        "whisper_remote_token": "",   # X-Jarvis-Token (loaded from server's /opt/jarvis/whisper-service/.env)
         "whisper_device": "auto",  # "cuda" (recommended if available), "auto", or "cpu" (only for faster-whisper)
         "whisper_compute_type": "int8",
         "whisper_vad": True,
@@ -649,8 +656,10 @@ def load_settings() -> Settings:
     wake_fuzzy_ratio = float(merged.get("wake_fuzzy_ratio", 0.78))
     whisper_model = str(merged.get("whisper_model", "medium"))
     whisper_backend = os.environ.get("JARVIS_WHISPER_BACKEND", "").lower() or str(merged.get("whisper_backend", "auto")).lower()
-    if whisper_backend not in ("auto", "mlx", "faster-whisper"):
+    if whisper_backend not in ("auto", "mlx", "faster-whisper", "remote"):
         whisper_backend = "auto"
+    whisper_remote_url = str(merged.get("whisper_remote_url", "")).strip().rstrip("/")
+    whisper_remote_token = str(merged.get("whisper_remote_token", "")).strip()
     whisper_device = str(merged.get("whisper_device", "auto")).lower()
     if whisper_device not in ("cuda", "auto", "cpu"):
         whisper_device = "auto"
@@ -816,6 +825,8 @@ def load_settings() -> Settings:
         # Whisper Speech Recognition
         whisper_model=whisper_model,
         whisper_backend=whisper_backend,
+        whisper_remote_url=whisper_remote_url,
+        whisper_remote_token=whisper_remote_token,
         whisper_device=whisper_device,
         whisper_compute_type=whisper_compute_type,
         whisper_vad=whisper_vad,

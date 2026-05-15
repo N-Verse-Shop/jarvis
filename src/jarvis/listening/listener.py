@@ -2988,6 +2988,11 @@ class VoiceListener(threading.Thread):
         """Determine which Whisper backend to use based on config and availability."""
         backend_pref = getattr(self.cfg, "whisper_backend", "auto")
 
+        if backend_pref == "remote":
+            # Caller (_init_whisper) validates URL + token and falls
+            # back to MLX if either is missing.
+            return "remote"
+
         if backend_pref == "mlx":
             if MLX_WHISPER_AVAILABLE:
                 return "mlx"
@@ -3416,6 +3421,53 @@ class VoiceListener(threading.Thread):
         # Determine and initialise Whisper backend
         self._whisper_backend = self._determine_whisper_backend()
         model_name = getattr(self.cfg, "whisper_model", "small")
+
+        # Remote backend — no local model loaded. We just stash the URL
+        # and token and let _transcribe_remote do an HTTP POST per
+        # utterance. Saves ~1.5GB Mac RAM (no MLX Whisper weights) and
+        # removes the 30s cold-load on first transcription. The server
+        # (whisper-service on Hetzner) has 6+ GB headroom — easily fits
+        # large-v3 or large-v3-turbo there.
+        if self._whisper_backend == "remote":
+            remote_url = getattr(self.cfg, "whisper_remote_url", "")
+            remote_token = getattr(self.cfg, "whisper_remote_token", "")
+            if not remote_url or not remote_token:
+                print(
+                    "  ❌ whisper_backend='remote' but whisper_remote_url / "
+                    "whisper_remote_token are empty in config. "
+                    "Falling back to MLX.", flush=True,
+                )
+                self._whisper_backend = "mlx" if MLX_WHISPER_AVAILABLE else "faster-whisper"
+            else:
+                self._remote_whisper_url = remote_url
+                self._remote_whisper_token = remote_token
+                # Probe /health so we fail fast at startup, not on the
+                # user's first utterance.
+                try:
+                    import requests as _rq
+                    r = _rq.get(f"{remote_url}/health", timeout=5)
+                    if r.status_code == 200:
+                        info = r.json()
+                        srv_model = info.get("model_name", "?")
+                        loaded = info.get("model_loaded")
+                        print(
+                            f"     🌐 Remote Whisper ready: {remote_url} "
+                            f"(model={srv_model}, loaded={loaded})", flush=True,
+                        )
+                    else:
+                        print(
+                            f"  ⚠️  whisper-service /health returned HTTP "
+                            f"{r.status_code} — will retry per-utterance",
+                            flush=True,
+                        )
+                except Exception as e:
+                    print(
+                        f"  ⚠️  whisper-service unreachable at probe "
+                        f"({remote_url}): {e}. Voice will still try at "
+                        f"each utterance.", flush=True,
+                    )
+                # Skip the local-model-load path below entirely.
+                return
 
         # Validate large-v3-turbo support for faster-whisper backend
         if model_name == "large-v3-turbo" and self._whisper_backend != "mlx":
@@ -4046,6 +4098,90 @@ class VoiceListener(threading.Thread):
                             except Exception:
                                 break
 
+    def _transcribe_remote(self, audio_np, language: Optional[str] = None) -> dict:
+        """POST audio to whisper-service on Hetzner, return MLX-shaped result.
+
+        Args:
+            audio_np: float32 1-D numpy array @ self._samplerate (16 kHz).
+            language: Optional ISO-639-1 hint ("uk", "ru", etc).
+
+        Returns:
+            Dict with keys {"text", "language", "segments"} mirroring the
+            shape that mlx_whisper.transcribe returns, so the downstream
+            filter/segment-scoring code keeps working unchanged.
+            On error returns {"text": "", "segments": [], "language": None}
+            and logs — caller decides whether to retry or drop the audio.
+
+        Implementation notes:
+          - We spool a 16-bit PCM WAV into a tempfile-shaped BytesIO so
+            faster-whisper / ffmpeg on the server can decode it. The
+            server's /transcribe endpoint accepts any ffmpeg-readable
+            format and we keep it simple with WAV (no compression cost
+            on the Mac CPU — the user explicitly asked to minimize Mac
+            load).
+          - Authentication header is `X-Jarvis-Token: <hex>` matching the
+            whisper-service auth.require_token implementation.
+          - Timeout: 60s. Real transcription is typically 1-3s; the
+            generous cap covers cold model load on the server side
+            (only happens once after service restart).
+          - Network failure or non-200 response → empty dict so the
+            voice loop treats it as "no speech detected" (the user
+            can repeat the utterance — far better than hanging).
+        """
+        import io as _io
+        import wave as _wave
+        import requests as _rq
+
+        if np is None:
+            return {"text": "", "segments": [], "language": None}
+
+        # Float32 [-1, 1] → int16 PCM. Whisper expects 16-bit mono.
+        pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767.0).astype(np.int16)
+
+        buf = _io.BytesIO()
+        with _wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(self._samplerate))
+            wf.writeframes(pcm16.tobytes())
+        wav_bytes = buf.getvalue()
+
+        headers = {"X-Jarvis-Token": self._remote_whisper_token}
+        files = {"audio": ("utt.wav", wav_bytes, "audio/wav")}
+        data = {}
+        if language:
+            data["language"] = language
+
+        try:
+            t0 = time.time()
+            r = _rq.post(
+                f"{self._remote_whisper_url}/transcribe",
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=60.0,
+            )
+            elapsed = time.time() - t0
+            if r.status_code != 200:
+                debug_log(
+                    f"remote whisper HTTP {r.status_code}: {r.text[:200]}",
+                    "voice",
+                )
+                return {"text": "", "segments": [], "language": None}
+            body = r.json()
+            # Reshape server response to MLX-compatible dict. The server
+            # returns segments as a list of {text, start, end, ...} dicts
+            # — same shape as MLX, so it passes through cleanly.
+            return {
+                "text": body.get("text", ""),
+                "language": body.get("language") or language,
+                "segments": body.get("segments", []) or [],
+                "_remote_inference_s": body.get("inference_time_s", elapsed),
+            }
+        except Exception as e:
+            debug_log(f"remote whisper request failed: {e}", "voice")
+            return {"text": "", "segments": [], "language": None}
+
     def _schedule_partial_transcribe(self) -> None:
         """Spawn a background thread to transcribe current speech buffer.
 
@@ -4056,8 +4192,10 @@ class VoiceListener(threading.Thread):
         """
         if np is None or not self._utterance_frames:
             return
-        if mlx_whisper is None or self._mlx_model_repo is None:
-            return  # only MLX path supports cheap partial right now
+        # Remote backend doesn't need a local model — different gate.
+        if self._whisper_backend != "remote":
+            if mlx_whisper is None or self._mlx_model_repo is None:
+                return  # only MLX path supports cheap partial right now
         # Copy frames so we don't race with the audio thread mutating
         # _utterance_frames while we're concatenating.
         frames_copy = list(self._utterance_frames)
@@ -4065,24 +4203,27 @@ class VoiceListener(threading.Thread):
         def _run():
             try:
                 audio = np.concatenate(frames_copy, axis=0).flatten()
-                # Cheap transcribe — single temperature, no beam search,
-                # no logprob filtering. This is intentional: we're
-                # showing a hint to the user, not the canonical result.
                 forced_lang = getattr(self.cfg, "whisper_language", None) or None
-                with self.transcribe_lock:
-                    result = mlx_whisper.transcribe(
-                        audio,
-                        path_or_hf_repo=self._mlx_model_repo,
-                        language=forced_lang,
-                        temperature=0.0,
-                        condition_on_previous_text=False,
-                        # Prime the decoder with UA tech/brand vocabulary
-                        # (see VOICE_WHISPER_INITIAL_PROMPT for the full
-                        # rationale). Massive accuracy win on proper
-                        # nouns like Hydrogen/Cloudflare/Hetzner that
-                        # the medium model otherwise renders phonetically.
-                        initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
-                    )
+                if self._whisper_backend == "remote":
+                    # Remote service handles everything; no local model
+                    # lock needed because each request is independent.
+                    result = self._transcribe_remote(audio, language=forced_lang)
+                else:
+                    # Local MLX — cheap single-temp pass, no beam search,
+                    # no logprob filtering. Just a UX preview.
+                    with self.transcribe_lock:
+                        result = mlx_whisper.transcribe(
+                            audio,
+                            path_or_hf_repo=self._mlx_model_repo,
+                            language=forced_lang,
+                            temperature=0.0,
+                            condition_on_previous_text=False,
+                            # Prime decoder with UA tech/brand vocabulary
+                            # (see VOICE_WHISPER_INITIAL_PROMPT). Major
+                            # accuracy win on proper nouns like
+                            # Hydrogen/Cloudflare/Hetzner.
+                            initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
+                        )
                 text = (result.get("text") or "").strip()
                 if not text:
                     return
@@ -4164,45 +4305,55 @@ class VoiceListener(threading.Thread):
         try:
             if self._whisper_backend == "mlx":
                 # MLX Whisper transcription
-                with self.transcribe_lock:
-                    # Forced language hint — Whisper auto-detect on short
-                    # wake-word audio routinely guesses English (training
-                    # imbalance) and hallucinates "Thank you" / "Charlie's"
-                    # over real Ukrainian. Forcing 'uk' keeps it on the
-                    # right phonetic map and still transcribes RU and most
-                    # EN wake-word mishearings acceptably.
-                    forced_lang = getattr(self.cfg, "whisper_language", None) or None
-                    # Better recognition: temperature fallback (default
-                    # only [0.0] — adding fallbacks lets Whisper retry
-                    # when confidence drops), wider beam search for
-                    # tricky accents/dialects. Cost: ~30% slower on
-                    # marginal audio, but user explicitly asked
-                    # "краще навчити джарвіса розуміти мене".
-                    result = mlx_whisper.transcribe(
-                        audio,
-                        path_or_hf_repo=self._mlx_model_repo,
-                        language=forced_lang,
-                        temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
-                        # condition_on_previous_text=False prevents
-                        # Whisper from "remembering" the previous
-                        # utterance and bleeding into the next — common
-                        # cause of "repeated phrase" hallucinations in
-                        # back-to-back queries.
-                        condition_on_previous_text=False,
-                        # Compression ratio threshold: if Whisper's
-                        # output is too repetitive (signs of decoding
-                        # collapse), reject and retry with higher temp.
-                        compression_ratio_threshold=2.4,
-                        # If logprob drops below this, retry. Default
-                        # -1.0; -1.2 is more permissive — keeps hard
-                        # accents from being dropped.
-                        logprob_threshold=-1.2,
-                        # Domain vocabulary primer — see VOICE_WHISPER_-
-                        # INITIAL_PROMPT for full rationale. Fixes 80%+
-                        # of brand/tech-term misrecognitions ("Hydrogen"
-                        # not "гідроген", "Cloudflare" not "клавдфлеер").
-                        initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
-                    )
+                # Forced language hint — Whisper auto-detect on short
+                # wake-word audio routinely guesses English (training
+                # imbalance) and hallucinates "Thank you" / "Charlie's"
+                # over real Ukrainian. Forcing 'uk' keeps it on the
+                # right phonetic map and still transcribes RU and most
+                # EN wake-word mishearings acceptably.
+                forced_lang = getattr(self.cfg, "whisper_language", None) or None
+
+                if self._whisper_backend == "remote":
+                    # Server-side STT — single HTTP POST. We lose the
+                    # temperature-fallback / compression-threshold knobs
+                    # (server uses its own faster-whisper defaults) but
+                    # we get zero local RAM and the option to run
+                    # large-v3-turbo there for better accuracy.
+                    result = self._transcribe_remote(audio, language=forced_lang)
+                else:
+                    with self.transcribe_lock:
+                        # Better recognition: temperature fallback
+                        # (default only [0.0] — adding fallbacks lets
+                        # Whisper retry when confidence drops), wider
+                        # beam search for tricky accents/dialects.
+                        # Cost: ~30% slower on marginal audio, but
+                        # user explicitly asked "краще навчити джарвіса
+                        # розуміти мене".
+                        result = mlx_whisper.transcribe(
+                            audio,
+                            path_or_hf_repo=self._mlx_model_repo,
+                            language=forced_lang,
+                            temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+                            # condition_on_previous_text=False prevents
+                            # Whisper from "remembering" the previous
+                            # utterance and bleeding into the next —
+                            # common cause of "repeated phrase"
+                            # hallucinations in back-to-back queries.
+                            condition_on_previous_text=False,
+                            # Compression ratio threshold: if output
+                            # is too repetitive (signs of decoding
+                            # collapse), reject and retry with higher temp.
+                            compression_ratio_threshold=2.4,
+                            # If logprob drops below this, retry. Default
+                            # -1.0; -1.2 is more permissive — keeps hard
+                            # accents from being dropped.
+                            logprob_threshold=-1.2,
+                            # Domain vocabulary primer — see VOICE_WHISPER_-
+                            # INITIAL_PROMPT for full rationale. Fixes 80%+
+                            # of brand/tech-term misrecognitions ("Hydrogen"
+                            # not "гідроген", "Cloudflare" not "клавдфлеер").
+                            initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
+                        )
 
                 # Capture Whisper's auto-detected language (ISO-639-1) so
                 # downstream tools can pick locale-appropriate resources.
