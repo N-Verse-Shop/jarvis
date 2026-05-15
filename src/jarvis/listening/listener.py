@@ -2859,6 +2859,7 @@ class VoiceListener(threading.Thread):
             "дякую за перегляд",
             "дякую за увагу",
             "напиши умови",   # ambient-noise-as-imperative artifact
+            "додай нотатку",  # NEW — observed 8+ times in May 15 logs
             "продовження буде",
             "продовження слідує",
             "напиши коментар",
