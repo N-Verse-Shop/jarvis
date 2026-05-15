@@ -42,7 +42,12 @@ def warm_up_ollama_model(base_url: str, model: str, timeout: float) -> bool:
                 "model": model,
                 "prompt": "",
                 "stream": False,
-                "keep_alive": "24h",
+                # 10m (was 24h) — intent judge eats 2.2GB resident,
+                # but it's only invoked once per utterance for ~80 tokens.
+                # If user pauses >10min the model unloads and frees RAM
+                # for chat. Cold-reload on return = +3-5s on first
+                # utterance — acceptable trade for more chat headroom.
+                "keep_alive": "10m",
                 "options": {"num_predict": 1},
             },
             timeout=timeout,
@@ -368,7 +373,12 @@ Examples (English+Ukrainian):
                     "prompt": "[warmup] Jarvis say hello",
                     "system": sys_prompt,
                     "stream": False,
-                    "keep_alive": "24h",
+                    # 10m (was 24h) — intent judge eats 2.2GB resident,
+                # but it's only invoked once per utterance for ~80 tokens.
+                # If user pauses >10min the model unloads and frees RAM
+                # for chat. Cold-reload on return = +3-5s on first
+                # utterance — acceptable trade for more chat headroom.
+                "keep_alive": "10m",
                     "options": {
                         "temperature": 0.0,
                         "num_predict": 80,
@@ -445,7 +455,12 @@ Examples (English+Ukrainian):
                     "system": system_prompt,
                     "stream": False,
                     "think": self.config.thinking,
-                    "keep_alive": "24h",
+                    # 10m (was 24h) — intent judge eats 2.2GB resident,
+                # but it's only invoked once per utterance for ~80 tokens.
+                # If user pauses >10min the model unloads and frees RAM
+                # for chat. Cold-reload on return = +3-5s on first
+                # utterance — acceptable trade for more chat headroom.
+                "keep_alive": "10m",
                     "options": {
                         "temperature": 0.0,
                         # 300 tokens: 80-char query + JSON envelope +

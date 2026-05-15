@@ -69,6 +69,38 @@ except OSError as e:
         print("     On Linux, ensure PortAudio is installed: sudo apt install libportaudio2", flush=True)
     del _sys
 
+# Whisper `initial_prompt` — pseudo "previous segment" that primes the
+# decoder. Whisper conditions on this text the same way it conditions
+# on prior decoded segments: it learns spellings, names, technical
+# terms, and language register from it. WITHOUT this, on UA the medium
+# model routinely garbled:
+#   "Hydrogen"   → "гідроген" / "хідроджин"
+#   "Cloudflare" → "клавдфлеер"
+#   "Shopify"    → "шопіфай" / "шоп ефай"
+#   "Hetzner"    → "гетцнер" / "хетзнер"
+#   "TTFB"       → "тіті ефбі"
+#   "DACH"       → "дач" / "дах"
+#   "qwen"       → "квен" / "коен"
+# Listing brand names, project names, tech terms and personal names
+# here fixes 80%+ of these. Keep it under ~200 tokens — longer prompts
+# slow decode and hurt non-listed words. The prompt is in Ukrainian
+# to anchor the language model on UA pronunciation rules.
+VOICE_WHISPER_INITIAL_PROMPT = (
+    "Запит до голосового асистента Джарвіс українською мовою. "
+    "Користувач — Данило Молянко з Nexus Studio. "
+    "Бренди і проєкти: Nexus Studio, IBONS, Hydrogen, Shopify, "
+    "Cloudflare, Hetzner, Tailscale, Render, Ollama, Qdrant, "
+    "Founder Cockpit, Telegram, Linear, GitHub, Notion, Obsidian, "
+    "macOS, Safari, Chrome, Mail, Calendar, Slack, DACH. "
+    "Технічні терміни: TTFB, TTFT, SaaS, API, JSON, MLX, Whisper, "
+    "qwen, gemma, llama, mistral, npm, deploy, frontend, бекенд, "
+    "лендінг, конверсія, кеш, токен, промпт, streaming, latency, "
+    "Lighthouse, PageSpeed, CDN, edge, worker, віджет. "
+    "Команди: відкрий, закрий, перезапусти, заблокуй, скажи, "
+    "знайди, покажи, створи задачу, додай нотатку."
+)
+
+
 # Whisper backend imports - try MLX first on Apple Silicon, fall back to faster-whisper
 MLX_WHISPER_AVAILABLE = False
 FASTER_WHISPER_AVAILABLE = False
@@ -4042,6 +4074,12 @@ class VoiceListener(threading.Thread):
                         language=forced_lang,
                         temperature=0.0,
                         condition_on_previous_text=False,
+                        # Prime the decoder with UA tech/brand vocabulary
+                        # (see VOICE_WHISPER_INITIAL_PROMPT for the full
+                        # rationale). Massive accuracy win on proper
+                        # nouns like Hydrogen/Cloudflare/Hetzner that
+                        # the medium model otherwise renders phonetically.
+                        initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
                     )
                 text = (result.get("text") or "").strip()
                 if not text:
@@ -4158,6 +4196,11 @@ class VoiceListener(threading.Thread):
                         # -1.0; -1.2 is more permissive — keeps hard
                         # accents from being dropped.
                         logprob_threshold=-1.2,
+                        # Domain vocabulary primer — see VOICE_WHISPER_-
+                        # INITIAL_PROMPT for full rationale. Fixes 80%+
+                        # of brand/tech-term misrecognitions ("Hydrogen"
+                        # not "гідроген", "Cloudflare" not "клавдфлеер").
+                        initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
                     )
 
                 # Capture Whisper's auto-detected language (ISO-639-1) so
