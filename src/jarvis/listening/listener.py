@@ -4148,7 +4148,12 @@ class VoiceListener(threading.Thread):
 
         headers = {"X-Jarvis-Token": self._remote_whisper_token}
         files = {"audio": ("utt.wav", wav_bytes, "audio/wav")}
-        data = {}
+        # Pass the domain vocabulary primer with EVERY request. Without
+        # this the server hallucinated "дякую" / "додай нотатку" on all
+        # ambient noise and wake-word "Джарвіс" decoded as "дякую" too.
+        # Server-side fallback (WS_DEFAULT_INITIAL_PROMPT) catches the
+        # Telegram-bot path; this catches our voice path.
+        data = {"initial_prompt": VOICE_WHISPER_INITIAL_PROMPT}
         if language:
             data["language"] = language
 
