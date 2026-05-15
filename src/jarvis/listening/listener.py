@@ -3423,11 +3423,16 @@ class VoiceListener(threading.Thread):
         model_name = getattr(self.cfg, "whisper_model", "small")
 
         # Remote backend — no local model loaded. We just stash the URL
-        # and token and let _transcribe_remote do an HTTP POST per
-        # utterance. Saves ~1.5GB Mac RAM (no MLX Whisper weights) and
-        # removes the 30s cold-load on first transcription. The server
-        # (whisper-service on Hetzner) has 6+ GB headroom — easily fits
-        # large-v3 or large-v3-turbo there.
+        # and token; _transcribe_remote handles the HTTP POST per
+        # utterance. Saves ~1.5GB Mac RAM and removes the 30s cold-load
+        # on first transcription. The server (whisper-service on
+        # Hetzner) has 6+ GB headroom — easily fits large-v3-turbo.
+        #
+        # CRITICAL: this whole inline init block lives inside run().
+        # The original `return` here exited run() entirely and the
+        # voice loop never started — silent dead daemon. We use a flag
+        # and skip the local-load branches below instead.
+        skip_local_load = False
         if self._whisper_backend == "remote":
             remote_url = getattr(self.cfg, "whisper_remote_url", "")
             remote_token = getattr(self.cfg, "whisper_remote_token", "")
@@ -3466,11 +3471,13 @@ class VoiceListener(threading.Thread):
                         f"({remote_url}): {e}. Voice will still try at "
                         f"each utterance.", flush=True,
                     )
-                # Skip the local-model-load path below entirely.
-                return
+                # Skip the local-model-load branches below; control
+                # continues into the audio-stream setup further down in
+                # run() so the daemon actually starts listening.
+                skip_local_load = True
 
         # Validate large-v3-turbo support for faster-whisper backend
-        if model_name == "large-v3-turbo" and self._whisper_backend != "mlx":
+        if not skip_local_load and model_name == "large-v3-turbo" and self._whisper_backend != "mlx":
             if not _is_faster_whisper_turbo_supported():
                 debug_log(
                     "faster-whisper does not support large-v3-turbo, "
@@ -3482,7 +3489,7 @@ class VoiceListener(threading.Thread):
                 )
                 model_name = "large-v3"
 
-        if self._whisper_backend == "mlx":
+        if not skip_local_load and self._whisper_backend == "mlx":
             if not MLX_WHISPER_AVAILABLE:
                 debug_log("MLX Whisper not available", "voice")
                 print("  ❌ MLX Whisper not available. Install with: pip install mlx-whisper", flush=True)
@@ -3527,8 +3534,8 @@ class VoiceListener(threading.Thread):
                     if is_rate_limited:
                         print("  💡 HuggingFace is rate limiting downloads. Please wait a few minutes and restart.", flush=True)
                     return
-        else:
-            # faster-whisper backend
+        elif not skip_local_load:
+            # faster-whisper backend (remote backend already returned above)
             if not FASTER_WHISPER_AVAILABLE:
                 debug_log("faster-whisper not available", "voice")
                 print("  ❌ faster-whisper not available. Install with: pip install faster-whisper", flush=True)
