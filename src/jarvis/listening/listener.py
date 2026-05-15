@@ -1686,11 +1686,21 @@ class VoiceListener(threading.Thread):
                         "repeat_last_n": 192,
                         "presence_penalty": 0.3,
                         "frequency_penalty": 0.2,
-                        # 4096 ctx — leaves room for longer prompts
-                        # (long history, multi-turn context) and
-                        # longer replies. gemma2:9b handles 4096 fine
-                        # at ~3-4s prompt-eval per kilo-token warm.
-                        "num_ctx": 4096,
+                        # 2048 ctx (was 4096) — KV-cache scales linearly
+                        # with context length on CPU, and 4096 was wasting
+                        # ~50% of prompt-eval time on slots never used.
+                        # Real voice dialogs measured at 500-1500 tokens:
+                        #   system prompt:    ~300 tok
+                        #   language directive: ~30 tok
+                        #   last 5-7 turns:   ~400-800 tok
+                        #   current query:    ~30-150 tok
+                        #   reply budget:     up to num_predict (600)
+                        # Headroom: 2048 - 1500 = 548 tok safety margin.
+                        # If history overflows we drop oldest turns
+                        # (listener already does this), so the worst case
+                        # is "Jarvis forgets a turn from 10min ago" —
+                        # an acceptable trade for ~40% faster prompt-eval.
+                        "num_ctx": 2048,
                         # 4 worker threads (Hetzner CCX23 = 4 vCPU).
                         "num_thread": 4,
                         # Larger batch = more tokens per prompt-eval pass
@@ -1871,7 +1881,7 @@ class VoiceListener(threading.Thread):
                                         "repeat_last_n": 128,
                                         "presence_penalty": 0.5,
                                         "frequency_penalty": 0.4,
-                                        "num_ctx": 4096,
+                                        "num_ctx": 2048,  # web-search retry — same rationale as _voice_direct_chat
                                     },
                                 },
                                 timeout=90.0,
@@ -2834,15 +2844,36 @@ class VoiceListener(threading.Thread):
         lower = text.lower()
         # Known idle-noise patterns. Each phrase observed multiple times in
         # production logs with `whisper_no_speech_threshold` ≥ 0.85.
+        # NEW (May 15) patterns from user logs after large-v3-turbo switch:
+        # Whisper trained heavily on UA YouTube outros/intros, so silence
+        # often decodes as the "thanks for watching" template in UA.
         KNOWN_PATTERNS = (
+            # Personal-name salads (training-data scraping artifacts)
             "дмитро павловський",
             "білян ліна керівськ",
             "білян ліпчук",
             "хіднось продавав",
-            "thank you",            # English silence hallucination
-            "thanks for watching",  # YouTube-style training-data leakage
+            # UA YouTube-outro hallucinations (NEW — seen on user's mic)
+            "дякую за просвіт",
+            "дякую за просмак",
+            "дякую за перегляд",
+            "дякую за увагу",
+            "напиши умови",   # ambient-noise-as-imperative artifact
+            "продовження буде",
+            "продовження слідує",
+            "напиши коментар",
+            "натисни лайк",
+            "підпишись на канал",
+            "до зустрічі",
+            "до побачення",  # only as hallucination — real goodbyes
+            "усім бувай",    # are routed via direct user-command path
+            # English silence-hallucinations (Whisper-default training)
+            "thank you",
+            "thanks for watching",
             "subscribe to",
             "see you next",
+            "subtitles by",
+            "продолжение следует",
         )
         for pat in KNOWN_PATTERNS:
             if pat in lower:
@@ -3120,7 +3151,10 @@ class VoiceListener(threading.Thread):
                                     "repeat_last_n": 192,
                                     "presence_penalty": 0.3,
                                     "frequency_penalty": 0.2,
-                                    "num_ctx": 4096,
+                                    # MUST match _voice_direct_chat (2048).
+                                    # Different num_ctx → different KV-cache
+                                    # slot → cold rebuild on first real call.
+                                    "num_ctx": 2048,
                                     "num_thread": 4,
                                     "num_batch": 256,
                                 },
@@ -4084,12 +4118,11 @@ class VoiceListener(threading.Thread):
                 text = (result.get("text") or "").strip()
                 if not text:
                     return
-                # Drop known Whisper silence-hallucinations
-                low = text.lower()
-                if any(hallu in low for hallu in (
-                    "субтитри", "subtitles by", "thank you for watching",
-                    "продолжение следует", "music",
-                )):
+                # Drop known Whisper silence-hallucinations. Mirror the
+                # canonical filter in _is_known_hallucination so the
+                # partial line doesn't preview UA-YouTube garbage that
+                # the final pass will then suppress (confusing UX).
+                if self._is_known_hallucination(text):
                     return
                 lang = result.get("language") or forced_lang
                 try:
