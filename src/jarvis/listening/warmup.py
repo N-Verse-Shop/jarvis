@@ -29,6 +29,18 @@ from typing import Optional
 log = logging.getLogger("jarvis.warmup")
 
 
+def _log(msg: str, level: str = "info") -> None:
+    """Mirror to debug_log + stdlib logging so messages appear in
+    both the daemon's loguru-captured stderr AND in plain logging
+    consumers (tests, future log aggregators)."""
+    try:
+        from ..debug import debug_log
+        debug_log(msg, "warmup")
+    except Exception:
+        pass
+    getattr(log, level, log.info)(msg)
+
+
 def _warmup_ollama(
     *,
     base_url: str,
@@ -51,7 +63,7 @@ def _warmup_ollama(
     try:
         import requests
     except ImportError:
-        log.debug("requests not installed — skipping Ollama warmup")
+        _log("requests not installed — skipping Ollama warmup")
         return
 
     url = base_url.rstrip("/") + "/api/chat"
@@ -73,15 +85,14 @@ def _warmup_ollama(
         r = requests.post(url, json=body, timeout=timeout_s)
         dt = time.monotonic() - t0
         if r.status_code == 200:
-            log.info("Ollama warmup OK (%s, %.2fs)", model, dt)
+            _log(f"Ollama warmup OK ({model}, {dt:.2f}s)")
         else:
-            log.warning(
-                "Ollama warmup HTTP %s: %s",
-                r.status_code,
-                r.text[:200],
+            _log(
+                f"Ollama warmup HTTP {r.status_code}: {r.text[:200]}",
+                "warning",
             )
     except Exception as exc:
-        log.warning("Ollama warmup failed: %s", exc)
+        _log(f"Ollama warmup failed: {exc}", "warning")
 
 
 def _warmup_whisper_mlx(model_repo: Optional[str]) -> None:
@@ -98,7 +109,7 @@ def _warmup_whisper_mlx(model_repo: Optional[str]) -> None:
         import mlx_whisper
         import numpy as np
     except ImportError:
-        log.debug("mlx_whisper / numpy missing — skipping Whisper warmup")
+        _log("mlx_whisper / numpy missing — skipping Whisper warmup")
         return
     t0 = time.monotonic()
     try:
@@ -112,13 +123,11 @@ def _warmup_whisper_mlx(model_repo: Optional[str]) -> None:
             language=None,
             verbose=False,
         )
-        log.info(
-            "Whisper warmup OK (%s, %.2fs)",
-            model_repo,
-            time.monotonic() - t0,
+        _log(
+            f"Whisper warmup OK ({model_repo}, {time.monotonic() - t0:.2f}s)"
         )
     except Exception as exc:
-        log.warning("Whisper warmup failed: %s", exc)
+        _log(f"Whisper warmup failed: {exc}", "warning")
 
 
 def _warmup_piper(voice_id: str, piper_dir: Optional[Path] = None) -> None:
@@ -132,7 +141,7 @@ def _warmup_piper(voice_id: str, piper_dir: Optional[Path] = None) -> None:
     try:
         from piper import PiperVoice
     except ImportError:
-        log.debug("piper missing — skipping Piper warmup")
+        _log("piper missing — skipping Piper warmup")
         return
     try:
         target_dir = piper_dir or (
@@ -142,7 +151,7 @@ def _warmup_piper(voice_id: str, piper_dir: Optional[Path] = None) -> None:
         if not target.exists():
             # Pipecat downloads lazily on first use; we'd race with
             # that path. Skip and let Pipecat handle it.
-            log.info("Piper voice not cached locally — skipping warmup")
+            _log("Piper voice not cached locally — skipping warmup")
             return
         t0 = time.monotonic()
         voice = PiperVoice.load(str(target))
@@ -164,13 +173,11 @@ def _warmup_piper(voice_id: str, piper_dir: Optional[Path] = None) -> None:
                 break
             except Exception:
                 continue
-        log.info(
-            "Piper warmup OK (%s, %.2fs)",
-            voice_id,
-            time.monotonic() - t0,
+        _log(
+            f"Piper warmup OK ({voice_id}, {time.monotonic() - t0:.2f}s)"
         )
     except Exception as exc:
-        log.warning("Piper warmup failed: %s", exc)
+        _log(f"Piper warmup failed: {exc}", "warning")
 
 
 def warmup_voice_stack(
@@ -218,7 +225,4 @@ def warmup_voice_stack(
 
     for t in threads:
         t.start()
-    log.info(
-        "Voice stack warmup kicked off — %d thread(s)",
-        len(threads),
-    )
+    _log(f"Voice stack warmup kicked off — {len(threads)} thread(s)")
