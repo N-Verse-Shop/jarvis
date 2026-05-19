@@ -746,6 +746,24 @@ def _make_fast_path_processor():
                 await self.push_frame(frame, direction)
                 return
 
+            # R33-S4: capability gate check. If a fast-path action
+            # corresponds to a closed-gate tool, fall through to the
+            # LLM — the LLM will see only allowed tools in its schema
+            # and respond conversationally instead of executing.
+            try:
+                from ..capabilities import is_tool_allowed
+                if not is_tool_allowed(action.name):
+                    self._audit.emit(
+                        kind="gate_blocked",
+                        tool=action.name,
+                        status="blocked",
+                        args={"text": text},
+                    )
+                    await self.push_frame(frame, direction)
+                    return
+            except Exception:
+                pass
+
             # ── MATCH ─────────────────────────────────────────────
             # Suppress the original transcript (do not call push_frame
             # for it). Run the action in a worker thread so blocking
@@ -818,9 +836,17 @@ def _make_fast_path_processor():
 
 
 def _mac_control_tools_schema():
-    """Return a :class:`ToolsSchema` for the curated mac_control ops."""
+    """Return a :class:`ToolsSchema` for the curated mac_control ops.
+
+    R33-S4: each tool is checked against
+    :func:`jarvis.capabilities.is_tool_allowed` and DROPPED from the
+    schema if its gate is closed. The LLM never sees the function in
+    its tools list, so it can't be invoked even if hallucinated.
+    """
     from pipecat.adapters.schemas.function_schema import FunctionSchema
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+    from ..capabilities import is_tool_allowed
 
     # Keep this list small + well-described. The LLM picks by name +
     # description; a vague description gets the wrong tool picked.
@@ -1064,7 +1090,19 @@ def _mac_control_tools_schema():
             required=["name", "reference"],
         ),
     ]
-    return ToolsSchema(standard_tools=schemas)
+    # R33-S4: filter the schema by gate state. Closed gates don't
+    # appear in the LLM's function list at all.
+    filtered = [s for s in schemas if is_tool_allowed(s.name)]
+    if len(filtered) != len(schemas):
+        dropped = sorted(
+            s.name for s in schemas if not is_tool_allowed(s.name)
+        )
+        debug_log(
+            f"capability gates dropped {len(schemas) - len(filtered)} "
+            f"tool(s) from LLM schema: {dropped}",
+            "pipecat",
+        )
+    return ToolsSchema(standard_tools=filtered)
 
 
 def _register_mac_control_handlers(llm):
@@ -1090,12 +1128,17 @@ def _register_mac_control_handlers(llm):
     # the curated set + sanity-check against the underlying op
     # registry so a typo in the schema (or a removed op in
     # mac_control) fails loudly at registration time.
-    exposed = [
+    # R33-S4: also filter by capability gate so closed-gate handlers
+    # don't get registered at all (otherwise a hallucinated function
+    # call could find them).
+    from ..capabilities import is_tool_allowed
+    candidate_exposed = [
         "focus_app", "open_url", "new_note", "new_reminder",
         "query_calendar", "send_message", "run_shortcut",
         "list_shortcuts", "system_info", "set_volume",
         "set_mute", "clipboard_set",
     ]
+    exposed = [n for n in candidate_exposed if is_tool_allowed(n)]
     for op_name in exposed:
         if op_name not in _OPS:
             # Don't silently skip — surface the misconfiguration so
@@ -1718,6 +1761,13 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     # Build the tools schema BEFORE the LLMContext so we can pass it
     # into the context (the LLM reads tools from the context at every
     # turn). Register handlers on the LLM service itself.
+    # R33-S4: log capability gate state once at pipeline build so the
+    # user can see which categories of tools are currently enabled.
+    try:
+        from ..capabilities import log_gate_state
+        log_gate_state()
+    except Exception:
+        pass
     tools_schema = _mac_control_tools_schema()
     _register_mac_control_handlers(llm)
     # R32 — skill loaders (list_skills / load_skill / load_skill_reference)
