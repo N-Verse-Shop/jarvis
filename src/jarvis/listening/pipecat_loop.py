@@ -1870,6 +1870,32 @@ def _build_pipeline(cfg: PipecatLoopConfig):
         ]
     )
 
+    # ── R33-S7: pre-warm the voice stack in background threads ────
+    # Primes Ollama KV cache for the exact system prompt + Whisper
+    # MLX graph + Piper ONNX session so the FIRST user utterance
+    # after a daemon restart doesn't eat 500-700 ms of cold-cache
+    # pain. Threads are daemon-mode so they die with the process.
+    # Failures log + continue — never block pipeline startup.
+    try:
+        from .warmup import warmup_voice_stack
+        whisper_repo = None
+        try:
+            from .listener import _get_mlx_model_repo
+            normalised = cfg.stt_mlx_model.lower().replace("_", "-")
+            whisper_repo = _get_mlx_model_repo(normalised)
+        except Exception:
+            pass
+        warmup_voice_stack(
+            ollama_base_url=cfg.ollama_base_url,
+            chat_model=cfg.chat_model,
+            system_prompt=system_prompt,
+            whisper_mlx_repo=whisper_repo,
+            piper_voice_id=cfg.piper_voice_id,
+            piper_dir=piper_dir,
+        )
+    except Exception as _warm_exc:
+        debug_log(f"warmup kick-off failed: {_warm_exc!r}", "pipecat")
+
     task_params = PipelineParams(
         # Allow interruptions — user can talk over TTS and we drop
         # the in-flight reply (the equivalent of the legacy
