@@ -56,7 +56,7 @@ from ..debug import debug_log
 # if it cannot satisfy the minimum stage required for a working voice
 # loop (currently 5 = core + adapters + tools + wake/echo).
 _MIN_STAGE_FOR_RUN = 5
-_CURRENT_STAGE = 4  # Stage 4: fast-path + mac_control function calling
+_CURRENT_STAGE = 5  # Stage 5: wake-word gate + echo filter + feature flag
 
 
 # ──────────────────────── F94 Russian system prompt ────────────────────
@@ -158,8 +158,17 @@ def from_settings(cfg) -> PipecatLoopConfig:
         active_language=str(getattr(cfg, "active_language", "ru")),
         extra={
             "voice_engine": getattr(cfg, "voice_engine", "legacy"),
-            "remote_whisper_url": getattr(cfg, "remote_whisper_url", ""),
-            "remote_whisper_token": getattr(cfg, "remote_whisper_token", ""),
+            "remote_whisper_url": getattr(cfg, "whisper_remote_url", ""),
+            "remote_whisper_token": getattr(cfg, "whisper_remote_token", ""),
+            # Stage-5 wake-word + hot-window knobs — reuse the same
+            # config keys the legacy listener already consumes so
+            # users don't have to re-tune their config.json.
+            "wake_word": getattr(cfg, "wake_word", "jarvis"),
+            "wake_aliases": list(getattr(cfg, "wake_aliases", []) or []),
+            "wake_fuzzy_ratio": float(getattr(cfg, "wake_fuzzy_ratio", 0.78)),
+            "hot_window_seconds": float(
+                getattr(cfg, "hot_window_seconds", 30.0)
+            ),
         },
     )
 
@@ -1017,6 +1026,269 @@ def _register_mac_control_handlers(llm):
         llm.register_function(op_name, _make_handler(op_name))
 
 
+# ──────────────── Stage-5 wake-word gate + echo filter ───────────────────
+#
+# Two more pre-LLM filters added in Stage 5:
+#
+#   * ``JarvisWakeWordGateProcessor`` — requires either a wake word in
+#     the utterance OR an active hot window before any transcript
+#     reaches the fast-path / LLM. Outside the hot window ambient
+#     speech is silently dropped (we don't reply unless explicitly
+#     addressed). A successful interaction extends the window so the
+#     user can follow up without saying "jarvis" again.
+#
+#   * ``JarvisEchoFilterProcessor`` — suppresses transcripts that
+#     arrive while TTS is actively playing (plus a short tail after
+#     TTS stops). Pipecat's transport-level interruption handling
+#     covers most echo cases, but the OS speaker/mic cross-talk path
+#     occasionally leaks a partial transcript of our own bot. We
+#     defence-in-depth by dropping any TranscriptionFrame that
+#     coincides with TTS playback.
+#
+# Both sit BEFORE the fast-path so they short-circuit the highest
+# layers — no point parsing a regex on a transcript we're going to
+# discard.
+
+
+def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
+    """Build the wake-word gate FrameProcessor.
+
+    Behaviour:
+
+    * Outside the hot window: drop ``TranscriptionFrame`` unless the
+      transcript contains a wake-word. On wake-word, open a hot
+      window of ``hot_window_seconds`` and forward the text AFTER
+      the wake word.
+    * Inside the hot window: forward all transcripts unchanged.
+    * On every assistant TTS turn (``TTSStoppedFrame``): refresh the
+      hot window so follow-ups don't need a fresh wake word.
+
+    Reuses :func:`wake_detection.is_wake_word_detected` and
+    :func:`wake_detection.extract_query_after_wake` so the heuristics
+    (fuzzy ratio, prefix tolerance, alias list) stay identical to the
+    legacy listener.
+    """
+    import time as _time
+
+    from pipecat.frames.frames import (
+        Frame,
+        TranscriptionFrame,
+        TTSStoppedFrame,
+    )
+    from pipecat.processors.frame_processor import (
+        FrameDirection,
+        FrameProcessor,
+    )
+
+    from ..ipc import get_stream
+    from .wake_detection import (
+        extract_query_after_wake,
+        is_wake_word_detected,
+    )
+
+    # Pull legacy settings from config.extra so we honour the same
+    # wake-word knobs the legacy listener used (wake_word, wake_aliases,
+    # wake_fuzzy_ratio, hot_window_seconds).
+    wake_word = str(cfg.extra.get("wake_word") or cfg.wake_words[0])
+    wake_aliases = list(cfg.extra.get("wake_aliases") or list(cfg.wake_words[1:]))
+    fuzzy_ratio = float(cfg.extra.get("wake_fuzzy_ratio", 0.78))
+    hot_window_seconds = float(cfg.extra.get("hot_window_seconds", 30.0))
+
+    class JarvisWakeWordGateProcessor(FrameProcessor):
+        """Drop ambient transcripts; require wake word or hot window."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._hot_until: float = 0.0  # unix ts; 0 = closed
+            self._stream = get_stream()
+
+        def _open_hot_window(self) -> None:
+            self._hot_until = _time.time() + hot_window_seconds
+            try:
+                self._stream.emit(
+                    "hot_window",
+                    active=True,
+                    expires_in_ms=int(hot_window_seconds * 1000),
+                )
+            except Exception:
+                pass
+
+        def _is_hot(self) -> bool:
+            return _time.time() < self._hot_until
+
+        async def process_frame(
+            self, frame: "Frame", direction: "FrameDirection"
+        ) -> None:
+            await super().process_frame(frame, direction)
+
+            # Bot just finished speaking — extend the hot window so
+            # the user can follow up without re-saying the wake word.
+            if isinstance(frame, TTSStoppedFrame):
+                self._open_hot_window()
+                await self.push_frame(frame, direction)
+                return
+
+            # Non-transcript frames pass through.
+            if not isinstance(frame, TranscriptionFrame):
+                await self.push_frame(frame, direction)
+                return
+
+            text = (frame.text or "").strip()
+            if not text:
+                await self.push_frame(frame, direction)
+                return
+
+            text_lower = text.lower()
+            wake_hit = is_wake_word_detected(
+                text_lower, wake_word, wake_aliases, fuzzy_ratio
+            )
+
+            # Hot window open → pass everything.
+            if self._is_hot():
+                # If the wake word IS present in a follow-up, strip
+                # it so the LLM sees the bare command.
+                if wake_hit:
+                    query = extract_query_after_wake(
+                        text_lower, wake_word, wake_aliases
+                    )
+                    if query:
+                        # Build a new frame with the trimmed text;
+                        # frozen dataclasses → use replace().
+                        from dataclasses import replace as _replace
+                        try:
+                            frame = _replace(frame, text=query)
+                        except Exception:
+                            pass
+                self._open_hot_window()  # refresh
+                await self.push_frame(frame, direction)
+                return
+
+            # Hot window closed → require wake word.
+            if not wake_hit:
+                # Silent drop — emit a log event so the HUD can show
+                # "(ignored: no wake word)" if it wants.
+                try:
+                    self._stream.emit(
+                        "log",
+                        level="DEBUG",
+                        component="wake-gate",
+                        message="dropped (no wake word, hot window closed)",
+                    )
+                except Exception:
+                    pass
+                # Do NOT push the frame — gate is closed.
+                return
+
+            # Wake hit while cold → open window + forward bare query.
+            self._stream.emit(
+                "wake_word",
+                word=wake_word,
+                confidence=1.0,
+            )
+            self._open_hot_window()
+            query = extract_query_after_wake(
+                text_lower, wake_word, wake_aliases
+            )
+            if query:
+                from dataclasses import replace as _replace
+                try:
+                    frame = _replace(frame, text=query)
+                except Exception:
+                    pass
+            else:
+                # Wake word alone with no follow-up command — drop
+                # the frame but keep the window open so the user
+                # can speak the actual command next.
+                return
+            await self.push_frame(frame, direction)
+
+    return JarvisWakeWordGateProcessor
+
+
+def _make_echo_filter_processor():
+    """Build the echo-filter FrameProcessor.
+
+    Tracks ``BotStartedSpeakingFrame``/``BotStoppedSpeakingFrame``
+    boundaries (and ``TTSStartedFrame``/``TTSStoppedFrame`` as
+    secondary signals). A ``TranscriptionFrame`` that arrives while
+    the bot is speaking is treated as echo and dropped. We also keep
+    a small tail (``_TAIL_SEC``) after TTS stops because hardware
+    audio latency means the speaker is still outputting samples for
+    ~200-500 ms after the frame finishes.
+    """
+    import time as _time
+
+    from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
+        Frame,
+        TranscriptionFrame,
+        TTSStartedFrame,
+        TTSStoppedFrame,
+    )
+    from pipecat.processors.frame_processor import (
+        FrameDirection,
+        FrameProcessor,
+    )
+
+    from ..ipc import get_stream
+
+    # Tail period — audio hardware finishes draining the last buffer
+    # well after the BotStoppedSpeaking frame fires. Tuned empirically
+    # on macOS CoreAudio + Piper TTS; raise if cross-talk leaks
+    # through, lower if the user feels they can't interrupt.
+    _TAIL_SEC = 0.5
+
+    class JarvisEchoFilterProcessor(FrameProcessor):
+        """Drop transcripts that arrive during bot's own speech."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._speaking = False
+            self._speak_end_ts: float = 0.0
+            self._stream = get_stream()
+
+        def _is_blocking_window(self) -> bool:
+            if self._speaking:
+                return True
+            if self._speak_end_ts and _time.time() < self._speak_end_ts:
+                return True
+            return False
+
+        async def process_frame(
+            self, frame: "Frame", direction: "FrameDirection"
+        ) -> None:
+            await super().process_frame(frame, direction)
+
+            if isinstance(frame, (BotStartedSpeakingFrame, TTSStartedFrame)):
+                self._speaking = True
+                self._speak_end_ts = 0.0
+            elif isinstance(frame, (BotStoppedSpeakingFrame, TTSStoppedFrame)):
+                self._speaking = False
+                self._speak_end_ts = _time.time() + _TAIL_SEC
+
+            if isinstance(frame, TranscriptionFrame):
+                if self._is_blocking_window():
+                    try:
+                        self._stream.emit(
+                            "log",
+                            level="DEBUG",
+                            component="echo-filter",
+                            message=(
+                                f"dropped transcript during TTS "
+                                f"(speaking={self._speaking}, "
+                                f"tail={self._speak_end_ts - _time.time():.2f}s)"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return  # drop
+
+            await self.push_frame(frame, direction)
+
+    return JarvisEchoFilterProcessor
+
+
 # ─────────────────────────── pipeline factory ────────────────────────────
 
 
@@ -1154,10 +1426,7 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     )
     aggregators = LLMContextAggregatorPair(context)
 
-    # ── Stage-3 HUD adapters ───────────────────────────────────────
-    # Two separate event-stream observer instances (one per pipeline
-    # half) plus a single state processor at the tail.
-    #
+    # ── Stage-3 HUD adapters + Stage-5 gates ───────────────────────
     # We instantiate the processor CLASSES lazily here because the
     # factories import pipecat — if pipecat isn't installed we want
     # ``from_settings`` / config helpers to still work for callers
@@ -1165,8 +1434,12 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     EventStreamProc = _make_event_stream_processor()
     StateProc = _make_state_processor()
     FastPathProc = _make_fast_path_processor()
+    WakeWordProc = _make_wake_word_processor(cfg)
+    EchoFilterProc = _make_echo_filter_processor()
     events_user = EventStreamProc()        # observes STT side
     events_assistant = EventStreamProc()   # observes LLM/TTS side
+    echo_filter = EchoFilterProc()         # drops bot-echo transcripts
+    wake_gate = WakeWordProc()             # requires wake word / hot window
     fast_path = FastPathProc()             # regex shortcut, pre-LLM
     state_proc = StateProc()               # tail — last word on state
 
@@ -1199,11 +1472,31 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     #   final, post-aggregation form. The single observer at the end
     #   removes any risk of two halves of the pipeline racing on
     #   conflicting state writes.
+    # Final topology (Stage 5):
+    #   transport.input → STT → events_user → echo_filter → wake_gate
+    #     → fast_path → user-aggregator → LLM → assistant-aggregator
+    #     → events_assistant → TTS → state_proc → transport.output
+    #
+    # Ordering rationale:
+    #
+    # * ``echo_filter`` is BEFORE ``wake_gate`` so transcripts created
+    #   from our own TTS audio never even reach the wake-word check
+    #   (otherwise the bot's own "Зараз відкрию Safari" could
+    #   self-trigger if it contained the wake word "джарвіс").
+    # * ``wake_gate`` is BEFORE ``fast_path`` because executing an
+    #   action without the user actually addressing us is a much
+    #   worse failure than not executing one they did. Conservative.
+    # * Both gates observe ``TTSStartedFrame``/``TTSStoppedFrame``/
+    #   ``BotStartedSpeakingFrame``/``BotStoppedSpeakingFrame`` that
+    #   propagate from the transport's interruption logic, so the
+    #   ordering above still lets them see TTS lifecycle frames.
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             events_user,
+            echo_filter,
+            wake_gate,
             fast_path,
             aggregators.user(),
             llm,
@@ -1321,9 +1614,89 @@ class PipecatLoop:
                 debug_log(f"PipecatLoop stop() error: {exc!r}", "pipecat")
 
 
+# ─────────────────────────── Thread wrapper ──────────────────────────────
+
+
+class PipecatVoiceThread:
+    """``threading.Thread``-shaped adapter so daemon.py can hot-swap.
+
+    Mirrors the public surface of ``listening.listener.VoiceListener``:
+
+    * Construct with ``(db, cfg, tts, dialogue_memory)`` — extra args
+      are accepted and ignored (Pipecat manages its own audio + TTS
+      + memory via the LLMContext).
+    * ``.start()`` spawns a thread that drives the Pipecat loop.
+    * ``.join(timeout)`` and ``.is_alive()`` work like ``Thread``.
+    * ``._should_stop`` / ``._dictation_active`` attributes are set
+      by daemon.py — we honour ``_should_stop`` to break out.
+    """
+
+    def __init__(self, db, cfg, tts, dialogue_memory) -> None:
+        # We don't actually use db/tts/memory — Pipecat owns those.
+        # Stored for diagnostic access by tests.
+        self._db = db
+        self._cfg = cfg
+        self._tts = tts
+        self._dialogue_memory = dialogue_memory
+        self._should_stop = False
+        self._dictation_active = False
+        self._loop_cfg = from_settings(cfg)
+        self._loop = PipecatLoop(self._loop_cfg)
+        import threading as _threading
+        self._thread = _threading.Thread(
+            target=self._run_thread,
+            name="PipecatVoiceThread",
+            daemon=True,
+        )
+
+    def _run_thread(self) -> None:
+        try:
+            debug_log(
+                "PipecatVoiceThread starting (engine=pipecat, stage="
+                f"{_CURRENT_STAGE}/{_MIN_STAGE_FOR_RUN})",
+                "pipecat",
+            )
+            self._loop.run()
+        except Exception as exc:
+            debug_log(f"PipecatVoiceThread crashed: {exc!r}", "pipecat")
+        finally:
+            debug_log("PipecatVoiceThread exited", "pipecat")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def stop(self) -> None:
+        self._should_stop = True
+        self._loop.stop()
+
+    # The legacy listener exposes ``model`` and ``_whisper_backend``
+    # for the DictationEngine hot-handoff. Stage 5 deliberately does
+    # NOT plumb dictation through — dictation continues to use the
+    # legacy whisper handle (it owns a separate audio capture loop).
+    # Returning None here is the explicit "no shared model" contract.
+    @property
+    def model(self):  # pragma: no cover — diagnostic accessor
+        return None
+
+    @property
+    def _whisper_backend(self):  # pragma: no cover
+        return "pipecat-mlx"
+
+    @property
+    def _mlx_model_repo(self):  # pragma: no cover
+        return None
+
+
 __all__ = [
     "PipecatLoop",
     "PipecatLoopConfig",
+    "PipecatVoiceThread",
     "from_settings",
     "_build_pipeline",  # exposed for unit tests / introspection
 ]

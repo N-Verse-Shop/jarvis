@@ -317,6 +317,12 @@ class Settings:
     # MCP Integration
     mcps: Dict[str, Any]
 
+    # R31 — voice engine selector. "legacy" (default) keeps the
+    # hand-rolled listener.VoiceListener; "pipecat" switches to the
+    # Pipecat-based loop in listening.pipecat_loop. Defaults to
+    # legacy until Stage 6 integration testing completes.
+    voice_engine: str = "legacy"
+
 
 
 def default_config_path() -> Path:
@@ -942,6 +948,13 @@ def load_settings() -> Settings:
     raw_dict = merged.get("dictation_custom_dictionary", [])
     dictation_custom_dictionary = list(raw_dict) if isinstance(raw_dict, list) else []
     mcps = _ensure_dict(merged.get("mcps"))
+
+    # R31 — voice engine selector. Accepts "legacy" or "pipecat".
+    # Unknown values fall back to "legacy" so a typo in config.json
+    # doesn't silently disable voice.
+    voice_engine = str(merged.get("voice_engine", "legacy")).strip().lower()
+    if voice_engine not in ("legacy", "pipecat"):
+        voice_engine = "legacy"
     # Audit round 14 fix: these four fallbacks disagreed with the
     # canonical values in ``get_default_config()`` — a config-less
     # user got a stricter Whisper gate (0.4/0.3/2) than the seeded
@@ -1110,4 +1123,7 @@ def load_settings() -> Settings:
 
         # MCP Integration
         mcps=mcps,
+
+        # R31 — voice engine selector
+        voice_engine=voice_engine,
     )

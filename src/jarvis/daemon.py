@@ -558,11 +558,41 @@ def main() -> None:
         print("  TTS disabled", flush=True)
 
     # Initialize voice listening (only if dependencies available)
-    print("🎤 Initializing voice listener (this may take a moment to load Whisper model)...", flush=True)
-    voice_thread: Optional[threading.Thread] = None
-    voice_thread = VoiceListener(db, cfg, tts, _global_dialogue_memory)
+    # R31: ``voice_engine`` config flag toggles between the legacy
+    # hand-rolled listener and the Pipecat-based loop. Default is
+    # "legacy" until the Pipecat path passes end-to-end integration
+    # in Stage 6.
+    voice_engine = str(getattr(cfg, "voice_engine", "legacy")).lower()
+    print(
+        f"🎤 Initializing voice listener (engine={voice_engine}, "
+        "this may take a moment to load the model)...",
+        flush=True,
+    )
+    voice_thread = None
+    if voice_engine == "pipecat":
+        try:
+            from .listening.pipecat_loop import PipecatVoiceThread
+            voice_thread = PipecatVoiceThread(
+                db, cfg, tts, _global_dialogue_memory
+            )
+            print(
+                "✓ Pipecat voice thread constructed — starting...",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"⚠ Pipecat init failed ({exc!r}); falling back to "
+                "legacy listener.",
+                flush=True,
+            )
+            voice_thread = None
+    if voice_thread is None:
+        voice_thread = VoiceListener(db, cfg, tts, _global_dialogue_memory)
     voice_thread.start()
-    print("✓ Voice listener thread started (loading Whisper model in background)", flush=True)
+    print(
+        "✓ Voice listener thread started (loading model in background)",
+        flush=True,
+    )
 
     # Initialize dictation engine (hold-to-dictate)
     dictation = None
