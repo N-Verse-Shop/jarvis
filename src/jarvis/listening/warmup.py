@@ -21,6 +21,7 @@ case is "first turn is still slow" — exactly the current state.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from pathlib import Path
@@ -28,16 +29,40 @@ from typing import Optional
 
 log = logging.getLogger("jarvis.warmup")
 
+# Serialise stderr writes so warmup threads don't interleave with
+# each other or with other daemon log writers.
+_print_lock = threading.Lock()
+
 
 def _log(msg: str, level: str = "info") -> None:
-    """Mirror to debug_log + stdlib logging so messages appear in
-    both the daemon's loguru-captured stderr AND in plain logging
-    consumers (tests, future log aggregators)."""
+    """Emit a warmup log line.
+
+    Warmup messages are LOW-VOLUME (a handful per daemon boot) but
+    HIGH-VALUE — they tell us whether the cold-cache prep actually
+    ran. We bypass the voice-debug gate (which is off by default)
+    and write straight to stderr with flush=True so they always
+    show up in ``jarvis-assistant.err.log``.
+
+    Also fans out to:
+      - stdlib logging — tests, future log aggregators.
+      - debug_log — when voice_debug is on, the line shows up
+        twice in stderr (once raw, once with [warmup] prefix), but
+        that's harmless and keeps a single source of truth for
+        debug-mode consumers.
+    """
+    # Always-on stderr write — this is what shows up in the daemon log.
+    try:
+        with _print_lock:
+            print(f"[warmup] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    # debug_log honour, gated on voice_debug.
     try:
         from ..debug import debug_log
         debug_log(msg, "warmup")
     except Exception:
         pass
+    # stdlib logging fan-out for tests / aggregators.
     getattr(log, level, log.info)(msg)
 
 
