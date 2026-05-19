@@ -1675,22 +1675,39 @@ class PipecatVoiceThread:
         self._should_stop = True
         self._loop.stop()
 
-    # The legacy listener exposes ``model`` and ``_whisper_backend``
-    # for the DictationEngine hot-handoff. Stage 5 deliberately does
-    # NOT plumb dictation through — dictation continues to use the
-    # legacy whisper handle (it owns a separate audio capture loop).
-    # Returning None here is the explicit "no shared model" contract.
+    # The DictationEngine calls these refs every time the
+    # hold-to-dictate hotkey fires. Even though Pipecat owns its own
+    # audio loop, dictation does NOT — it captures separately and
+    # transcribes via the shared MLX repo. We expose ``"mlx"`` as
+    # the backend and the canonical MLX-community repo for the
+    # configured whisper model, matching exactly what the legacy
+    # listener would have returned. ``model`` stays None because
+    # MLX transcription is stateless (loads from repo each call).
     @property
     def model(self):  # pragma: no cover — diagnostic accessor
         return None
 
     @property
     def _whisper_backend(self):  # pragma: no cover
-        return "pipecat-mlx"
+        # Always "mlx" on Apple Silicon — Pipecat's WhisperSTTServiceMLX
+        # uses the same MLX backend dictation needs.
+        return "mlx"
 
     @property
     def _mlx_model_repo(self):  # pragma: no cover
-        return None
+        # Reuse the legacy MLX-repo resolver so dictation gets the
+        # same repo Pipecat is using. ``whisper_model`` config field
+        # (e.g. "large-v3-turbo") drives the lookup.
+        try:
+            from .listener import _get_mlx_model_repo
+            model_name = str(getattr(self._cfg, "whisper_model", "large-v3-turbo"))
+            # Normalise the Pipecat-flavoured enum name back to the
+            # legacy short form. Pipecat: "LARGE_V3_TURBO" → legacy:
+            # "large-v3-turbo".
+            normalised = model_name.lower().replace("_", "-")
+            return _get_mlx_model_repo(normalised)
+        except Exception:
+            return None
 
 
 __all__ = [
