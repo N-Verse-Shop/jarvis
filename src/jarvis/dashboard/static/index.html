@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Jarvis Control Room</title>
+    <link rel="stylesheet" href="/dashboard/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='40' fill='%2300d4ff'/%3E%3Ccircle cx='50' cy='50' r='30' fill='%23000'/%3E%3Ctext x='50' y='62' text-anchor='middle' fill='%2300d4ff' font-family='monospace' font-size='32' font-weight='bold'%3EJ%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <!-- ─── auth gate ─── -->
+    <div id="auth-screen" class="auth">
+      <div class="auth-card glass">
+        <h1>Jarvis Control Room</h1>
+        <p class="subtle">Local-only dashboard. Paste the token from
+          <code>~/Library/Application&nbsp;Support/jarvis/dashboard-token</code>.</p>
+        <input id="auth-token" type="password" autocomplete="off"
+               placeholder="paste token here" autofocus />
+        <button id="auth-submit">Unlock</button>
+        <div id="auth-error" class="error"></div>
+      </div>
+    </div>
+
+    <!-- ─── main app shell ─── -->
+    <div id="app" hidden>
+      <!-- header: state indicator + nav -->
+      <header class="app-header">
+        <div class="brand">
+          <div id="state-orb" class="orb"></div>
+          <div class="brand-text">
+            <div class="brand-title">Jarvis</div>
+            <div class="brand-state" id="brand-state">connecting…</div>
+          </div>
+        </div>
+        <nav class="app-nav">
+          <button class="nav-tab active" data-view="overview">Overview</button>
+          <button class="nav-tab" data-view="skills">Skills</button>
+          <button class="nav-tab" data-view="audit">Audit</button>
+          <button class="nav-tab" data-view="persona">Persona</button>
+          <button class="nav-tab" data-view="capabilities">Capabilities</button>
+          <button class="nav-tab" data-view="live">Live</button>
+        </nav>
+        <div class="header-meta">
+          <div class="meta-row"><span class="meta-label">PID</span><span id="meta-pid">—</span></div>
+          <div class="meta-row"><span class="meta-label">Uptime</span><span id="meta-uptime">—</span></div>
+        </div>
+      </header>
+
+      <!-- view: overview -->
+      <section class="view active" id="view-overview">
+        <div class="grid">
+          <div class="card glass">
+            <h3>Daemon</h3>
+            <dl class="kv">
+              <dt>State</dt><dd id="ov-state">—</dd>
+              <dt>Engine</dt><dd>Pipecat (R33)</dd>
+              <dt>Version</dt><dd id="ov-version">—</dd>
+              <dt>PID</dt><dd id="ov-pid">—</dd>
+              <dt>Uptime</dt><dd id="ov-uptime">—</dd>
+            </dl>
+          </div>
+          <div class="card glass">
+            <h3>Activity (last 24h)</h3>
+            <dl class="kv">
+              <dt>Tool calls</dt><dd id="ov-tools">—</dd>
+              <dt>Completed</dt><dd id="ov-done">—</dd>
+              <dt>Failed</dt><dd id="ov-failed">—</dd>
+              <dt>Voice turns</dt><dd id="ov-turns">—</dd>
+            </dl>
+          </div>
+          <div class="card glass">
+            <h3>Top tools</h3>
+            <ul class="bars" id="ov-top-tools"></ul>
+          </div>
+          <div class="card glass">
+            <h3>Recent events</h3>
+            <ul class="event-feed mini" id="ov-feed"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- view: skills -->
+      <section class="view" id="view-skills">
+        <div class="view-toolbar">
+          <h2>Skills</h2>
+          <button id="skills-reload" class="ghost">Reload</button>
+        </div>
+        <div id="skills-list" class="skills-grid"></div>
+        <div id="skill-detail" class="skill-detail glass" hidden>
+          <button class="close-x" id="skill-close">×</button>
+          <h2 id="skill-detail-name">—</h2>
+          <div class="skill-tags" id="skill-detail-tags"></div>
+          <pre id="skill-detail-content" class="md"></pre>
+          <div class="refs-list" id="skill-refs-list"></div>
+        </div>
+      </section>
+
+      <!-- view: audit -->
+      <section class="view" id="view-audit">
+        <div class="view-toolbar">
+          <h2>Audit Trail</h2>
+          <div class="filters">
+            <select id="audit-kind">
+              <option value="">All kinds</option>
+              <option value="tool_call">Tool call</option>
+              <option value="fast_path">Fast path</option>
+              <option value="gate_blocked">Gate blocked</option>
+            </select>
+            <select id="audit-status">
+              <option value="">Any status</option>
+              <option value="starting">starting</option>
+              <option value="completed">completed</option>
+              <option value="failed">failed</option>
+              <option value="blocked">blocked</option>
+            </select>
+            <input id="audit-tool" placeholder="tool name…" />
+            <button id="audit-refresh" class="ghost">Refresh</button>
+          </div>
+        </div>
+        <table class="audit-table">
+          <thead>
+            <tr><th>Time</th><th>Kind</th><th>Tool</th><th>Status</th><th>Args</th><th>Dur</th></tr>
+          </thead>
+          <tbody id="audit-tbody">
+            <tr><td colspan="6" class="empty">No events yet.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- view: persona -->
+      <section class="view" id="view-persona">
+        <div class="view-toolbar">
+          <h2>Persona</h2>
+          <button id="persona-reload" class="ghost">Reload from disk</button>
+        </div>
+        <div class="card glass" id="persona-card">
+          <dl class="kv-block">
+            <dt>Name</dt><dd id="persona-name">—</dd>
+            <dt>Owner</dt><dd id="persona-owner">—</dd>
+            <dt>Language</dt><dd id="persona-lang">—</dd>
+            <dt>File</dt><dd id="persona-path" class="path">—</dd>
+          </dl>
+          <h3>Identity</h3>
+          <p id="persona-identity" class="prose">—</p>
+          <h3>Boundaries</h3>
+          <ul id="persona-boundaries"></ul>
+          <h3>Shortcuts</h3>
+          <ul id="persona-shortcuts"></ul>
+        </div>
+      </section>
+
+      <!-- view: capabilities -->
+      <section class="view" id="view-capabilities">
+        <div class="view-toolbar">
+          <h2>Capability Gates</h2>
+        </div>
+        <p class="subtle">Open gates allow the LLM to call associated tools.
+          Toggle via env vars (<code>JARVIS_ENABLE_&lt;NAME&gt;</code>,
+          <code>JARVIS_DISABLE_&lt;NAME&gt;</code>) and restart the daemon.</p>
+        <div id="capabilities-list" class="cap-grid"></div>
+      </section>
+
+      <!-- view: live -->
+      <section class="view" id="view-live">
+        <div class="view-toolbar">
+          <h2>Live Events</h2>
+          <div class="filters">
+            <label class="chk"><input type="checkbox" id="live-pause" /> Pause</label>
+            <button id="live-clear" class="ghost">Clear</button>
+          </div>
+        </div>
+        <ul class="event-feed" id="live-feed"></ul>
+      </section>
+    </div>
+
+    <script type="module" src="/dashboard/app.js"></script>
+  </body>
+</html>

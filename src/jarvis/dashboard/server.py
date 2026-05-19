@@ -192,10 +192,24 @@ class DashboardServer:
             out |= ord(x) ^ ord(y)
         return out == 0
 
+    # Paths that must be reachable WITHOUT a token — the SPA shell
+    # has to load before the user types one. Everything under /api
+    # (except /api/health) still requires auth.
+    _PUBLIC_PREFIXES = ("/dashboard", "/")
+
+    @classmethod
+    def _is_public_path(cls, path: str) -> bool:
+        if path == "/api/health":
+            return True
+        if path == "/":
+            return True
+        if path.startswith("/dashboard"):
+            return True
+        return False
+
     async def _auth_mw(self, app, handler):
         async def _mw(req):
-            # Public endpoints (no auth) — health probe + token check
-            if req.path == "/api/health" and req.method == "GET":
+            if self._is_public_path(req.path):
                 return await handler(req)
             provided = self._bearer(req)
             if not provided or not self._safe_compare(provided, self._token):
@@ -227,6 +241,19 @@ class DashboardServer:
     def _register_routes(self, app) -> None:
         from aiohttp import web
 
+        # ── Static SPA ─────────────────────────────────────
+        # Mounted at /dashboard/ so the SPA loads its own
+        # styles + JS from there. Root / redirects to the
+        # SPA index.
+        static_dir = Path(__file__).parent / "static"
+        if static_dir.is_dir():
+            app.router.add_get("/", self._h_root_redirect)
+            app.router.add_get("/dashboard", self._h_dashboard_index)
+            app.router.add_get("/dashboard/", self._h_dashboard_index)
+            app.router.add_static(
+                "/dashboard/", static_dir, name="dashboard-static"
+            )
+
         app.router.add_get("/api/health", self._h_health)
         app.router.add_get("/api/state", self._h_state)
         app.router.add_get("/api/persona", self._h_persona)
@@ -249,6 +276,23 @@ class DashboardServer:
     async def _h_options(req):
         from aiohttp import web
         return web.Response(status=204)
+
+    @staticmethod
+    async def _h_root_redirect(req):
+        from aiohttp import web
+        raise web.HTTPFound("/dashboard/")
+
+    @staticmethod
+    async def _h_dashboard_index(req):
+        from aiohttp import web
+        index_path = Path(__file__).parent / "static" / "index.html"
+        if not index_path.is_file():
+            return web.Response(status=404, text="dashboard not built")
+        return web.Response(
+            body=index_path.read_bytes(),
+            content_type="text/html",
+            charset="utf-8",
+        )
 
     # ----- handlers -----------------------------------------------
     async def _h_health(self, req):
