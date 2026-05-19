@@ -174,8 +174,26 @@ def from_settings(cfg) -> PipecatLoopConfig:
 
 
 def _system_prompt_for(lang: str) -> str:
-    """Return the slim voice system prompt for the active language."""
-    return _VOICE_SYSTEM_PROMPT_UK if lang == "uk" else _VOICE_SYSTEM_PROMPT_RU
+    """Return the slim voice system prompt + L1 skill catalog.
+
+    The base voice prompt is ~130 tokens; the L1 catalog is one
+    line per active skill (~10-15 tokens each). With 5-10 skills
+    we stay under 250 tokens — small enough that cold-cache prompt
+    evals are still snappy on qwen3:8b.
+
+    Lazy-imports the skill store because the skills module is
+    optional — early Pipecat unit tests don't need it.
+    """
+    base = _VOICE_SYSTEM_PROMPT_UK if lang == "uk" else _VOICE_SYSTEM_PROMPT_RU
+    try:
+        from ..skills import get_skill_store
+        catalog = get_skill_store().catalog_block(active_locale=lang)
+        return base + catalog
+    except Exception as exc:
+        # Skills are optional polish — a broken store must never
+        # break the voice loop. Log once and continue with base.
+        debug_log(f"skills catalog unavailable: {exc!r}", "pipecat")
+        return base
 
 
 # ───────────────────────── Stage-3 HUD adapters ──────────────────────────
@@ -939,6 +957,66 @@ def _mac_control_tools_schema():
             },
             required=["text"],
         ),
+        # ── R32 skill loaders ──────────────────────────────────
+        # See ``jarvis.skills.store`` for the L1/L2/L3 model. The L1
+        # catalog appears in the system prompt; these tools let the
+        # LLM expand to L2/L3 when a skill matches the task.
+        FunctionSchema(
+            name="list_skills",
+            description=(
+                "List the names + one-line descriptions of all "
+                "skills available in this Jarvis workspace. Use when "
+                "the L1 catalog in the system prompt didn't show the "
+                "skill you need, or before deciding which skill fits "
+                "the user's request."
+            ),
+            properties={},
+            required=[],
+        ),
+        FunctionSchema(
+            name="load_skill",
+            description=(
+                "Load the full SKILL.md protocol for the given skill "
+                "name. Call this BEFORE attempting a complex task "
+                "that matches an L1 catalog entry — the SKILL.md "
+                "tells you the step-by-step protocol, tools to use, "
+                "and expected output shape. Returns the full "
+                "markdown content."
+            ),
+            properties={
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Exact skill name from the L1 catalog "
+                        "(e.g. 'research-brief')."
+                    ),
+                },
+            },
+            required=["name"],
+        ),
+        FunctionSchema(
+            name="load_skill_reference",
+            description=(
+                "Load a supporting reference file from a skill's "
+                "``references/`` directory. Use only after "
+                "``load_skill`` has been called and that SKILL.md "
+                "explicitly pointed at the reference."
+            ),
+            properties={
+                "name": {
+                    "type": "string",
+                    "description": "Skill name",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": (
+                        "Reference file stem (without .md). E.g. "
+                        "'EXAMPLE' for 'references/EXAMPLE.md'."
+                    ),
+                },
+            },
+            required=["name", "reference"],
+        ),
     ]
     return ToolsSchema(standard_tools=schemas)
 
@@ -1024,6 +1102,162 @@ def _register_mac_control_handlers(llm):
 
     for op_name in exposed:
         llm.register_function(op_name, _make_handler(op_name))
+
+
+def _register_skill_handlers(llm) -> None:
+    """Register the three skill-loader function-calls.
+
+    Separate from the mac_control bridge because skills don't go
+    through ``_dispatch_op`` — they're a pure read-side accessor
+    on the local skill store. No subprocess, no AppleScript, no
+    blocking I/O beyond a small file read. We still hop to a
+    thread to keep the asyncio loop responsive in case the
+    SKILL.md is unusually large.
+    """
+    import asyncio as _asyncio
+
+    from ..ipc import get_stream
+    from ..skills import get_skill_store
+
+    stream = get_stream()
+    store = get_skill_store()
+
+    async def _h_list(params) -> None:
+        stream.emit(
+            "tool_call", tool="list_skills", args={}, status="starting"
+        )
+        try:
+            skills = await _asyncio.to_thread(store.list_skills)
+            payload = [
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "tags": s.tags,
+                    "risk": s.risk,
+                    "has_references": bool(s.references),
+                }
+                for s in skills
+            ]
+            stream.emit(
+                "tool_call",
+                tool="list_skills",
+                args={},
+                status="completed",
+                result={"count": len(payload)},
+            )
+            await params.result_callback({"skills": payload})
+        except Exception as exc:
+            stream.emit(
+                "tool_call",
+                tool="list_skills",
+                args={},
+                status="failed",
+                error=str(exc),
+            )
+            await params.result_callback({"ok": False, "error": str(exc)})
+
+    async def _h_load(params) -> None:
+        args = dict(params.arguments or {})
+        name = str(args.get("name", "")).strip()
+        stream.emit(
+            "tool_call", tool="load_skill", args=args, status="starting"
+        )
+        try:
+            skill = await _asyncio.to_thread(store.get_skill, name)
+            if skill is None:
+                msg = (
+                    f"Unknown skill {name!r}. Call list_skills() to "
+                    "see available names."
+                )
+                stream.emit(
+                    "tool_call",
+                    tool="load_skill",
+                    args=args,
+                    status="failed",
+                    error=msg,
+                )
+                await params.result_callback({"ok": False, "error": msg})
+                return
+            stream.emit(
+                "tool_call",
+                tool="load_skill",
+                args=args,
+                status="completed",
+                result={"chars": len(skill.content)},
+            )
+            await params.result_callback(
+                {
+                    "ok": True,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "content": skill.content,
+                    "references": sorted(skill.references.keys()),
+                    "risk": skill.risk,
+                    "tools": skill.tools,
+                }
+            )
+        except Exception as exc:
+            stream.emit(
+                "tool_call",
+                tool="load_skill",
+                args=args,
+                status="failed",
+                error=str(exc),
+            )
+            await params.result_callback({"ok": False, "error": str(exc)})
+
+    async def _h_load_ref(params) -> None:
+        args = dict(params.arguments or {})
+        name = str(args.get("name", "")).strip()
+        ref = str(args.get("reference", "")).strip()
+        stream.emit(
+            "tool_call",
+            tool="load_skill_reference",
+            args=args,
+            status="starting",
+        )
+        try:
+            text = await _asyncio.to_thread(
+                store.load_reference, name, ref
+            )
+            if text is None:
+                msg = (
+                    f"No reference {ref!r} found on skill {name!r}. "
+                    "Call load_skill first to see its 'references' "
+                    "list."
+                )
+                stream.emit(
+                    "tool_call",
+                    tool="load_skill_reference",
+                    args=args,
+                    status="failed",
+                    error=msg,
+                )
+                await params.result_callback({"ok": False, "error": msg})
+                return
+            stream.emit(
+                "tool_call",
+                tool="load_skill_reference",
+                args=args,
+                status="completed",
+                result={"chars": len(text)},
+            )
+            await params.result_callback(
+                {"ok": True, "name": name, "reference": ref, "content": text}
+            )
+        except Exception as exc:
+            stream.emit(
+                "tool_call",
+                tool="load_skill_reference",
+                args=args,
+                status="failed",
+                error=str(exc),
+            )
+            await params.result_callback({"ok": False, "error": str(exc)})
+
+    llm.register_function("list_skills", _h_list)
+    llm.register_function("load_skill", _h_load)
+    llm.register_function("load_skill_reference", _h_load_ref)
 
 
 # ──────────────── Stage-5 wake-word gate + echo filter ───────────────────
@@ -1417,6 +1651,15 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     # turn). Register handlers on the LLM service itself.
     tools_schema = _mac_control_tools_schema()
     _register_mac_control_handlers(llm)
+    # R32 — skill loaders (list_skills / load_skill / load_skill_reference)
+    # are already in the schema; register their handlers too.
+    try:
+        _register_skill_handlers(llm)
+    except Exception as exc:
+        debug_log(
+            f"skill handlers unavailable: {exc!r} (catalog still works)",
+            "pipecat",
+        )
 
     # ── context aggregators ────────────────────────────────────────
     system_prompt = _system_prompt_for(cfg.active_language)
