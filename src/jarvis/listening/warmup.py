@@ -34,7 +34,7 @@ def _warmup_ollama(
     base_url: str,
     model: str,
     system_prompt: str,
-    timeout_s: float = 10.0,
+    timeout_s: float = 60.0,
 ) -> None:
     """Prime Ollama's KV cache with the actual system prompt.
 
