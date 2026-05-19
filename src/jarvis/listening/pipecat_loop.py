@@ -174,26 +174,50 @@ def from_settings(cfg) -> PipecatLoopConfig:
 
 
 def _system_prompt_for(lang: str) -> str:
-    """Return the slim voice system prompt + L1 skill catalog.
+    """Build the full voice system prompt for the active language.
 
-    The base voice prompt is ~130 tokens; the L1 catalog is one
-    line per active skill (~10-15 tokens each). With 5-10 skills
-    we stay under 250 tokens — small enough that cold-cache prompt
-    evals are still snappy on qwen3:8b.
+    Composition (in order, each section optional + best-effort):
 
-    Lazy-imports the skill store because the skills module is
-    optional — early Pipecat unit tests don't need it.
+      1. Persona block from ~/.config/jarvis/persona.md (R33-S1)
+      2. Base voice prompt (RU or UK, hard-coded fallback)
+      3. L1 skill catalog from ~/.config/jarvis/skills/ (R32-1)
+
+    The persona section comes FIRST because it shapes the model's
+    voice for the whole turn; the base prompt + skill catalog are
+    operational instructions that follow.
+
+    Total budget: ~300 tokens. Persona ~120, base ~130, catalog ~50
+    at 5 skills. Cold-cache eval on qwen3:8b stays under ~250 ms.
+
+    Lazy-imports are intentional: ``skills`` and ``persona`` are
+    optional modules and must NEVER break the voice loop on import
+    failure.
     """
     base = _VOICE_SYSTEM_PROMPT_UK if lang == "uk" else _VOICE_SYSTEM_PROMPT_RU
+    parts: list[str] = []
+
+    # 1. Persona (R33-S1)
+    try:
+        from ..persona import get_persona_store
+        persona_block = get_persona_store().get().render_prompt_block(lang=lang)
+        if persona_block:
+            parts.append(persona_block)
+    except Exception as exc:
+        debug_log(f"persona block unavailable: {exc!r}", "pipecat")
+
+    # 2. Base voice prompt
+    parts.append(base)
+
+    # 3. L1 skill catalog (R32-1)
     try:
         from ..skills import get_skill_store
         catalog = get_skill_store().catalog_block(active_locale=lang)
-        return base + catalog
+        if catalog:
+            parts.append(catalog.lstrip("\n"))
     except Exception as exc:
-        # Skills are optional polish — a broken store must never
-        # break the voice loop. Log once and continue with base.
         debug_log(f"skills catalog unavailable: {exc!r}", "pipecat")
-        return base
+
+    return "\n\n".join(p for p in parts if p)
 
 
 # ───────────────────────── Stage-3 HUD adapters ──────────────────────────
