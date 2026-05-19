@@ -44,5 +44,23 @@ class DeleteMealTool(Tool):
             except Exception:
                 is_deleted = False
         debug_log(f"DELETE_MEAL: id={mid} deleted={is_deleted}", "nutrition")
-        context.user_print("✅ Meal deleted." if is_deleted else "⚠️ I couldn't delete that meal.")
-        return ToolExecutionResult(success=is_deleted, reply_text=("Meal deleted." if is_deleted else "Sorry, I couldn't delete that meal."))
+        # Audit round 13 fix: round 12's types.py auto-migration moves
+        # ``success=False, reply_text=<text>`` into ``error_message``,
+        # which means the engine no longer surfaces the polite "Sorry"
+        # message as a tool result — it appears as an error and the
+        # LLM gets back "(no result)". Split the two cases explicitly
+        # so the failure path passes the human message through
+        # ``error_message=`` (the engine reads ``error_text`` for it).
+        if is_deleted:
+            context.user_print("✅ Meal deleted.")
+            return ToolExecutionResult(success=True, reply_text="Meal deleted.")
+        context.user_print("⚠️ I couldn't delete that meal.")
+        return ToolExecutionResult(
+            success=False,
+            reply_text=None,
+            error_message=(
+                "Could not delete meal "
+                f"id={mid if mid is not None else '(missing)'} — "
+                "row not found or DB error. Ask the user to confirm the id."
+            ),
+        )

@@ -70,6 +70,12 @@ class TestScreenshotTool:
     @patch('subprocess.run')
     def test_run_empty_ocr(self, mock_run, mock_which):
         """Test screenshot with empty OCR result (tesseract missing)."""
+        # Round 13 changed behaviour: an empty OCR result is now a
+        # failure (success=False, error_message=<human reason>) so
+        # the reply engine doesn't silently return an empty body to
+        # the user. Pre-round-13 it returned success=True with empty
+        # error_message — that's the contract this test pins to the
+        # new behaviour.
         # screencapture present, tesseract missing
         def which_side_effect(name):
             if name == 'screencapture':
@@ -83,5 +89,5 @@ class TestScreenshotTool:
             mock_exists.return_value = True
             result = self.tool.run({}, self.context)
         assert isinstance(result, ToolExecutionResult)
-        assert result.success is True
-        assert result.reply_text == ''
+        assert result.success is False
+        assert "screenshot" in (result.error_message or "").lower()

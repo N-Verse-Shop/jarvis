@@ -32,6 +32,30 @@ SUPPORTED_CHAT_MODELS: Dict[str, Dict[str, str]] = {
         "size": "~12GB",
         "vram": "24GB+",
     },
+    # Round 29 (F88): user config (~/.config/jarvis/config.json) had
+    # been running qwen3:8b / qwen2.5:3b against Hetzner remotely for
+    # months while the supported-models check only knew about the
+    # gemma/gpt-oss family — anything that does
+    # `model in get_supported_model_ids()` (validation UIs, doctor,
+    # model-picker) flagged the real production model as invalid.
+    "qwen3:8b": {
+        "name": "Qwen 3 8B",
+        "description": "Multilingual, strong RU/UA — ~5GB; recommended for chat over Tailscale to a remote Ollama host",
+        "size": "~5GB",
+        "vram": "8GB+",
+    },
+    "qwen2.5:3b": {
+        "name": "Qwen 2.5 3B",
+        "description": "Lightweight, fast — ~2GB; great for intent-judge / classifier roles",
+        "size": "~2GB",
+        "vram": "4GB+",
+    },
+    "qwen2.5:1.5b": {
+        "name": "Qwen 2.5 1.5B",
+        "description": "Tiny, very fast — ~1GB; canned-reply / wake disambiguator",
+        "size": "~1GB",
+        "vram": "2GB+",
+    },
 }
 
 # The default chat model (first in the supported list)
@@ -162,15 +186,41 @@ class Settings:
     hot_window_enabled: bool
     hot_window_seconds: float
     hot_window_persistent: bool
+    # Persistent-hot-window safety ceilings (only active when
+    # hot_window_persistent=True). See state_manager.py for semantics.
+    hot_window_max_session_seconds: float
+    hot_window_max_idle_seconds: float
 
     # Echo Detection
     echo_energy_threshold: float
     echo_tolerance: float
 
+    # Stop Commands — interrupt TTS playback vs end the whole session.
+    # See get_default_config() for the per-key semantics. These are read
+    # via cfg.X in listener.py, so they MUST be declared here — getattr()
+    # fallbacks silently mask a user's config.json values otherwise.
+    stop_commands: list[str]
+    stop_command_fuzzy_ratio: float
+    session_stop_commands: list[str]
+
+    # Voice-energy interrupt (allow shouting over TTS to interrupt it).
+    # Disabled by default — see voice_interrupt_v3 comment in config.json
+    # for the failure mode (baseline=room-noise → first frame trips).
+    voice_interrupt_energy_enabled: bool
+    voice_interrupt_spike_ratio: float
+    voice_interrupt_spike_frames: int
+    voice_interrupt_absolute_rms: float
+
     # Intent Judge (LLM-based intent classification)
     # Always used when available, falls back to simple wake word detection
     intent_judge_model: str
     intent_judge_timeout_sec: float
+    intent_judge_thinking_enabled: bool
+
+    # Global thinking-mode toggle for chat (Qwen3 etc.). When False the
+    # daemon explicitly sends `"think": false` at chat call sites so the
+    # thinking-model doesn't burn tokens on <think>...</think>.
+    llm_thinking_enabled: bool
 
     # Transcript Buffer - ambient speech context for intent judge
     transcript_buffer_duration_sec: float
@@ -261,6 +311,7 @@ class Settings:
     dictation_enabled: bool
     dictation_hotkey: str
     dictation_filler_removal: bool
+    dictation_thinking_enabled: bool
     dictation_custom_dictionary: list
 
     # MCP Integration
@@ -282,19 +333,81 @@ def _load_json(path: Path) -> Dict[str, Any]:
                 data = json.load(f)
                 if isinstance(data, dict):
                     return data
-    except Exception:
-        pass
+    except Exception as e:
+        # Audit round 16 fix: surface the failure instead of silently
+        # returning defaults. A corrupt config file (truncated JSON
+        # from a power cut mid-write, invalid encoding, permission
+        # change) was indistinguishable from a fresh install before
+        # this — every user customisation appeared to vanish and the
+        # daemon happily booted with defaults. The debug_log call
+        # gives a single forensic breadcrumb without ever exposing
+        # config content.
+        try:
+            from .debug import debug_log as _dlog
+            _dlog(
+                f"config load failed at {path}: {type(e).__name__}: {e}",
+                "config",
+            )
+        except Exception:
+            pass
     return {}
 
 
 def _save_json(path: Path, data: Dict[str, Any]) -> bool:
-    """Save config data to JSON file. Returns True on success."""
+    """Save config data to JSON file. Returns True on success.
+
+    Audit round 11 fix: previously wrote directly to ``path``; a crash
+    mid-migration (or `_migrate_config` rewrite) left the user's config
+    truncated or zero-bytes. Next `load_settings` then returned defaults
+    silently — wiping every customisation. Atomic `.tmp + os.replace`
+    pattern matches the rest of the codebase (see ``ipc/stream.py``,
+    ``utils/location.py``) — partial write stays in the .tmp sibling and
+    is harmlessly orphaned on retry.
+    """
     try:
+        import os as _os
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                _os.fsync(f.fileno())
+            except OSError:
+                # Some filesystems (e.g. encrypted overlays) don't
+                # support fsync — non-fatal, replace below still gives
+                # us a torn-write-resistant write.
+                pass
+        _os.replace(tmp, path)
+        # Round 29 (F89): enforce 0600 — config.json carries the
+        # whisper_remote_token (real 64-char hex). With default umask
+        # the file ends up world-readable on a multi-user macOS; any
+        # process under any UID could exfiltrate the token via a
+        # routine file scan. chmod is idempotent + harmless.
+        try:
+            _os.chmod(path, 0o600)
+        except Exception:
+            pass
         return True
-    except Exception:
+    except Exception as e:
+        # Audit round 16 fix: surface the failure once before
+        # swallowing. Silent ``return False`` left ``save_settings``
+        # callers unable to distinguish "permission denied" from "OK".
+        try:
+            from .debug import debug_log as _dlog
+            _dlog(
+                f"config save failed at {path}: {type(e).__name__}: {e}",
+                "config",
+            )
+        except Exception:
+            pass
+        # Cleanup stale .tmp if it survived the failure path.
+        try:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
         return False
 
 
@@ -433,7 +546,7 @@ def get_default_config() -> Dict[str, Any]:
 
         # Voice Collection & Timing
         "voice_block_seconds": 4.0,
-        "voice_collect_seconds": 4.5,
+        "voice_collect_seconds": 3.0,
         "voice_max_collect_seconds": 180.0,
 
         # Wake Word Detection
@@ -528,9 +641,30 @@ def get_default_config() -> Dict[str, Any]:
         "planner_enabled": True,
         "planner_timeout_sec": 6.0,
 
-        # Stop Commands
-        "stop_commands": ["stop", "quiet", "shush", "silence", "enough", "shut up"],
+        # Stop Commands. TWO related keys exist (don't merge them):
+        #   - `stop_commands`: short-circuit during TTS playback — say one
+        #     of these and the current spoken reply is interrupted. Hot
+        #     window stays open. Used by listener.py:1077.
+        #   - `session_stop_commands`: end the entire session — daemon
+        #     transitions to IDLE and waits for a fresh "Джарвис" wake.
+        #     Used by listener.py:918, 1043.
+        # Both lists must include EN + RU + UA variants because Whisper
+        # may transcribe the user's RU "стоп" as EN "stop" or vice versa
+        # depending on accent + audio quality. Pre-RU-migration the EN-only
+        # default left RU users unable to interrupt TTS.
+        "stop_commands": [
+            "stop", "quiet", "shush", "silence", "enough", "shut up",
+            "стоп", "хватит", "тише", "замолчи", "тихо",
+            "стій", "досить", "тиша", "замовкни",
+        ],
         "stop_command_fuzzy_ratio": 0.8,
+        "session_stop_commands": [
+            "стоп", "хватит", "достаточно", "тише", "тишина",
+            "замолчи", "выключись", "отбой", "завершить сессию",
+            "досить", "тиша", "замовкни", "завершити сесію",
+            "вимкнись", "відбій",
+            "stop session", "end session",
+        ],
 
         # Location Services
         "location_enabled": True,
@@ -649,8 +783,17 @@ def load_settings() -> Settings:
     voice_device_val = merged.get("voice_device")
     voice_device = None if voice_device_val in (None, "", "default", "system") else str(voice_device_val)
     voice_block_seconds = float(merged.get("voice_block_seconds", 4.0))
-    voice_collect_seconds = float(merged.get("voice_collect_seconds", 2.5))
-    voice_max_collect_seconds = float(merged.get("voice_max_collect_seconds", 60.0))
+    # Default unified across all 3 historical sites: config.json defaults (4.5),
+    # this loader (was 2.5), and listener init (was 2.0). Pick 3.0 — long
+    # enough for the user to think between wake and follow-up command,
+    # short enough that "Джарвіс" alone gets an ack quickly.
+    voice_collect_seconds = float(merged.get("voice_collect_seconds", 3.0))
+    # Audit round 14 fix: this fallback was 60.0 while
+    # ``get_default_config()`` returns 180.0 — a user with no
+    # ``config.json`` saw a 60 s cap (collection truncated long voice
+    # notes mid-sentence) while a freshly-seeded config behaved
+    # differently. Align to the canonical default.
+    voice_max_collect_seconds = float(merged.get("voice_max_collect_seconds", 180.0))
     wake_word = str(merged.get("wake_word", "jarvis")).strip().lower()
     wake_aliases = [a.strip().lower() for a in _ensure_list(merged.get("wake_aliases")) if a.strip()]
     wake_fuzzy_ratio = float(merged.get("wake_fuzzy_ratio", 0.78))
@@ -678,12 +821,57 @@ def load_settings() -> Settings:
     hot_window_enabled = bool(merged.get("hot_window_enabled", True))
     hot_window_seconds = float(merged.get("hot_window_seconds", 3.0))
     hot_window_persistent = bool(merged.get("hot_window_persistent", False))
+    try:
+        hot_window_max_session_seconds = float(merged.get("hot_window_max_session_seconds", 1800.0))
+    except (TypeError, ValueError):
+        hot_window_max_session_seconds = 1800.0
+    try:
+        hot_window_max_idle_seconds = float(merged.get("hot_window_max_idle_seconds", 180.0))
+    except (TypeError, ValueError):
+        hot_window_max_idle_seconds = 180.0
     echo_energy_threshold = float(merged.get("echo_energy_threshold", 2.0))
     echo_tolerance = float(merged.get("echo_tolerance", 0.3))
+
+    # Stop Commands — short-circuit TTS vs end-session. Both default to
+    # the merged RU+UA+EN lists so listener never sees an empty list.
+    stop_commands = _ensure_list(merged.get("stop_commands")) or [
+        "stop", "quiet", "shush", "silence", "enough", "shut up",
+        "стоп", "хватит", "тише", "замолчи", "тихо",
+        "стій", "досить", "тиша", "замовкни",
+    ]
+    try:
+        stop_command_fuzzy_ratio = float(merged.get("stop_command_fuzzy_ratio", 0.8))
+    except (TypeError, ValueError):
+        stop_command_fuzzy_ratio = 0.8
+    session_stop_commands = _ensure_list(merged.get("session_stop_commands")) or [
+        "стоп", "хватит", "достаточно", "тише", "тишина",
+        "замолчи", "выключись", "отбой", "завершить сессию",
+        "досить", "тиша", "замовкни", "завершити сесію",
+        "вимкнись", "відбій",
+        "stop session", "end session",
+    ]
+
+    # Voice-energy interrupt knobs (disabled by default — see config.json
+    # _voice_interrupt_v3_comment for the failure mode).
+    voice_interrupt_energy_enabled = bool(merged.get("voice_interrupt_energy_enabled", False))
+    try:
+        voice_interrupt_spike_ratio = float(merged.get("voice_interrupt_spike_ratio", 1.5))
+    except (TypeError, ValueError):
+        voice_interrupt_spike_ratio = 1.5
+    try:
+        voice_interrupt_spike_frames = int(merged.get("voice_interrupt_spike_frames", 8))
+    except (TypeError, ValueError):
+        voice_interrupt_spike_frames = 8
+    try:
+        voice_interrupt_absolute_rms = float(merged.get("voice_interrupt_absolute_rms", 0.025))
+    except (TypeError, ValueError):
+        voice_interrupt_absolute_rms = 0.025
 
     # Intent Judge - always used when available
     intent_judge_model = str(merged.get("intent_judge_model", "gemma4:e2b"))
     intent_judge_timeout_sec = float(merged.get("intent_judge_timeout_sec", 10.0))
+    intent_judge_thinking_enabled = bool(merged.get("intent_judge_thinking_enabled", False))
+    llm_thinking_enabled = bool(merged.get("llm_thinking_enabled", False))
 
     # Transcript Buffer - ambient speech context for intent judge (separate from dialogue)
     transcript_buffer_duration_sec = float(merged.get("transcript_buffer_duration_sec", 120.0))
@@ -750,13 +938,20 @@ def load_settings() -> Settings:
     dictation_enabled = bool(merged.get("dictation_enabled", True))
     dictation_hotkey = str(merged.get("dictation_hotkey", _default_dictation_hotkey())).strip()
     dictation_filler_removal = bool(merged.get("dictation_filler_removal", False))
+    dictation_thinking_enabled = bool(merged.get("dictation_thinking_enabled", False))
     raw_dict = merged.get("dictation_custom_dictionary", [])
     dictation_custom_dictionary = list(raw_dict) if isinstance(raw_dict, list) else []
     mcps = _ensure_dict(merged.get("mcps"))
-    whisper_min_confidence = float(merged.get("whisper_min_confidence", 0.4))
+    # Audit round 14 fix: these four fallbacks disagreed with the
+    # canonical values in ``get_default_config()`` — a config-less
+    # user got a stricter Whisper gate (0.4/0.3/2) than the seeded
+    # default (0.3/0.15/1), so the first-run experience filtered more
+    # transcripts as low-confidence than the documented behaviour
+    # promised. Align to the canonical defaults.
+    whisper_min_confidence = float(merged.get("whisper_min_confidence", 0.3))
     whisper_no_speech_threshold = float(merged.get("whisper_no_speech_threshold", 0.5))
-    whisper_min_audio_duration = float(merged.get("whisper_min_audio_duration", 0.3))
-    whisper_min_word_length = int(merged.get("whisper_min_word_length", 2))
+    whisper_min_audio_duration = float(merged.get("whisper_min_audio_duration", 0.15))
+    whisper_min_word_length = int(merged.get("whisper_min_word_length", 1))
     _wl_raw = merged.get("whisper_language")
     whisper_language = (str(_wl_raw).strip().lower() or None) if _wl_raw else None
     llm_chat_timeout_sec = float(merged.get("llm_chat_timeout_sec", 180.0))
@@ -850,11 +1045,27 @@ def load_settings() -> Settings:
         hot_window_enabled=hot_window_enabled,
         hot_window_seconds=hot_window_seconds,
         hot_window_persistent=hot_window_persistent,
+        hot_window_max_session_seconds=hot_window_max_session_seconds,
+        hot_window_max_idle_seconds=hot_window_max_idle_seconds,
         echo_energy_threshold=echo_energy_threshold,
         echo_tolerance=echo_tolerance,
+
+        # Stop Commands
+        stop_commands=stop_commands,
+        stop_command_fuzzy_ratio=stop_command_fuzzy_ratio,
+        session_stop_commands=session_stop_commands,
+
+        # Voice-energy interrupt
+        voice_interrupt_energy_enabled=voice_interrupt_energy_enabled,
+        voice_interrupt_spike_ratio=voice_interrupt_spike_ratio,
+        voice_interrupt_spike_frames=voice_interrupt_spike_frames,
+        voice_interrupt_absolute_rms=voice_interrupt_absolute_rms,
+
         # Intent Judge - always used when available
         intent_judge_model=intent_judge_model,
         intent_judge_timeout_sec=intent_judge_timeout_sec,
+        intent_judge_thinking_enabled=intent_judge_thinking_enabled,
+        llm_thinking_enabled=llm_thinking_enabled,
 
         # Transcript Buffer
         transcript_buffer_duration_sec=transcript_buffer_duration_sec,
@@ -894,6 +1105,7 @@ def load_settings() -> Settings:
         dictation_enabled=dictation_enabled,
         dictation_hotkey=dictation_hotkey,
         dictation_filler_removal=dictation_filler_removal,
+        dictation_thinking_enabled=dictation_thinking_enabled,
         dictation_custom_dictionary=dictation_custom_dictionary,
 
         # MCP Integration

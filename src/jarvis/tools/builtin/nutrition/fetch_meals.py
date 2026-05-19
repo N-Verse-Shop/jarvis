@@ -1,15 +1,44 @@
 """Fetch meals tool for nutrition tracking."""
 
 from typing import Dict, Any, Optional, List, Callable
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as _dtime
 
 from ....debug import debug_log
 from ...base import Tool, ToolContext
 from ...types import ToolExecutionResult
 
 
+def _local_today_start_utc() -> datetime:
+    """Return the UTC instant corresponding to the user's local midnight.
+
+    Audit round 17 fix: the previous "last 24h" default rolled a
+    wall-clock 24-hour window forward in UTC, so a user in Kyiv
+    (UTC+3) asking "what did I eat today?" at 01:30 local time got
+    meals from 22:30 UTC YESTERDAY through 22:30 UTC TODAY — which
+    excludes everything they ate before midnight LOCAL today (the
+    real intent) and includes yesterday's late dinner as "today".
+
+    Reading the user's wall-clock timezone via ``datetime.astimezone()``
+    (no args → local TZ) and snapping to its midnight gives the
+    intuitive "today so far" range, which is what every voice user
+    actually wants. Returns a tz-aware UTC datetime so the rest of
+    the pipeline stays UTC-internal.
+    """
+    local_now = datetime.now().astimezone()
+    local_midnight = datetime.combine(
+        local_now.date(), _dtime(0, 0, 0, tzinfo=local_now.tzinfo)
+    )
+    return local_midnight.astimezone(timezone.utc)
+
+
 def _normalize_time_range(args: Optional[Dict[str, Any]]) -> tuple[str, str]:
-    """Normalize time range for meal fetching."""
+    """Normalize time range for meal fetching.
+
+    Default range (when caller passes neither bound): from LOCAL
+    midnight today through now (UTC). See ``_local_today_start_utc``
+    for the rationale — voice users asking "today" mean their wall-
+    clock today, not a 24-hour UTC sliding window.
+    """
     now = datetime.now(timezone.utc)
     since: Optional[str] = None
     until: Optional[str] = None
@@ -25,8 +54,9 @@ def _normalize_time_range(args: Optional[Dict[str, Any]]) -> tuple[str, str]:
         except Exception:
             until = None
     if since is None and until is None:
-        # Default last 24h
-        return (now - timedelta(days=1)).isoformat(), now.isoformat()
+        # Default: from local-midnight today through "now". Stays in
+        # UTC for the SQL boundary but uses the user's perceived day.
+        return _local_today_start_utc().isoformat(), now.isoformat()
     if since is None and until is not None:
         # backfill 24h prior to until
         try:
@@ -36,7 +66,7 @@ def _normalize_time_range(args: Optional[Dict[str, Any]]) -> tuple[str, str]:
         return (until_dt - timedelta(days=1)).isoformat(), until_dt.isoformat()
     if since is not None and until is None:
         return since, now.isoformat()
-    return since or (now - timedelta(days=1)).isoformat(), until or now.isoformat()
+    return since or _local_today_start_utc().isoformat(), until or now.isoformat()
 
 
 def summarize_meals(meals: List[Any]) -> str:

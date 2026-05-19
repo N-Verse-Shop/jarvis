@@ -22,6 +22,71 @@ from jarvis.memory.graph import FIXED_BRANCH_IDS, GraphMemoryStore
 
 app = Flask(__name__)
 
+
+# Audit round 21 SECURITY fix (F07): DNS-rebinding + CSRF guard.
+#
+# The viewer binds to 127.0.0.1:5050 and Flask accepts any ``Host:``
+# header by default. A malicious web page in the user's browser
+# using DNS rebinding (``*.rebind.me`` → ``127.0.0.1`` after TTL=0)
+# could make same-origin XHRs to ``http://127.0.0.1:5050/api/...``
+# with a foreign ``Host`` and a permissive ``Origin``. Without
+# this guard, the DELETE endpoints (memory, meal, graph node) would
+# happily run, letting any web page wipe the user's persistent
+# memory. The guard rejects any request whose ``Host:`` is not in
+# the loopback allowlist OR whose ``Origin:`` (when present) is
+# outside the same allowlist. CSRF mitigation: we additionally
+# require a same-site ``Sec-Fetch-Site`` of either ``same-origin``
+# / ``none`` for mutating verbs — browsers set this automatically
+# and a forged value cannot be set by JavaScript.
+_LOOPBACK_HOSTS = frozenset({
+    "127.0.0.1", "127.0.0.1:5050", "localhost", "localhost:5050",
+    "[::1]", "[::1]:5050",
+})
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+@app.before_request
+def _enforce_loopback_host() -> Optional[Response]:
+    from flask import request as _req
+    host = (_req.headers.get("Host") or "").lower()
+    if host not in _LOOPBACK_HOSTS:
+        debug_log(
+            f"memory_viewer: rejected request with non-loopback Host={host!r}",
+            "viewer",
+        )
+        return jsonify({"error": "forbidden — non-loopback host"}), 403
+    origin = (_req.headers.get("Origin") or "").lower()
+    if origin:
+        # Origin is "scheme://host[:port]"; extract host:port for compare.
+        try:
+            from urllib.parse import urlparse as _urlparse
+            o = _urlparse(origin)
+            o_host = (o.netloc or "").lower()
+        except Exception:
+            o_host = origin
+        if o_host and o_host not in _LOOPBACK_HOSTS:
+            debug_log(
+                f"memory_viewer: rejected cross-origin request from {origin!r}",
+                "viewer",
+            )
+            return jsonify({"error": "forbidden — cross-origin"}), 403
+    if _req.method.upper() in _MUTATING_METHODS:
+        # Mutating verb — require an attribute the browser sets and
+        # malicious JS cannot forge. ``Sec-Fetch-Site`` was added in
+        # Chrome 76 / Safari 16 / Firefox 90 — wide deployment now.
+        # Accept ``none`` (top-level nav), ``same-origin`` (our own
+        # SPA), and missing (curl / older fetch shim) for legitimate
+        # operator use. Reject explicit ``cross-site``.
+        sfs = (_req.headers.get("Sec-Fetch-Site") or "").lower()
+        if sfs == "cross-site":
+            debug_log(
+                f"memory_viewer: rejected cross-site mutating {_req.method}",
+                "viewer",
+            )
+            return jsonify({"error": "forbidden — cross-site mutation"}), 403
+    return None
+
+
 # Global database connection
 _db_conn: Optional[sqlite3.Connection] = None
 _graph_store: Optional[GraphMemoryStore] = None
@@ -270,18 +335,45 @@ def get_memory(memory_id: int) -> Response:
 
 @app.route("/api/memory/<int:memory_id>", methods=["DELETE"])
 def delete_memory(memory_id: int) -> Response:
-    """Delete a memory by ID."""
-    conn = get_db()
-    cur = conn.cursor()
+    """Delete a memory by ID.
 
+    Audit round 21 fix (F01): route through ``Database.delete_
+    conversation_summary`` which atomically removes BOTH the SQL row
+    AND the FAISS vector. Previously this handler only issued the
+    SQL delete — on FAISS-backed installs the vector orphaned, and
+    subsequent hybrid search returned phantom summary_ids that
+    silently corrupted retrieval ranking.
+    """
     try:
-        cur.execute("DELETE FROM conversation_summaries WHERE id = ?", (memory_id,))
-        conn.commit()
-
-        if cur.rowcount > 0:
-            return jsonify({"success": True, "message": "Memory deleted"})
-        else:
+        from jarvis.memory.db import Database
+        try:
+            db = Database()
+        except Exception as exc:
+            # Fall back to direct SQL delete + best-effort FAISS sync
+            # so the UI still works even if Database can't open here.
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM conversation_summaries WHERE id = ?",
+                (memory_id,),
+            )
+            conn.commit()
+            if cur.rowcount > 0:
+                return jsonify({
+                    "success": True,
+                    "message": "Memory deleted (warning: vector may have orphaned)",
+                })
             return jsonify({"error": "Memory not found"}), 404
+        try:
+            deleted = db.delete_conversation_summary(int(memory_id))
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+        if deleted:
+            return jsonify({"success": True, "message": "Memory deleted"})
+        return jsonify({"error": "Memory not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

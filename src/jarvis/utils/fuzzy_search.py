@@ -21,9 +21,17 @@ def generate_flexible_fts_query(query: str, field_names: List[str] = None) -> st
     """
     if not query.strip():
         return ""
-    
-    # Clean and tokenize the query
-    tokens = re.findall(r"[A-Za-z0-9_]+", query.lower())
+
+    # Clean and tokenize the query.
+    # Audit round 13 fix: previously `[A-Za-z0-9_]+` silently dropped
+    # all non-Latin characters — a Ukrainian/Russian query like
+    # "коли я був у Берліні" returned `tokens=["Берліні"]` only if
+    # the user happened to mix Latin in. Pure-Cyrillic queries
+    # returned `tokens=[]` → empty FTS query → zero hits, so the diary
+    # never matched memory search for non-English speakers. The `\w+`
+    # regex with the default Python 3 `re.UNICODE` flag matches all
+    # letters from any script.
+    tokens = re.findall(r"\w+", query.lower(), flags=re.UNICODE)
     if not tokens:
         return ""
     

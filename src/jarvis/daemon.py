@@ -148,6 +148,43 @@ def get_dictation_engine():
     return _global_dictation_engine
 
 
+# Audit round 16 fix: dictation state updates fire on every hotkey
+# press and used to swallow ALL exceptions silently. The dominant
+# failure mode is ``ImportError`` in headless mode (expected — no
+# Qt installed in CI / SSH session) which we keep silent; anything
+# else (e.g. ``set_state`` raised, the singleton was torn down)
+# is a real bug. We dedupe via ``_FACE_WIDGET_WARN_SEEN`` so a
+# transient failure logs once instead of every dictation tick.
+_FACE_WIDGET_WARN_SEEN: set[str] = set()
+
+
+def _safe_set_face_state(state_name: str) -> None:
+    """Best-effort UI state hint for the face widget.
+
+    ``state_name`` is the ``JarvisState`` member name ("DICTATING",
+    "DICTATION_PROCESSING", "IDLE"). Failures are logged ONCE per
+    ``(state, error_class)`` pair so the log doesn't fill up on
+    a recurring exception.
+    """
+    try:
+        from desktop_app.face_widget import JarvisState, get_jarvis_state
+        get_jarvis_state().set_state(getattr(JarvisState, state_name))
+    except ImportError:
+        # Headless / unbundled mode — no widget to update. Silent
+        # by design; this fires whenever the desktop app isn't
+        # available and is not a bug.
+        return
+    except Exception as e:
+        sig = f"{state_name}:{type(e).__name__}"
+        if sig not in _FACE_WIDGET_WARN_SEEN:
+            _FACE_WIDGET_WARN_SEEN.add(sig)
+            debug_log(
+                f"face widget set_state({state_name}) failed once: "
+                f"{type(e).__name__}: {e}",
+                "ui",
+            )
+
+
 def _install_signal_handlers() -> None:
     """Ensure signals like Ctrl+Break trigger clean shutdown."""
     def _raise_keyboard_interrupt(_signum, _frame):
@@ -158,8 +195,23 @@ def _install_signal_handlers() -> None:
         if sig is not None:
             try:
                 signal.signal(sig, _raise_keyboard_interrupt)
-            except Exception:
-                pass
+            except (ValueError, OSError) as e:
+                # ValueError: signal only installable on main thread
+                # (the only legitimate swallow). OSError: signal unsupported
+                # on this OS (Windows SIGTERM is partial). Anything else
+                # is a real bug that used to vanish silently — audit
+                # round 16 surfaces it as a debug breadcrumb.
+                debug_log(
+                    f"signal handler install failed for {sig_name}: "
+                    f"{type(e).__name__}: {e}",
+                    "daemon",
+                )
+            except Exception as e:
+                debug_log(
+                    f"unexpected error installing signal {sig_name}: "
+                    f"{type(e).__name__}: {e}",
+                    "daemon",
+                )
 
 
 def _check_and_update_diary(
@@ -188,8 +240,15 @@ def _check_and_update_diary(
         if use_callbacks and callback_name and _diary_update_callbacks.get(callback_name):
             try:
                 _diary_update_callbacks[callback_name](data)
-            except Exception:
-                pass
+            except Exception as _cb_err:
+                # Audit round 16: surface the callback failure. A buggy
+                # UI callback used to silently break diary UI updates
+                # with no log trail; debug breadcrumb lets us bisect.
+                debug_log(
+                    f"diary callback {callback_name!r} raised: "
+                    f"{type(_cb_err).__name__}: {_cb_err}",
+                    "memory",
+                )
 
         # Emit IPC event (subprocess mode)
         if use_ipc:
@@ -513,28 +572,16 @@ def main() -> None:
 
             def _on_dictation_start():
                 voice_thread._dictation_active = True
-                try:
-                    from desktop_app.face_widget import JarvisState, get_jarvis_state
-                    get_jarvis_state().set_state(JarvisState.DICTATING)
-                except Exception:
-                    pass
+                _safe_set_face_state("DICTATING")
                 debug_log("dictation started — listener paused", "dictation")
 
             def _on_dictation_processing_start():
-                try:
-                    from desktop_app.face_widget import JarvisState, get_jarvis_state
-                    get_jarvis_state().set_state(JarvisState.DICTATION_PROCESSING)
-                except Exception:
-                    pass
+                _safe_set_face_state("DICTATION_PROCESSING")
                 debug_log("dictation processing started — transcribing captured audio", "dictation")
 
             def _on_dictation_end():
                 voice_thread._dictation_active = False
-                try:
-                    from desktop_app.face_widget import JarvisState, get_jarvis_state
-                    get_jarvis_state().set_state(JarvisState.IDLE)
-                except Exception:
-                    pass
+                _safe_set_face_state("IDLE")
                 debug_log("dictation ended — listener resumed", "dictation")
 
             dictation = _DE(
@@ -576,12 +623,14 @@ def main() -> None:
     def stdin_monitor():
         global _global_stop_requested
         try:
-            # When parent closes our stdin, readline returns empty
+            # Read until explicit SHUTDOWN command OR EOF. We do NOT
+            # treat EOF alone as shutdown when running under launchd:
+            # launchd attaches /dev/null to stdin → first readline()
+            # returns "" immediately → daemon would self-kill at boot.
+            # See I1-regression in round 8 audit.
             while True:
                 line = sys.stdin.readline()
-                if not line:  # EOF - stdin closed
-                    debug_log("stdin closed, requesting stop", "jarvis")
-                    _global_stop_requested = True
+                if not line:  # EOF — thread exits silently, no stop signal
                     break
                 line = line.strip()
                 if line == "SHUTDOWN":
@@ -591,9 +640,27 @@ def main() -> None:
         except Exception:
             pass  # stdin might not be available
 
-    if sys.platform == "win32" and not getattr(sys, 'frozen', False):
+    # Audit round 8 fix I1: previously gated to win32 only. The
+    # Electron HUD + desktop_app launcher both spawn the daemon as a
+    # subprocess on macOS too, and send "SHUTDOWN\n" to stdin for a
+    # clean exit. Without the monitor running on darwin, that
+    # SHUTDOWN was ignored — daemon could only be killed via SIGTERM,
+    # which raced with the blocking diary loop (see I2).
+    #
+    # I1-regression guard: only enable the monitor when stdin is a
+    # PIPE (parent process writing to us). Under launchd stdin is
+    # /dev/null (character device), under a terminal it's a tty —
+    # in both cases there's no useful SHUTDOWN traffic to wait for.
+    def _stdin_is_pipe() -> bool:
+        try:
+            import stat
+            return stat.S_ISFIFO(os.fstat(0).st_mode)
+        except Exception:
+            return False
+    if not getattr(sys, 'frozen', False) and _stdin_is_pipe():
         stdin_thread = threading.Thread(target=stdin_monitor, daemon=True)
         stdin_thread.start()
+        debug_log("stdin SHUTDOWN monitor enabled (pipe detected)", "jarvis")
 
     try:
         # Main daemon loop
@@ -601,16 +668,45 @@ def main() -> None:
             time.sleep(1.0)
             now = time.time()
 
-            # Periodically check if diary should be updated
+            # Periodically check if diary should be updated.
+            # Audit round 8 fix I2/I3 + round 12 fix: run the diary
+            # update in a worker thread so blocking Ollama calls (can
+            # be 30-180s) don't starve the SIGINT poll loop. Round 12
+            # adds an is_alive() guard — if Ollama stalls beyond the
+            # 60s check interval, the previous worker is still running,
+            # and spawning a second one had two failure modes:
+            #   1. Two threads with the same SQLite handle racing
+            #      writes (database-locked spikes).
+            #   2. After 30 stalled minutes you'd have 30 zombie
+            #      diary threads each holding a partial summary in
+            #      memory.
             if now - last_diary_check >= diary_check_interval:
-                _check_and_update_diary(db, cfg, verbose=False)
                 last_diary_check = now
+                prev = globals().get("_diary_worker")
+                if prev is not None and prev.is_alive():
+                    debug_log(
+                        "diary update skipped: previous worker still running",
+                        "memory",
+                    )
+                else:
+                    _t = threading.Thread(
+                        target=_check_and_update_diary,
+                        args=(db, cfg, False),
+                        daemon=True,
+                        name="diary-update",
+                    )
+                    globals()["_diary_worker"] = _t
+                    _t.start()
 
-        # Keep voice thread alive (unless stop requested)
+        # Keep voice thread alive (unless stop requested).
+        # Audit round 8 fix I3: this loop used to fire diary update
+        # EVERY 0.5s with no interval gate — a busy-loop hammering
+        # Ollama. Now it just sleeps, waiting for the voice thread or
+        # global stop. Diary updates are scheduled by the main loop
+        # above, never from here.
         if voice_thread is not None:
             while voice_thread.is_alive() and not _global_stop_requested:
                 time.sleep(0.5)
-                _check_and_update_diary(db, cfg, verbose=False)
 
     except KeyboardInterrupt:
         debug_log("daemon received KeyboardInterrupt", "jarvis")
@@ -677,6 +773,17 @@ def main() -> None:
             except Exception:
                 pass
             _warm_profile_graph_listener = None
+
+        # Audit round 12 fix: shut down the action pool so the 4 worker
+        # threads don't leak across in-process daemon restarts (test
+        # runner, self-upgrade reload). `wait=False` matches the
+        # fail-fast shutdown semantics — we don't want to block on a
+        # stuck action.
+        try:
+            from .listening.action_dispatcher import shutdown_action_pool
+            shutdown_action_pool(wait=False)
+        except Exception:
+            pass
 
         debug_log("daemon stopped", "jarvis")
         print("👋 Daemon stopped", flush=True)

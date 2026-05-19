@@ -1033,7 +1033,11 @@ class TestMergeNodeData:
         )
 
         sent_user_content = mock_llm.call_args.kwargs["user_content"]
-        assert "CURRENT facts on the node" in sent_user_content
+        # Audit round 14: prompt is now fenced as UNTRUSTED content; the
+        # "CURRENT FACTS" marker moved into the fence delimiter. The
+        # invariant under test (line count matches `_split_data_lines`)
+        # is unaffected — assertion updated to the new marker.
+        assert "UNTRUSTED CURRENT FACTS" in sent_user_content
         assert "A.\nB." in sent_user_content
         # The dropped blank/whitespace lines must not survive into the prompt.
         assert "A.\n\n" not in sent_user_content
@@ -1378,8 +1382,12 @@ class TestFormatWarmProfileBlock:
         assert "Baris" in out
 
     def test_directives_only_omits_user_heading(self):
+        # Round 15 fix F3: directives section was reframed from
+        # "STANDING INSTRUCTIONS … obey verbatim" (imperative, prompt-
+        # injection risk) to "RULES THE USER HAS PREVIOUSLY STATED …"
+        # (informational, fenced). Test pins the new heading.
         out = format_warm_profile_block({"user": "", "directives": "Reply briefly."})
-        assert "STANDING INSTRUCTIONS" in out
+        assert "RULES THE USER HAS PREVIOUSLY STATED" in out
         assert "INFORMATION THE USER HAS SHARED" not in out
         assert "briefly" in out
 
@@ -1388,9 +1396,9 @@ class TestFormatWarmProfileBlock:
             {"user": "Name is Baris.", "directives": "Reply briefly."}
         )
         assert "INFORMATION THE USER HAS SHARED" in out
-        assert "STANDING INSTRUCTIONS" in out
+        assert "RULES THE USER HAS PREVIOUSLY STATED" in out
         # User section appears before directives
-        assert out.index("INFORMATION THE USER") < out.index("STANDING INSTRUCTIONS")
+        assert out.index("INFORMATION THE USER") < out.index("RULES THE USER HAS PREVIOUSLY STATED")
 
     def test_whitespace_only_treated_as_empty(self):
         assert format_warm_profile_block({"user": "   \n", "directives": "\t"}) == ""

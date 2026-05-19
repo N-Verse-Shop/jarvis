@@ -756,11 +756,69 @@ class DialogueMemory:
         return now
 
     def add_message(self, role: str, content: str) -> None:
-        """Add a message to recent memory. Thread-safe."""
+        """Add a message to recent memory. Thread-safe.
+
+        Audit round 9 fix #9: soft cap on `_messages` growth. The
+        existing `_cleanup_old_messages` only runs from
+        `mark_saved_up_to` / `clear_pending_updates` — both of which
+        require the diary flush to succeed. If LLM perpetually fails
+        (round 8 flagged silent LLM error swallowing), neither path
+        ever runs and `_messages` grows unbounded. With 1000+ entries
+        every `get_recent_messages` / `has_pending_chunks` scans the
+        whole list under the lock → voice latency hit.
+
+        Hard cap of 2000 messages (~10× expected window) — drops
+        entries older than RECENT_WINDOW_SEC unless they're still
+        pending save. Defence in depth: even if the diary pipeline
+        is broken, memory stays bounded.
+        """
         with self._lock:
             timestamp = self._next_ts()
             self._messages.append((timestamp, role.strip(), content.strip()))
             self._last_activity_time = timestamp
+            # Audit round 10 fix R8 (regression from round 9): the OR
+            # clause `m[0] > self._last_saved_timestamp` was meant to
+            # protect unsaved messages from eviction. But when diary
+            # flush is BROKEN (LLM down for hours, network outage),
+            # `_last_saved_timestamp` stays at 0 → every message
+            # satisfies `m[0] > 0` → the soft cap is silently bypassed
+            # and memory grows unbounded — defeating the entire point
+            # of the cap. Now: tiered defence. First-pass tries to
+            # preserve recent+unsaved entries; if THAT still leaves
+            # >2000, force-keep newest 2000 regardless. Diary loses
+            # the oldest unsaved entries (acceptable failure mode —
+            # better than OOM-ing the daemon).
+            if len(self._messages) > 2000:
+                cutoff = timestamp - self.RECENT_WINDOW_SEC
+                kept = [
+                    m for m in self._messages
+                    if m[0] >= cutoff or m[0] > self._last_saved_timestamp
+                ]
+                if len(kept) > 2000:
+                    # Hard cap fallback when diary is broken.
+                    dropped_unsaved = len(kept) - 2000
+                    kept = kept[-2000:]
+                    try:
+                        debug_log(
+                            f"conversation HARD-cap: forced drop of "
+                            f"{dropped_unsaved} entries (diary saving "
+                            f"may be broken — last_saved_ts="
+                            f"{self._last_saved_timestamp})",
+                            "memory",
+                        )
+                    except Exception:
+                        pass
+                elif len(kept) < len(self._messages):
+                    try:
+                        debug_log(
+                            f"conversation soft-cap: trimmed "
+                            f"{len(self._messages) - len(kept)} of "
+                            f"{len(self._messages)} (kept {len(kept)})",
+                            "memory",
+                        )
+                    except Exception:
+                        pass
+                self._messages = kept
 
     def get_recent_context(self) -> List[str]:
         """Get recent messages formatted as context strings."""
@@ -1078,6 +1136,28 @@ class DialogueMemory:
             (ts, role, content) for ts, role, content in self._messages
             if ts >= cutoff or ts > self._last_saved_timestamp
         ]
+        # Round 29 (F89): periodic SQLite WAL checkpoint. db.py sets
+        # journal_mode=WAL on init but the WAL file is only truncated
+        # when something explicitly checkpoints. On chatty days the
+        # WAL ledger creeps to GB while the .db itself looks fine,
+        # then SQLite stalls reads when an automatic checkpoint
+        # finally fires mid-conversation. We tag this onto the
+        # already-throttled cleanup (~every few minutes) so the
+        # truncation cost is amortised and never blocks the hot path.
+        try:
+            from .db import get_db  # local import to avoid cycle
+            db = get_db()
+            if db is not None and hasattr(db, "_conn") and db._conn is not None:
+                lock = getattr(db, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                else:
+                    db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            # Best-effort housekeeping — never crash the conversation
+            # loop on a checkpoint failure.
+            pass
 
     def clear_pending_updates(self) -> None:
         """Mark all current messages as saved. Thread-safe.
@@ -1385,8 +1465,19 @@ def search_conversation_memory_by_keywords(
     try:
         debug_log(f"      🔍 Keyword-based search for: {clean_keywords}", "memory")
 
-        # Build FTS OR query for better recall
-        fts_query = " OR ".join(clean_keywords[:5])  # Limit to 5 keywords
+        # Build FTS5 OR query — each term MUST be double-quoted so SQLite
+        # FTS5 treats it as a literal phrase. Without quoting, Cyrillic
+        # tokens with punctuation hit "syntax error near 'OR'" because
+        # FTS5 tokenizer sees the punctuation as syntax. Also escape any
+        # embedded double-quote by doubling it (SQL convention).
+        def _fts5_quote(term: str) -> str:
+            # Strip FTS5-reserved chars that can't appear inside a phrase
+            # even when quoted (control chars).
+            cleaned = term.replace('"', '""').strip()
+            return f'"{cleaned}"' if cleaned else ""
+        fts_query = " OR ".join(filter(None, (_fts5_quote(k) for k in clean_keywords[:5])))
+        if not fts_query:
+            return contexts
 
         # For embedding, combine keywords to get semantic meaning of the topic cluster
         embed_query = " ".join(clean_keywords)

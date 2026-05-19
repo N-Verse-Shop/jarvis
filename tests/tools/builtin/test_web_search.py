@@ -80,7 +80,7 @@ class TestWebSearchTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "disabled" in result.reply_text.lower()
+        assert "disabled" in result.error_message.lower()
 
     def test_run_empty_query(self):
         """Test web search with empty query."""
@@ -89,7 +89,7 @@ class TestWebSearchTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "provide a search query" in result.reply_text.lower()
+        assert "provide a search query" in result.error_message.lower()
 
     def test_run_no_args(self):
         """Test web search with no arguments."""
@@ -97,7 +97,7 @@ class TestWebSearchTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "provide a search query" in result.reply_text.lower()
+        assert "provide a search query" in result.error_message.lower()
 
     def test_run_web_search_disabled(self):
         """Test web search when disabled in configuration."""
@@ -109,7 +109,7 @@ class TestWebSearchTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "disabled" in result.reply_text.lower()
+        assert "disabled" in result.error_message.lower()
 
     @patch('src.jarvis.tools.builtin.web_search._fetch_page_content')
     @patch('requests.get')

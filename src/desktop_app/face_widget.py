@@ -68,8 +68,35 @@ import tempfile
 import os
 
 def _get_jarvis_state_file() -> str:
-    """Get the path to the Jarvis state file."""
-    return os.path.join(tempfile.gettempdir(), "jarvis_state")
+    """Get the path to the Jarvis state file.
+
+    Audit round 21 SECURITY fix (F05): previously this was
+    ``tempfile.gettempdir() + "/jarvis_state"`` = ``/tmp/jarvis_state``
+    on macOS — world-readable AND world-writable. Any other local
+    user (multi-user Mac) could:
+      1. Read the file to learn the AI's state (privacy leak).
+      2. Write garbage into it, which would cause the JarvisState
+         enum lookup to raise ValueError → face widget falls back to
+         in-memory state and misses real daemon updates (wedge).
+    Now uses the user-private ``~/Library/Application Support/jarvis/``
+    directory (same as the HUD state file). 0o700 dir + 0o600 file
+    perms enforced at write time.
+    """
+    base = os.path.expanduser("~/Library/Application Support/jarvis")
+    try:
+        os.makedirs(base, exist_ok=True)
+        try:
+            os.chmod(base, 0o700)
+        except OSError:
+            pass
+    except OSError:
+        # Fallback to the legacy /tmp path so the HUD still works on
+        # systems where ~/Library cannot be created (sandboxed test
+        # runs, CI). The old privacy exposure was real but the daemon
+        # being functional is more important than perfect privacy in
+        # the fallback case.
+        return os.path.join(tempfile.gettempdir(), "jarvis_state")
+    return os.path.join(base, "jarvis_state")
 
 
 def _get_hud_state_file() -> str:
@@ -90,17 +117,32 @@ def _write_hud_state(state_value: str, level: float = 0.0) -> None:
     """Atomically push a state payload to the HUD overlay.
 
     Writes to a temp file then os.replace so the HUD never reads a torn JSON.
-    Silent on failure — HUD is a non-critical visual addon."""
+    Silent on failure — HUD is a non-critical visual addon.
+
+    Audit round 21 fix (F06): the temp file used to be ``target + ".tmp"`` —
+    a fixed name. Two concurrent writers (e.g. the in-process face widget
+    AND the daemon subprocess in dev mode) raced on the same tmp path:
+    one wrote payload A, the other overwrote with payload B mid-flush,
+    the first's ``os.replace`` then renamed partial B into ``state.json``,
+    and the HUD read torn JSON. Now the tmp name includes pid + a short
+    random suffix so writers never collide.
+    """
     import json
+    import uuid
     payload = {"state": state_value.upper(), "ts": _time.time(), "level": float(level)}
     target = _get_hud_state_file()
-    tmp = target + ".tmp"
+    tmp = f"{target}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     try:
         with open(tmp, "w") as f:
             f.write(json.dumps(payload))
         os.replace(tmp, target)
     except OSError:
-        pass
+        # Best-effort cleanup of the orphan tmp on failure so they
+        # don't accumulate in ~/Library/Application Support/jarvis.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 class JarvisStateManager(QObject):
@@ -121,6 +163,17 @@ class JarvisStateManager(QObject):
         self._state = JarvisState.ASLEEP  # Start asleep
         self._state_lock = threading.Lock()
         self._state_file = _get_jarvis_state_file()
+        # Audit round 21 fix (F04): cache the parsed file state +
+        # its mtime so the property-read fast-path skips the
+        # open()+read() syscall when the file hasn't changed.
+        # The animation timer calls ``state`` at 30 Hz; before this
+        # cache that was 30 fopen/read/close cycles per second per
+        # face widget instance, contending with the daemon's
+        # writer on the same path. Cache TTL is bounded by mtime
+        # so a real state change still propagates immediately.
+        self._state_cache: Optional[JarvisState] = None
+        self._state_cache_mtime: float = 0.0
+        self._state_cache_lock = threading.Lock()
         # Always start fresh in ASLEEP state on app launch
         # (state file is for cross-process communication during a session,
         # not for persisting state across app restarts)
@@ -128,28 +181,77 @@ class JarvisStateManager(QObject):
 
     @property
     def state(self) -> JarvisState:
-        """Read current state (checks file for cross-process communication)."""
-        # First check file (for cross-process), then fall back to memory
-        try:
-            if os.path.exists(self._state_file):
-                with open(self._state_file, 'r') as f:
-                    content = f.read().strip()
-                    return JarvisState(content)
-        except (ValueError, OSError):
-            # Invalid content or read error - fall back to in-memory state
-            pass
+        """Read current state (checks file for cross-process communication).
 
-        with self._state_lock:
-            return self._state
+        Audit round 21 fix (F04): the animation timer hits this 30
+        times per second. The previous implementation did
+        ``os.path.exists`` + ``open`` + ``read`` + ``strip`` +
+        ``JarvisState(content)`` every single call. We now stat the
+        file once per read, compare ``st_mtime`` to a cached value,
+        and skip the read entirely when the file hasn't been touched
+        since the last cache fill. Stat is one syscall — far cheaper
+        than open+read+close+enum-parse.
+        """
+        # Fast path — check mtime; on cache hit, return cached value.
+        try:
+            st = os.stat(self._state_file)
+        except FileNotFoundError:
+            # No file yet — fall back to the in-memory state.
+            with self._state_lock:
+                return self._state
+        except OSError:
+            with self._state_lock:
+                return self._state
+        with self._state_cache_lock:
+            if (self._state_cache is not None
+                    and st.st_mtime == self._state_cache_mtime):
+                return self._state_cache
+        # Mtime advanced (or no cache yet) — re-read.
+        try:
+            with open(self._state_file, 'r') as f:
+                content = f.read().strip()
+            parsed = JarvisState(content)
+        except (ValueError, OSError):
+            with self._state_lock:
+                return self._state
+        with self._state_cache_lock:
+            self._state_cache = parsed
+            self._state_cache_mtime = st.st_mtime
+        return parsed
 
     def _write_state(self, state: JarvisState) -> None:
-        """Write state to file for cross-process communication."""
+        """Write state to file for cross-process communication.
+
+        Audit round 21 fix (F05 follow-up): use atomic temp+rename
+        and set mode 0o600 so the state file is private to the
+        owning user even if the directory mode is permissive on
+        an exotic filesystem.
+        """
+        import uuid
+        tmp = f"{self._state_file}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
         try:
-            with open(self._state_file, 'w') as f:
+            with open(tmp, 'w') as f:
                 f.write(state.value)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, self._state_file)
         except OSError:
-            # File write failed - state won't be shared across processes
-            pass
+            # File write failed - state won't be shared across processes.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        # Audit round 21 (F04): invalidate the cache so the next
+        # read() doesn't return the prior value even if the OS
+        # mtime resolution is coarse (HFS+ second-granular).
+        with self._state_cache_lock:
+            self._state_cache = state
+            try:
+                self._state_cache_mtime = os.stat(self._state_file).st_mtime
+            except OSError:
+                self._state_cache_mtime = 0.0
         # Mirror to the HUD overlay's JSON path so the Electron coin reacts
         # in lock-step with the face widget. ASLEEP collapses to IDLE for
         # the HUD's state machine (HUD hides on IDLE, no "ASLEEP" concept).
@@ -159,15 +261,34 @@ class JarvisStateManager(QObject):
         _write_hud_state(hud_state)
 
     def set_state(self, state: JarvisState) -> None:
-        """Set the Jarvis state (thread-safe, cross-process)."""
+        """Set the Jarvis state (thread-safe, cross-process).
+
+        Audit round 22 fix (F37): skip the file write AND the typed
+        event emit when the state hasn't changed. Previously a
+        no-op transition (e.g. SystemTTS calling
+        ``_notify_speaking_state(True)`` between two sentences while
+        state was already SPEAKING) still triggered a full
+        atomic-temp+os.replace + IPC emit cycle. With 4-6 sentences
+        per reply that's 8-12 unnecessary state.json writes per
+        turn, each of which the HUD watcher polls and re-renders
+        the coin animation — visible to user as flicker.
+        """
         with self._state_lock:
             old = self._state
+            if old == state:
+                # No-op transition — skip the file write + emit. The
+                # Qt signal is also skipped because same-process
+                # listeners already saw the prior state and don't
+                # need a duplicate notification.
+                return
             self._state = state
 
         # Write to file for cross-process communication
         self._write_state(state)
 
-        # Emit typed event for HUD + observers (skip no-op transitions).
+        # Emit typed event for HUD + observers. ``old != state`` is
+        # guaranteed by the early-return above, but keep the
+        # explicit check for defence-in-depth.
         if old != state:
             try:
                 from jarvis.ipc import get_stream
@@ -631,51 +752,63 @@ class LowPolyFaceWidget(QWidget):
     
     def paintEvent(self, event):
         """Render the low-poly face."""
+        # Audit round 17 fix: wrap the whole body in try/finally so
+        # ``painter.end()`` ALWAYS runs. Previously any exception in a
+        # ``_draw_*`` helper (a math overflow, a None subtitle font on a
+        # locale-stripped system, a deleted texture) escaped paintEvent
+        # with the painter still attached to the widget. Qt then logged
+        # "QPainter::end: Painter ended with X saved states" and the
+        # next paint corrupted because the native paint engine handle
+        # leaked. At 60 FPS this accumulates fast — visible UI corruption
+        # after a few minutes.
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        w, h = self.width(), self.height()
-        cx, cy = w / 2, h / 2
+            w, h = self.width(), self.height()
+            cx, cy = w / 2, h / 2
 
-        # Apply hover offset to center position
-        cy += self._hover_offset
+            # Apply hover offset to center position
+            cy += self._hover_offset
 
-        # Draw background
-        self._draw_background(painter, w, h)
+            # Draw background
+            self._draw_background(painter, w, h)
 
-        # Save painter state and apply transformations
-        painter.save()
-        painter.translate(cx, cy)  # Move origin to face center
-        painter.scale(self._breathing_scale, self._breathing_scale)  # Apply breathing scale
-        painter.rotate(self._head_tilt)  # Apply subtle rotation
-        painter.translate(-cx, -cy)  # Move origin back
+            # Save painter state and apply transformations
+            painter.save()
+            try:
+                painter.translate(cx, cy)  # Move origin to face center
+                painter.scale(self._breathing_scale, self._breathing_scale)  # Apply breathing scale
+                painter.rotate(self._head_tilt)  # Apply subtle rotation
+                painter.translate(-cx, -cy)  # Move origin back
 
-        # Calculate face dimensions
-        face_width = min(w, h) * 0.7
-        face_height = face_width * 1.3
+                # Calculate face dimensions
+                face_width = min(w, h) * 0.7
+                face_height = face_width * 1.3
 
-        # Draw listening ring echoes (behind the face)
-        self._draw_listening_rings(painter, cx, cy, face_width, face_height)
+                # Draw listening ring echoes (behind the face)
+                self._draw_listening_rings(painter, cx, cy, face_width, face_height)
 
-        # Draw dictation pulse ring (behind the face)
-        self._draw_dictation_pulse(painter, cx, cy, face_width, face_height)
+                # Draw dictation pulse ring (behind the face)
+                self._draw_dictation_pulse(painter, cx, cy, face_width, face_height)
 
-        # Draw the face mesh
-        self._draw_face_mesh(painter, cx, cy, face_width, face_height)
+                # Draw the face mesh
+                self._draw_face_mesh(painter, cx, cy, face_width, face_height)
 
-        # Draw eyes
-        self._draw_eyes(painter, cx, cy, face_width, face_height)
+                # Draw eyes
+                self._draw_eyes(painter, cx, cy, face_width, face_height)
 
-        # Draw mouth
-        self._draw_mouth(painter, cx, cy, face_width, face_height)
+                # Draw mouth
+                self._draw_mouth(painter, cx, cy, face_width, face_height)
 
-        # Draw accent lines
-        self._draw_accent_lines(painter, cx, cy, face_width, face_height)
-
-        # Restore painter state
-        painter.restore()
-
-        painter.end()
+                # Draw accent lines
+                self._draw_accent_lines(painter, cx, cy, face_width, face_height)
+            finally:
+                # Restore painter state even if a draw helper raised,
+                # so the saved-state stack stays balanced.
+                painter.restore()
+        finally:
+            painter.end()
     
     def _draw_background(self, painter: QPainter, w: int, h: int):
         """Draw the dark background with subtle grid."""

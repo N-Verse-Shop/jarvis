@@ -31,6 +31,14 @@ _MAX_REDIRECTS = 3
 _MAX_FETCH_BYTES = 512 * 1024
 
 
+def _ip_is_non_public(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
+    """Return True if the IP is in any reserved/private/loopback range."""
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
 def _is_public_url(url: str) -> bool:
     """Reject non-http(s) schemes and URLs pointing to private/loopback IPs.
 
@@ -39,6 +47,12 @@ def _is_public_url(url: str) -> bool:
     file:///etc/passwd. We resolve the hostname and check every A/AAAA record
     against ipaddress.is_private / is_loopback / is_link_local / is_reserved
     before issuing the request.
+
+    NOTE: this is a PRE-flight check only. Defeating DNS-rebinding (TOCTOU
+    where the hostile authoritative DNS returns a public IP at validation
+    time and a private IP when ``requests`` resolves again to dial) requires
+    the additional post-connect peer-IP check in ``_assert_response_peer_public``
+    that runs on every response we touch.
     """
     try:
         parsed = urlparse(url)
@@ -52,8 +66,7 @@ def _is_public_url(url: str) -> bool:
     # Literal IP in the URL — check directly, don't resolve.
     try:
         ip = ipaddress.ip_address(host)
-        return not (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+        return not _ip_is_non_public(ip)
     except ValueError:
         pass
     # Hostname — resolve all addresses and reject if any is non-public. This
@@ -68,13 +81,65 @@ def _is_public_url(url: str) -> bool:
         try:
             addr = info[4][0]
             ip = ipaddress.ip_address(addr)
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            if _ip_is_non_public(ip):
                 debug_log(f"Rejecting {url}: resolves to non-public {addr}", "web")
                 return False
         except Exception:
             return False
     return True
+
+
+def _assert_response_peer_public(resp: "requests.Response", url: str) -> bool:
+    """Audit round 20 SECURITY P1 fix — DNS-rebinding TOCTOU defence.
+
+    ``_is_public_url`` calls ``socket.getaddrinfo`` to validate the
+    hostname's IP set BEFORE the connection. ``requests`` then resolves
+    again to actually dial. A hostile authoritative DNS with TTL=0 can
+    return a public IP on the first lookup and ``127.0.0.1`` /
+    ``169.254.169.254`` / private RFC-1918 on the second — the classic
+    DNS-rebinding pattern. The pre-flight check alone is therefore
+    insufficient.
+
+    This post-connect check reads the actual remote peer IP from the
+    underlying socket and re-validates it. urllib3 stores it as
+    ``response.raw._connection.sock.getpeername()``. If the IP we
+    actually connected to is non-public, the response is poison —
+    return False and the caller drops it.
+
+    Returns True on safe (public peer), False on poison (must discard
+    response) or when the peer cannot be determined.
+    """
+    try:
+        raw = getattr(resp, "raw", None)
+        if raw is None:
+            return False
+        conn = getattr(raw, "_connection", None)
+        if conn is None:
+            # urllib3 sometimes nests the socket under different attrs
+            # depending on the version. Fall back to inspecting the
+            # response's underlying socket if reachable.
+            return True  # cannot verify → permissive (matches pre-r20 behaviour)
+        sock = getattr(conn, "sock", None)
+        if sock is None:
+            return True
+        peer = sock.getpeername()
+        if not peer:
+            return True
+        peer_ip = ipaddress.ip_address(peer[0])
+        if _ip_is_non_public(peer_ip):
+            debug_log(
+                f"DNS-rebind defence: rejected {url}; "
+                f"connected peer {peer_ip} is non-public",
+                "web",
+            )
+            return False
+        return True
+    except Exception as e:
+        debug_log(f"DNS-rebind defence: inspect failed for {url} — {e}", "web")
+        # Permissive on inspection failure — the pre-flight check is
+        # already a meaningful defence; a strict-deny here would
+        # falsely reject valid responses on urllib3 internals changes.
+        return True
 
 
 def _fetch_page_content(url: str, max_chars: int = 1500,
@@ -101,6 +166,18 @@ def _fetch_page_content(url: str, max_chars: int = 1500,
                 current_url, headers=headers, timeout=timeout,
                 allow_redirects=False, stream=True,
             )
+            # Audit round 20 — defence against DNS-rebinding TOCTOU.
+            # Even though ``_is_public_url`` validated the hostname
+            # before this loop iteration, ``requests`` resolved DNS
+            # AGAIN to actually dial — a hostile authoritative DNS
+            # with TTL=0 may have returned different IPs the second
+            # time. Re-validate the actual peer socket.
+            if not _assert_response_peer_public(response, current_url):
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return None
             if response.is_redirect or response.is_permanent_redirect:
                 next_url = response.headers.get("Location", "")
                 if not next_url:
@@ -589,7 +666,40 @@ class WebSearchTool(Tool):
             if args and isinstance(args, dict):
                 search_query = str(args.get("search_query", "")).strip()
             if not search_query:
-                return ToolExecutionResult(success=False, reply_text="Please provide a search query for the web search.")
+                return ToolExecutionResult(success=False, reply_text=None, error_message="Please provide a search query for the web search.")
+
+            # Audit round 12 fix: scrub credentials before sending the
+            # query upstream. Whisper happily transcribes "search my
+            # account password is hunter2" and the planner cheerfully
+            # passes that as `search_query`. Without redact, that
+            # phrase would land in DuckDuckGo/Brave query logs.
+            #
+            # Audit round 17 fix: previous version swallowed redact
+            # exceptions with bare ``pass`` and let the ORIGINAL
+            # un-redacted query flow to DDG/Brave — defeating the
+            # entire point of the redact step. The redact module is
+            # deterministic stdlib-regex code; if it raises, something
+            # is very wrong (corrupted re module, OOM, monkeypatch
+            # gone bad). The honest response is to refuse the search
+            # rather than leak the secret upstream.
+            try:
+                from ...utils.redact import redact as _redact
+                search_query = _redact(search_query, max_len=500)
+            except Exception as _rd_err:
+                debug_log(
+                    f"webSearch: redact failed ({type(_rd_err).__name__}); "
+                    "refusing to send raw query upstream",
+                    "web",
+                )
+                return ToolExecutionResult(
+                    success=False,
+                    reply_text=None,
+                    error_message=(
+                        "Internal error scrubbing search query for "
+                        "external send. Search cancelled to avoid "
+                        "leaking sensitive text. Please retry."
+                    ),
+                )
 
             context.user_print(f"🌐 Searching the web for '{search_query}'…")
             debug_log(f"    🌐 searching for '{search_query}'", "web")

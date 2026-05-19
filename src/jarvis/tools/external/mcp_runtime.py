@@ -273,7 +273,18 @@ class _ServerWorker:
     ) -> None:
         self._loop = loop
         self._server_name = server_name
-        self.config = dict(server_cfg)
+        # Audit round 16 fix: ``dict(server_cfg)`` is a SHALLOW copy —
+        # nested dicts (``env``, ``args``) keep their original object
+        # identity. The cache-hit check at ``_workers_lock`` does
+        # ``existing.config == server_cfg`` which compares those nested
+        # dicts by IDENTITY for the inner objects. If a caller rotated
+        # a token by mutating ``cfg["mcps"][name]["env"]`` in place,
+        # the equality check returns True, the worker keeps stale
+        # credentials, and the 401 only surfaces on next subprocess
+        # restart. ``copy.deepcopy`` makes the cached snapshot
+        # immutable to outside mutations.
+        import copy as _copy
+        self.config = _copy.deepcopy(server_cfg)
         self._queue: Optional[asyncio.Queue] = None
         self._task: Optional[asyncio.Task] = None
         self._ready: concurrent.futures.Future = concurrent.futures.Future()

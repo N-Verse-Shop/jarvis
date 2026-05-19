@@ -46,7 +46,7 @@ class TestDeleteMealTool:
         
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "couldn't delete" in result.reply_text.lower()
+        assert 'could not delete' in result.error_message.lower()
     
     def test_run_invalid_id(self):
         """Test deletion with invalid ID."""

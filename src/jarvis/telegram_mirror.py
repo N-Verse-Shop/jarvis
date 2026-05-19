@@ -47,6 +47,39 @@ DEFAULT_TYPES = {
 DEFAULT_DEBOUNCE_MS = 1500
 
 
+def _scrub_token_in(message: str, token: str) -> str:
+    """Audit round 20 SECURITY P1 fix — strip a Telegram bot token
+    from any string before it lands in stderr / log files.
+
+    The Telegram Bot API embeds the token in the URL path
+    (``https://api.telegram.org/bot<TOKEN>/sendMessage``). When
+    ``urllib`` raises (DNS failure, TLS error, HTTPError 5xx), it
+    stringifies as ``URLError: <urlopen error ... for
+    https://api.telegram.org/bot123:abc/sendMessage>`` — embedding
+    the secret verbatim. Previously we wrote that whole string to
+    stderr, which launchd captures into a long-lived log file.
+    Any single hiccup → permanent token leak.
+
+    This scrubber:
+      * Replaces the literal token bytes with ``[REDACTED_TG_TOKEN]``
+        (catches the case where the exception captured the URL we
+        constructed).
+      * Replaces the regex pattern ``/bot<digits>:<alnum-_>+/`` with
+        ``/bot[REDACTED]/`` (defence-in-depth — catches a future
+        urllib stringification format we didn't anticipate, AND
+        catches any unrelated token-shaped substring).
+    """
+    if not message:
+        return message
+    safe = message.replace(token, "[REDACTED_TG_TOKEN]") if token else message
+    try:
+        import re as _re
+        safe = _re.sub(r"/bot\d+:[A-Za-z0-9_-]+", "/bot[REDACTED]", safe)
+    except Exception:
+        pass
+    return safe
+
+
 def _send_telegram(token: str, chat_id: str, text: str,
                    parse_mode: str = "HTML") -> bool:
     """Synchronous Telegram sendMessage. Returns True on 200."""
@@ -64,7 +97,12 @@ def _send_telegram(token: str, chat_id: str, text: str,
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status == 200
     except Exception as e:
-        print(f"# telegram send failed: {e}", file=sys.stderr, flush=True)
+        # Audit round 20: scrub the token before logging. urllib's
+        # default exception stringification embeds the FULL URL —
+        # including ``/bot<TOKEN>/`` — so the raw ``{e}`` form used
+        # to leak the secret on every transient network blip.
+        scrubbed = _scrub_token_in(f"{type(e).__name__}: {e}", token)
+        print(f"# telegram send failed: {scrubbed}", file=sys.stderr, flush=True)
         return False
 
 

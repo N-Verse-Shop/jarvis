@@ -13,10 +13,27 @@ def _make_response_mock(**attrs) -> Mock:
     """Build a Mock that doubles as both the requests response and a context
     manager (the production code uses ``with requests.get(...) as resp`` so
     the connection is released deterministically).
+
+    Round 17: production code now uses ``stream=True`` + ``iter_content``
+    to enforce a byte cap on the response body. Wire up sensible
+    defaults so existing tests that supply ``content=`` still work:
+    - ``iter_content`` yields the entire ``content`` in one chunk.
+    - ``encoding`` / ``apparent_encoding`` default to utf-8 so the
+      decode path succeeds.
+    - ``headers`` defaults to an empty dict so ``Content-Length`` lookup
+      is a clean None.
     """
     resp = Mock(**attrs)
     resp.__enter__ = Mock(return_value=resp)
     resp.__exit__ = Mock(return_value=False)
+    if not isinstance(getattr(resp, "headers", None), dict):
+        resp.headers = attrs.get("headers", {}) or {}
+    body = attrs.get("content", b"")
+    if not isinstance(body, (bytes, bytearray)):
+        body = b""
+    resp.iter_content = Mock(return_value=iter([body])) if body else Mock(return_value=iter([]))
+    resp.encoding = attrs.get("encoding", "utf-8")
+    resp.apparent_encoding = attrs.get("apparent_encoding", "utf-8")
     return resp
 
 
@@ -42,7 +59,7 @@ class TestFetchWebPageTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "url" in result.reply_text.lower()
+        assert "url" in result.error_message.lower()
 
     def test_run_empty_url(self):
         """Test fetch web page with empty URL."""
@@ -51,7 +68,7 @@ class TestFetchWebPageTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "url" in result.reply_text.lower()
+        assert "url" in result.error_message.lower()
 
     @patch('requests.get')
     def test_run_success(self, mock_get):
@@ -105,7 +122,7 @@ class TestFetchWebPageTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "Failed to fetch page" in result.reply_text
+        assert "Failed to fetch page" in result.error_message
 
     @patch('requests.get')
     def test_run_request_error(self, mock_get):
@@ -117,7 +134,7 @@ class TestFetchWebPageTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "Failed to fetch page" in result.reply_text
+        assert "Failed to fetch page" in result.error_message
 
     def test_run_invalid_url(self):
         """Test fetch web page with invalid URL."""
@@ -125,7 +142,12 @@ class TestFetchWebPageTool:
         result = self.tool.run(args, self.context)
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "failed" in result.reply_text.lower() or "error" in result.reply_text.lower()
+        # Round 15: types.py __post_init__ migrates failure messages
+        # from reply_text into error_message. The SSRF guard rejects
+        # "not-a-url" before any HTTP attempt with a "blocked" message
+        # — verify any of the three semantically equivalent phrasings.
+        lowered = (result.error_message or "").lower()
+        assert any(kw in lowered for kw in ("failed", "error", "blocked", "invalid"))
 
     @patch('requests.get')
     def test_run_with_links_extraction(self, mock_get):

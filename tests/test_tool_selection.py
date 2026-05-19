@@ -10,7 +10,20 @@ from jarvis.tools.selection import (
     _build_tool_keywords,
     _ALWAYS_INCLUDED,
     _RELATIVE_THRESHOLD,
+    _clear_tool_embedding_cache,
 )
+
+
+# Round 18 fix: the tool-embedding cache lives at module scope and
+# persists across tests within a single pytest process. Clear it
+# before every test so each one starts from a clean state and the
+# mock embed functions are exercised on every call instead of being
+# served from a prior test's stored vectors.
+@pytest.fixture(autouse=True)
+def _reset_tool_embedding_cache():
+    _clear_tool_embedding_cache()
+    yield
+    _clear_tool_embedding_cache()
 
 
 # ---------------------------------------------------------------------------

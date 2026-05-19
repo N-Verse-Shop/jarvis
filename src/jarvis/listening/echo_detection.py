@@ -1,6 +1,7 @@
 """Echo detection and suppression logic for preventing TTS feedback."""
 
 import time
+import threading
 from typing import Optional, List
 import re
 
@@ -9,19 +10,35 @@ from ..debug import debug_log
 from rapidfuzz import fuzz
 
 
+# How long after TTS finish we keep `_last_tts_text` available for echo
+# comparisons. Slightly past the extended delayed-echo window (3.0s in
+# `detect_echo`) so the gated checks inside this file still have data
+# during their window, but listener.py callers that read `_last_tts_text`
+# directly (without consulting `_last_tts_finish_time`) don't false-match
+# minutes-old TTS in persistent hot-window mode.
+_STALE_TTS_TEXT_CLEAR_SECS: float = 3.5
+
+
 class EchoDetector:
     """Handles echo detection to prevent TTS feedback loops."""
     
-    def __init__(self, echo_tolerance: float = 0.3, energy_spike_threshold: float = 2.0):
+    def __init__(self, echo_tolerance: float = 0.3, energy_spike_threshold: float = 2.0,
+                 hot_window_persistent: bool = False):
         """
         Initialize echo detector.
-        
+
         Args:
             echo_tolerance: Time window after TTS for echo detection (seconds)
             energy_spike_threshold: Energy multiplier to distinguish real input from echo
+            hot_window_persistent: If True, DO NOT stale-clear `_last_tts_text`
+                3.5s after TTS finishes. In persistent mode the hot window
+                stays open indefinitely, and stale-clearing the echo reference
+                creates a giant blind spot where ambient TV/family speech 4+s
+                after TTS bypasses all echo detection. Audit round 6 fix.
         """
         self.echo_tolerance = echo_tolerance
         self.energy_spike_threshold = energy_spike_threshold
+        self.hot_window_persistent = hot_window_persistent
         
         # TTS tracking
         self._tts_start_time: float = 0.0
@@ -41,7 +58,116 @@ class EchoDetector:
         # Utterance timing
         self._utterance_start_time: float = 0.0
         self._utterance_end_time: float = 0.0
-    
+
+        # Stale-TTS-text auto-clear (see _STALE_TTS_TEXT_CLEAR_SECS).
+        self._stale_clear_timer: Optional[threading.Timer] = None
+        self._stale_clear_lock = threading.Lock()
+
+        # Audit round 12 fix H2: TTS-state trio (`_tts_start_time`,
+        # `_last_tts_text`, `_tts_exact_duration`) was mutated by the
+        # TTS thread in `track_tts_start` and read by the audio thread
+        # in `_matches_tts_segment` / `cleanup_leading_echo_during_tts`
+        # without a lock. A new TTS firing mid-check could let the
+        # reader compute `words_per_sec` using the NEW duration but
+        # the OLD text — wrong drift window, echo not rejected, intent
+        # judge then sees the echo as a fresh utterance. Snapshot the
+        # trio atomically.
+        self._tts_state_lock = threading.Lock()
+
+    def _cancel_stale_clear(self) -> None:
+        """Cancel any pending stale-TTS-text clear timer."""
+        with self._stale_clear_lock:
+            if self._stale_clear_timer is not None:
+                self._stale_clear_timer.cancel()
+                self._stale_clear_timer = None
+
+    def snapshot_tts_state(self) -> tuple[float, str, Optional[float]]:
+        """Atomically snapshot the (start_time, last_text, exact_duration)
+        trio under the TTS-state lock.
+
+        Audit round 12 fix H2: readers that compute words-per-sec or
+        drift windows MUST take all three from the same TTS so they
+        don't end up combining the NEW duration with the OLD text.
+        """
+        with self._tts_state_lock:
+            return (self._tts_start_time, self._last_tts_text, self._tts_exact_duration)
+
+    def snapshot_tts_window(self) -> tuple[float, float, str, Optional[float]]:
+        """Atomically snapshot the full TTS-state quadruple including
+        ``_last_tts_finish_time``: ``(start_time, finish_time, last_text,
+        exact_duration)``.
+
+        Audit round 14 fix C3: listener.py callers that consult both
+        the start_time and finish_time of the last TTS (to decide if an
+        utterance overlapped a TTS window) MUST read both under the
+        same lock so a track_tts_finish() racing with the reader can't
+        leave finish_time stale with the new start_time.
+        """
+        with self._tts_state_lock:
+            return (
+                self._tts_start_time,
+                self._last_tts_finish_time,
+                self._last_tts_text,
+                self._tts_exact_duration,
+            )
+
+    def clear_last_tts_text(self) -> None:
+        """Clear ``_last_tts_text`` under the TTS-state lock.
+
+        Audit round 14 fix C3: wake-interrupt and HUD-interrupt paths
+        in listener.py used to mutate ``_last_tts_text = ""`` directly.
+        That bypasses ``_tts_state_lock`` and races with a TTS thread
+        that's mid-update in ``track_tts_start``.
+        """
+        with self._tts_state_lock:
+            self._last_tts_text = ""
+
+    def set_tts_exact_duration(self, duration: float) -> None:
+        """Update ``_tts_exact_duration`` under the TTS-state lock.
+
+        Audit round 14 fix C3: the Piper duration callback in
+        listener.py used to write ``_tts_exact_duration`` directly,
+        racing with ``_matches_tts_segment`` readers.
+        """
+        with self._tts_state_lock:
+            self._tts_exact_duration = duration
+
+    def close(self) -> None:
+        """Tear down — cancel any pending timer.
+
+        Audit round 12 fix M3: without this, an EchoDetector that
+        gets replaced (config reload, in-process restart) leaves its
+        stale-clear timer running with a reference to the dead
+        instance for up to ~3.5s. Harmless functionally but a real
+        ref-leak that blocks GC.
+        """
+        self._cancel_stale_clear()
+
+    def _do_stale_clear(self) -> None:
+        """Timer callback — wipe stale `_last_tts_text` if no new TTS
+        started in the meantime (track_tts_start would have cancelled).
+
+        Round 29 (F76): mutation of `_last_tts_text` MUST hold
+        `_tts_state_lock`. The audio thread's `_matches_tts_segment`
+        path takes a coherent snapshot of (start_time, last_text,
+        baseline, duration) via `snapshot_tts_state()` which acquires
+        this same lock; an unlocked write here used to race the
+        snapshot — the reader could observe `last_text=""` after the
+        12s post-TTS echo window F35 was supposed to cover, letting a
+        late TTS echo slip through as a "fresh utterance" and loop.
+        """
+        with self._stale_clear_lock:
+            self._stale_clear_timer = None
+        # Hold _tts_state_lock before observing/mutating shared state.
+        with self._tts_state_lock:
+            if self._last_tts_text:
+                cleared = self._last_tts_text[:40]
+                self._last_tts_text = ""
+                debug_log(
+                    f"cleared stale _last_tts_text after {_STALE_TTS_TEXT_CLEAR_SECS}s: '{cleared}…'",
+                    "echo",
+                )
+
     def track_tts_start(self, tts_text: str, baseline_energy: float = 0.0045,
                         exact_duration: Optional[float] = None) -> None:
         """
@@ -52,18 +178,55 @@ class EchoDetector:
             baseline_energy: Current audio energy baseline
             exact_duration: Exact audio duration in seconds (from Piper synthesis)
         """
-        self._tts_start_time = time.time()
-        self._last_tts_text = tts_text.lower().strip()
-        self._tts_energy_baseline = baseline_energy
-        self._tts_exact_duration = exact_duration
+        # New TTS starting → cancel any pending stale-clear from a prior
+        # finish, since this fresh text is the new echo baseline.
+        self._cancel_stale_clear()
+        # Atomic mutation of the trio used by `_matches_tts_segment`
+        # (round 12 fix H2).
+        with self._tts_state_lock:
+            self._tts_start_time = time.time()
+            self._last_tts_text = tts_text.lower().strip()
+            self._tts_energy_baseline = baseline_energy
+            self._tts_exact_duration = exact_duration
 
         duration_info = f", exact_duration={exact_duration:.2f}s" if exact_duration else ""
         debug_log(f"TTS started, text_len={len(tts_text)}, baseline_energy={baseline_energy:.4f}{duration_info}", "echo")
-    
+
     def track_tts_finish(self) -> None:
-        """Track when TTS finishes speaking."""
-        self._last_tts_finish_time = time.time()
-        debug_log("TTS finished", "echo")
+        """Track when TTS finishes speaking.
+
+        In WAKE-WORD mode: schedules an automatic clear of `_last_tts_text`
+        past the extended delayed-echo window. If a new TTS starts before
+        the timer fires, `track_tts_start` cancels it and overwrites
+        instead.
+
+        In PERSISTENT HOT-WINDOW mode: SKIPS the stale-clear entirely.
+        The hot window stays open across the user's whole session, so
+        ambient speech that arrives 4+s after TTS still needs the echo
+        reference to be matched against. Pre-audit-round-6 we cleared
+        unconditionally → TV speech at T+5s bypassed echo detection
+        entirely → intent judge had to do the whole job alone and
+        occasionally said directed=true on a phrase like "какие дворцы"
+        because there was no echo signal to override it.
+        """
+        # Audit round 14 fix C3: ``_last_tts_finish_time`` is now part
+        # of the lock-protected TTS-state quadruple (see
+        # ``snapshot_tts_window``); writers must take the lock too.
+        with self._tts_state_lock:
+            self._last_tts_finish_time = time.time()
+        # Always cancel any pending clear so a NEW TTS starts with a
+        # fresh reference. The clear-scheduling below is what's gated.
+        self._cancel_stale_clear()
+        if self.hot_window_persistent:
+            debug_log("TTS finished (persistent mode — stale-clear SKIPPED)", "echo")
+            return
+        with self._stale_clear_lock:
+            self._stale_clear_timer = threading.Timer(
+                _STALE_TTS_TEXT_CLEAR_SECS, self._do_stale_clear
+            )
+            self._stale_clear_timer.daemon = True
+            self._stale_clear_timer.start()
+        debug_log(f"TTS finished (stale-clear scheduled in {_STALE_TTS_TEXT_CLEAR_SECS}s)", "echo")
     
     def track_utterance_timing(self, start_time: float, end_time: float) -> None:
         """
@@ -145,22 +308,29 @@ class EchoDetector:
         - System TTS buffering delays
         - Audio processing latency
         """
-        if not (self._tts_start_time > 0 and utterance_start_time > 0):
+        # Audit round 13 fix: snapshot the TTS-state trio atomically so a
+        # new TTS firing mid-check can't mix the OLD text with the NEW
+        # duration (round 12 added the lock + snapshot helper but the
+        # readers were never refactored — the race fix was inert).
+        tts_start_time, last_tts_text, tts_exact_duration = self.snapshot_tts_state()
+        if not (tts_start_time > 0 and utterance_start_time > 0):
             return False
 
-        time_offset = utterance_start_time - self._tts_start_time
+        time_offset = utterance_start_time - tts_start_time
         time_offset_with_tolerance = max(0, time_offset - self.echo_tolerance)
 
-        tts_words = self._last_tts_text.split()
+        tts_words = last_tts_text.split()
 
         if not tts_words:
             return False
 
-        # Use exact duration from Piper if available, otherwise estimate from WPM
-        if self._tts_exact_duration and self._tts_exact_duration > 0:
-            words_per_sec = len(tts_words) / self._tts_exact_duration
+        # Use exact duration from Piper if available, otherwise estimate from WPM.
+        # tts_rate can be None (Piper engine doesn't expose WPM) — fall back to
+        # 200 WPM to keep the division safe and produce a reasonable estimate.
+        if tts_exact_duration and tts_exact_duration > 0:
+            words_per_sec = len(tts_words) / tts_exact_duration
         else:
-            words_per_sec = tts_rate / 60.0
+            words_per_sec = (tts_rate or 200) / 60.0
 
         estimated_word_index = int(time_offset_with_tolerance * words_per_sec)
 
@@ -210,10 +380,13 @@ class EchoDetector:
         1. First try a timing-based segment (fast, handles typical cases)
         2. If that fails, search the full TTS text (handles timing mismatches)
         """
-        if not heard_text or not self._last_tts_text or not (self._tts_start_time > 0 and utterance_start_time > 0):
+        # Audit round 13 fix: snapshot the TTS-state trio atomically (see
+        # `_matches_tts_segment` above for the rationale).
+        tts_start_time, last_tts_text, tts_exact_duration = self.snapshot_tts_state()
+        if not heard_text or not last_tts_text or not (tts_start_time > 0 and utterance_start_time > 0):
             return heard_text
 
-        tts_words = self._last_tts_text.lower().strip().split()
+        tts_words = last_tts_text.lower().strip().split()
         heard_words = heard_text.lower().strip().split()
 
         if not tts_words or not heard_words:
@@ -229,13 +402,15 @@ class EchoDetector:
         heard_clean = [_clean_token(w) for w in heard_words]
 
         # Phase 1: Try timing-based segment first (faster for typical cases)
-        time_offset = utterance_start_time - self._tts_start_time
+        time_offset = utterance_start_time - tts_start_time
         time_offset_with_tolerance = max(0, time_offset - self.echo_tolerance)
-        # Use exact duration from Piper if available, otherwise estimate from WPM
-        if self._tts_exact_duration and self._tts_exact_duration > 0:
-            words_per_sec = len(tts_words) / self._tts_exact_duration
+        # Use exact duration from Piper if available, otherwise estimate from WPM.
+        # tts_rate can be None (Piper engine doesn't expose WPM) — fall back to
+        # 200 WPM to keep the division safe and produce a reasonable estimate.
+        if tts_exact_duration and tts_exact_duration > 0:
+            words_per_sec = len(tts_words) / tts_exact_duration
         else:
-            words_per_sec = tts_rate / 60.0
+            words_per_sec = (tts_rate or 200) / 60.0
         estimated_word_index = int(time_offset_with_tolerance * words_per_sec)
         tolerance_words = round(self.echo_tolerance * words_per_sec) + 5
         start_idx = max(0, estimated_word_index - tolerance_words)
@@ -556,10 +731,38 @@ class EchoDetector:
                 else:
                     debug_log(f"accepted in cooldown (high energy or no text match): '{heard_text}'", "voice")
 
-            # Extended Delayed-Echo Window (e.g., < 1.5s)
-            elif self.echo_tolerance <= time_since_finish < 1.5:
+            # Extended Delayed-Echo Window.
+            # History: 1.5s (round 16) → 3.0s (round 17) → 12.0s
+            # (round 22 fix F35).
+            #
+            # Round 22 evidence from events.jsonl:
+            #   ts=66918 SPEAKING→IDLE (TTS sentence "Что нужно, Данило?"
+            #            finished playing through speakers)
+            #   ts=66929 stt_final: "жайрис, что нужно, данил?"
+            # Δ = 31 seconds. Whisper's 30s sliding window buffered
+            # the speaker→room→mic echo long after TTS officially
+            # ended. The 3.0s cap let it through → LLM responded to
+            # its own echo → "бред" feedback loop.
+            #
+            # Bumping to 12.0s covers:
+            #   * Mac speaker buffer + driver latency (~30ms)
+            #   * Room reverb tail (200-600ms)
+            #   * Whisper 30s sliding window pulling stale audio
+            #     back into a fresh decode pass (the dominant factor —
+            #     up to ~10s observed empirically)
+            #
+            # Inside this extended window we keep the stricter
+            # partial_ratio>=similarity_threshold gate (default 92 in
+            # hot window). This protects against the failure mode of
+            # rejecting a legitimate user follow-up that happens to
+            # contain a TTS-related word.
+            elif self.echo_tolerance <= time_since_finish < 12.0:
                 if text_matches_full_tts:
-                    debug_log(f"rejected as delayed echo in extended window (text match): '{heard_text}'", "echo")
+                    debug_log(
+                        f"rejected as delayed echo in extended window "
+                        f"(text match, Δ={time_since_finish:.1f}s): '{heard_text}'",
+                        "echo",
+                    )
                     return True
 
         # --- Default Case ---

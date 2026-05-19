@@ -95,7 +95,9 @@ _RULES: dict[str, _LangRule] = {
     # forms. Clause-length threshold is lowered to CJK_MIN_CLAUSE_CHARS
     # because each Han character carries word-level meaning.
     "zh": _LangRule(
-        re.compile(r"以及|并且|以及|和|与"),
+        # Audit round 10 fix: deduplicated '以及' was listed twice
+        # (harmless to matching but signaled an unreviewed edit).
+        re.compile(r"以及|并且|和|与"),
         min_clause_chars=CJK_MIN_CLAUSE_CHARS,
     ),
     # Japanese: そして / および / また are freestanding sentence-level

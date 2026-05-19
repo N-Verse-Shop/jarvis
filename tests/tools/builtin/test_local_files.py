@@ -34,7 +34,7 @@ class TestLocalFilesTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "requires a JSON object" in result.reply_text
+        assert "requires a JSON object" in result.error_message
 
     def test_run_missing_operation(self):
         """Test local files with missing operation."""
@@ -43,7 +43,7 @@ class TestLocalFilesTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "requires 'operation'" in result.reply_text
+        assert "requires 'operation'" in result.error_message
 
     def test_run_missing_path(self):
         """Test local files with missing path."""
@@ -52,7 +52,7 @@ class TestLocalFilesTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "requires 'operation' and 'path'" in result.reply_text
+        assert "requires 'operation' and 'path'" in result.error_message
 
     @patch('pathlib.Path.exists')
     @patch('pathlib.Path.is_file')
@@ -80,7 +80,7 @@ class TestLocalFilesTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "not found" in result.reply_text.lower()
+        assert "not found" in result.error_message.lower()
 
     @patch('pathlib.Path.write_text')
     @patch('pathlib.Path.mkdir')
@@ -100,7 +100,9 @@ class TestLocalFilesTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "requires string 'content'" in result.reply_text
+        # Round 15: types.py __post_init__ migration moves failure text
+        # from reply_text into error_message.
+        assert "requires string 'content'" in result.error_message
 
     def test_run_unsafe_path(self):
         """Test with path outside home directory."""
@@ -109,7 +111,7 @@ class TestLocalFilesTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "not allowed" in result.reply_text.lower()
+        assert "not allowed" in result.error_message.lower()
 
     def test_run_unknown_operation(self):
         """Test with unknown operation."""
@@ -118,4 +120,4 @@ class TestLocalFilesTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "Unknown localFiles operation" in result.reply_text
+        assert "Unknown localFiles operation" in result.error_message

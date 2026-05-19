@@ -75,7 +75,14 @@ class TestStopCommand:
         assert is_stop_command("stop", ["stop", "quiet"]) is True
 
     def test_stop_command_in_phrase(self):
-        assert is_stop_command("please stop talking", ["stop", "quiet"]) is True
+        # Round 18 fix: a multi-word transcript with "stop" embedded is
+        # NOT a stop command — it's a query ABOUT stopping. The previous
+        # contract intercepted "please stop talking" as a stop command
+        # and dropped it before the wake handler could route it, also
+        # broke "Jarvis stop the kitchen timer" and similar queries.
+        # Standalone-only match preserves the genuine "stop" cases
+        # while letting the embedded-keyword queries reach the LLM.
+        assert is_stop_command("please stop talking", ["stop", "quiet"]) is False
 
     def test_no_stop_command(self):
         assert is_stop_command("what is the weather", ["stop", "quiet"]) is False

@@ -5,7 +5,6 @@ import sys
 import re
 import requests
 import threading
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import os
 
@@ -20,13 +19,17 @@ from .builtin.refresh_mcp_tools import RefreshMCPToolsTool
 from .builtin.weather import WeatherTool
 from .builtin.stop import StopTool
 from .builtin.tool_search import ToolSearchTool
+from .builtin.mac_control import MacControlTool
 from .types import ToolExecutionResult
 from ..config import Settings
 from .external.mcp_client import MCPClient
 from ..debug import debug_log
 
 
-# Registry of all builtin tools
+# Registry of all builtin tools.
+# Audit round 20 P3 — ``macControl`` added so the agent has first-class
+# window-mgmt + native-app automation (Notes / Reminders / Finder /
+# focus/list apps / open URL with strict scheme allowlist).
 BUILTIN_TOOLS = {
     "screenshot": ScreenshotTool(),
     "webSearch": WebSearchTool(),
@@ -39,6 +42,7 @@ BUILTIN_TOOLS = {
     "getWeather": WeatherTool(),
     "stop": StopTool(),
     "toolSearchTool": ToolSearchTool(),
+    "macControl": MacControlTool(),
 }
 
 # Global MCP tools cache
@@ -67,7 +71,12 @@ def initialize_mcp_tools(mcps_config: Dict[str, Any], verbose: bool = True) -> T
         if verbose and _mcp_tools_cache:
             debug_log(f"MCP tools cache initialized with {len(_mcp_tools_cache)} tools", "mcp")
 
-        return _mcp_tools_cache.copy(), errors
+    # Audit round 21 (F11): MCP cache changed — bust the
+    # description / schema caches so the next call recomputes with
+    # the new tool set. Outside ``_mcp_tools_cache_lock`` so the
+    # description cache's own lock isn't nested under it.
+    _bump_tools_generation()
+    return _mcp_tools_cache.copy(), errors
 
 
 def get_cached_mcp_tools() -> Dict[str, "ToolSpec"]:
@@ -99,7 +108,10 @@ def refresh_mcp_tools(verbose: bool = True) -> Tuple[Dict[str, "ToolSpec"], Dict
             print(f"  ✅ Found {len(_mcp_tools_cache)} MCP tools", flush=True)
 
         debug_log(f"MCP tools cache refreshed with {len(_mcp_tools_cache)} tools", "mcp")
-        return _mcp_tools_cache.copy(), errors
+    # Audit round 21 (F11): same generation-bump as
+    # ``initialize_mcp_tools``. Outside the lock.
+    _bump_tools_generation()
+    return _mcp_tools_cache.copy(), errors
 
 
 def is_mcp_cache_initialized() -> bool:
@@ -168,6 +180,55 @@ def discover_mcp_tools(mcps_config: Dict[str, Any]) -> Tuple[Dict[str, ToolSpec]
         return {}, {"_global": str(e)}
 
 
+# Audit round 21 fix (F11) — cache the tool-description and tool-
+# JSON-schema outputs across replies. The two functions are called
+# at least twice per voice turn (engine init + every tool_search
+# widening). Without a cache, every turn paid the cost of:
+#   • iterating BUILTIN_TOOLS (~12 tools, each a property access on
+#     name/description/inputSchema — descriptors that may allocate).
+#   • iterating mcp_tools (often 20-30 tools at ~200 char descs).
+#   • building ~6 KB of strings.
+# The output is a pure function of (sorted-allowed-tool-set,
+# mcp_tools_generation). Cache the result keyed on that. Bust the
+# cache when ``initialize_mcp_tools``/``refresh_mcp_tools`` updates
+# ``_mcp_tools_cache`` — see ``_bump_tools_generation`` below.
+_TOOLS_RESULT_CACHE: Dict[Tuple[Any, ...], Any] = {}
+_TOOLS_RESULT_CACHE_LOCK = threading.Lock()
+_TOOLS_CACHE_GENERATION: int = 0
+
+
+def _bump_tools_generation() -> None:
+    """Invalidate the description / schema caches.
+
+    Call from any path that mutates the available tool set
+    (``initialize_mcp_tools``, ``refresh_mcp_tools``, builtin
+    registration changes). Cheap — flips a counter; the cache lookup
+    keys on that counter so the next call recomputes."""
+    global _TOOLS_CACHE_GENERATION
+    with _TOOLS_RESULT_CACHE_LOCK:
+        _TOOLS_CACHE_GENERATION += 1
+        _TOOLS_RESULT_CACHE.clear()
+
+
+def _tools_cache_key(
+    allowed_tools: Optional[List[str]],
+    mcp_tools: Optional[Dict[str, "ToolSpec"]],
+    kind: str,
+) -> Tuple[Any, ...]:
+    """Build a hashable cache key from the inputs.
+
+    ``allowed_tools=None`` is treated as "all built-ins + all
+    mcp_tools" — collapse to a sentinel so repeated calls with
+    ``None`` share the same key.
+    """
+    if allowed_tools is None:
+        allowed_key: Any = None
+    else:
+        allowed_key = tuple(sorted(allowed_tools))
+    mcp_key = id(mcp_tools) if mcp_tools else 0
+    return (kind, allowed_key, mcp_key, _TOOLS_CACHE_GENERATION)
+
+
 def generate_tools_json_schema(allowed_tools: Optional[List[str]] = None, mcp_tools: Optional[Dict[str, ToolSpec]] = None) -> List[Dict[str, Any]]:
     """
     Generate tools in OpenAI-compatible JSON schema format for native tool calling.
@@ -190,7 +251,20 @@ def generate_tools_json_schema(allowed_tools: Optional[List[str]] = None, mcp_to
             }
         }
     ]
+
+    Audit round 21 (F11): memoised keyed on (allowed_tools-set,
+    mcp_tools-id, generation). Result is deep-copied on hit so a
+    caller mutating the returned list doesn't poison the cache.
     """
+    cache_key = _tools_cache_key(allowed_tools, mcp_tools, "schema")
+    with _TOOLS_RESULT_CACHE_LOCK:
+        cached = _TOOLS_RESULT_CACHE.get(cache_key)
+    if cached is not None:
+        # Deep-ish copy — the function dict structure is small;
+        # ``json.loads(json.dumps(...))`` would be cleanest but is
+        # 5x slower than a list comprehension of dict copies on
+        # this shape.
+        return [dict(t, function=dict(t["function"])) for t in cached]
     names = list(allowed_tools or list(BUILTIN_TOOLS.keys()))
     tools: List[Dict[str, Any]] = []
 
@@ -224,11 +298,23 @@ def generate_tools_json_schema(allowed_tools: Optional[List[str]] = None, mcp_to
                 }
                 tools.append(tool_def)
 
-    return tools
+    with _TOOLS_RESULT_CACHE_LOCK:
+        _TOOLS_RESULT_CACHE[cache_key] = tools
+    # Caller may mutate the returned list — give them a copy.
+    return [dict(t, function=dict(t["function"])) for t in tools]
 
 
 def generate_tools_description(allowed_tools: Optional[List[str]] = None, mcp_tools: Optional[Dict[str, ToolSpec]] = None) -> str:
-    """Produce a compact tool help string for the system prompt using OpenAI standard format."""
+    """Produce a compact tool help string for the system prompt using OpenAI standard format.
+
+    Audit round 21 (F11): memoised — same key shape as
+    ``generate_tools_json_schema``. Save ~5-20 ms per turn.
+    """
+    cache_key = _tools_cache_key(allowed_tools, mcp_tools, "desc")
+    with _TOOLS_RESULT_CACHE_LOCK:
+        cached = _TOOLS_RESULT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     names = list(allowed_tools or list(BUILTIN_TOOLS.keys()))
     lines: List[str] = []
     lines.append("Tool-use protocol: Use the tool_calls field in your response:")
@@ -272,36 +358,16 @@ def generate_tools_description(allowed_tools: Optional[List[str]] = None, mcp_to
                     if param_descriptions:
                         lines.append(f"Input: {', '.join(param_descriptions)}")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    with _TOOLS_RESULT_CACHE_LOCK:
+        _TOOLS_RESULT_CACHE[cache_key] = result
+    return result
 
-def _normalize_time_range(args: Optional[Dict[str, Any]]) -> Tuple[str, str]:
-    now = datetime.now(timezone.utc)
-    since: Optional[str] = None
-    until: Optional[str] = None
-    if args and isinstance(args, dict):
-        try:
-            since_val = args.get("since_utc")
-            since = str(since_val) if since_val else None
-        except Exception:
-            since = None
-        try:
-            until_val = args.get("until_utc")
-            until = str(until_val) if until_val else None
-        except Exception:
-            until = None
-    if since is None and until is None:
-        # Default last 24h
-        return (now - timedelta(days=1)).isoformat(), now.isoformat()
-    if since is None and until is not None:
-        # backfill 24h prior to until
-        try:
-            until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
-        except Exception:
-            until_dt = now
-        return (until_dt - timedelta(days=1)).isoformat(), until_dt.isoformat()
-    if since is not None and until is None:
-        return since, now.isoformat()
-    return since or (now - timedelta(days=1)).isoformat(), until or now.isoformat()
+# Audit round 11 fix M1: previously a duplicate ``_normalize_time_range``
+# lived here AND in nutrition/fetch_meals.py. Only the nutrition copy
+# was used; the registry copy was dead code that future maintainers
+# would have copy-pasted out of sync. Removed; if any other tool needs
+# the helper, import it from ``nutrition/fetch_meals.py``.
 
 
 def run_tool_with_retries(
@@ -314,15 +380,61 @@ def run_tool_with_retries(
     redacted_text: str,
     max_retries: int = 1,
     language: Optional[str] = None,
+    allowed_tools: Optional[List[str]] = None,
 ) -> ToolExecutionResult:
+    """Dispatch a tool call. Audit round 11 fix C1: enforce the active
+    allow-list AT THE REGISTRY LAYER, not just at the engine call sites.
+
+    The engine guards both dispatch sites today, but the registry is the
+    real security boundary — any future caller (a CLI test harness, the
+    currently-unwired evaluator, an experimental agent path) would
+    silently get full-catalog access. ``allowed_tools=None`` preserves
+    the prior behaviour (no enforcement) for callers that haven't yet
+    been updated; engine.py passes the live allow-list explicitly.
+    """
     # Normalize tool name to canonical camelCase
     raw_name = (tool_name or "").strip()
     name = raw_name
 
-    # Check if tool name is a discovered MCP tool (server__toolname format)
-    if "__" in raw_name:
+    # Allow-list enforcement happens before any dispatch path so MCP
+    # tools, builtins, and the unknown-tool tail share one gate.
+    if allowed_tools is not None and name not in allowed_tools:
+        debug_log(f"registry: rejected non-allowed tool: {name!r} (allow-list size={len(allowed_tools)})", "tools")
+        return ToolExecutionResult(
+            success=False,
+            reply_text=None,
+            error_message=f"Tool '{name}' is not in the active allow-list.",
+        )
+
+    # Audit round 16 fix: builtin tools ALWAYS win over MCP-discovered
+    # tools, regardless of name shape. Previously a malicious MCP
+    # server could register a tool called ``screenshot__steal`` or
+    # even reuse a builtin name with a double-underscore suffix
+    # (``web__Search``); the ``"__" in raw_name`` branch fired before
+    # the builtin check ran, so the MCP got the dispatch.
+    if name in BUILTIN_TOOLS:
+        # Fall through to the BUILTIN dispatch below.
+        pass
+    elif "__" in raw_name:
+        # Check if tool name is a discovered MCP tool (server__toolname format)
         server_name, mcp_tool_name = raw_name.split("__", 1)
         mcps_config = getattr(cfg, "mcps", {})
+        # Extra guard (defence in depth): even after the builtin
+        # check above, refuse to dispatch via MCP if the server_name
+        # half collides with a builtin name. This catches the
+        # degenerate case where the engine's name-normalisation drops
+        # the suffix before lookup.
+        if server_name in BUILTIN_TOOLS:
+            debug_log(
+                f"registry: refusing MCP dispatch — server_name {server_name!r} "
+                f"shadows a builtin tool",
+                "tools",
+            )
+            return ToolExecutionResult(
+                success=False,
+                reply_text=None,
+                error_message=f"Refused: MCP server name '{server_name}' collides with a builtin tool.",
+            )
         if mcps_config and server_name in mcps_config:
             try:
                 if MCPClient is None:

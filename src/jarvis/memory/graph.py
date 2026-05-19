@@ -256,12 +256,48 @@ class GraphMemoryStore:
         self._lock = threading.RLock()
         self._init_schema()
         self._ensure_root()
+        # Audit round 14 fix: restrict the on-disk file to the owner.
+        # The graph holds the assistant's persistent memory (facts about
+        # the user, directives, world knowledge) — group/other read is
+        # never appropriate. Best-effort: ignore failures on FSes that
+        # don't support POSIX modes.
+        try:
+            import os as _os
+            _os.chmod(db_path, 0o600)
+        except Exception:
+            pass
 
     # ── Schema & bootstrap ──────────────────────────────────────────────
 
     def _init_schema(self) -> None:
         with self._lock:
             self.conn.execute("PRAGMA foreign_keys = ON")
+            # Audit round 14 fix: without a busy_timeout, two writers
+            # racing on the same SQLite file get SQLITE_BUSY (the diary
+            # flush worker and the foreground graph write happen at the
+            # same time during a voice turn). Set 5 s — well above any
+            # realistic single-write duration but short enough that a
+            # truly hung writer surfaces instead of stalling forever.
+            self.conn.execute("PRAGMA busy_timeout = 5000")
+            # Audit round 20 fix (P1): switch to WAL journal mode so
+            # readers never block on a writer. Without WAL, every
+            # mutation (touch_node, append_to_node, bulk_split_node)
+            # held a global lock that even foreground SELECTs
+            # (search_nodes, find_node_by_name, get_recent_nodes —
+            # used in the hot voice path) had to wait on. Under
+            # bursty mutation (warm-profile rebuild during a diary
+            # flush) read latency could spike to 5 s (the busy_timeout
+            # above), manifesting as visible voice latency. Sibling
+            # stores (memory/db.py, utils/vector_store.py) already use
+            # WAL; this brings the graph store into parity.
+            #
+            # WAL is durable across crashes and persists across opens,
+            # so issuing the PRAGMA on every open is idempotent.
+            # ``synchronous=NORMAL`` is the recommended companion
+            # (WAL + NORMAL = full crash safety for committed txns,
+            # without the per-COMMIT fsync of FULL).
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
             self.conn.executescript(_GRAPH_SCHEMA_SQL)
             self.conn.commit()
 
@@ -274,36 +310,45 @@ class GraphMemoryStore:
         on first boot for existing graphs that predate the taxonomy —
         this is the migration path.
         """
-        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            row = self.conn.execute(
-                "SELECT id FROM memory_nodes WHERE parent_id IS NULL LIMIT 1"
-            ).fetchone()
-            if row is None:
-                self.conn.execute(
-                    """INSERT INTO memory_nodes
-                       (id, name, description, data, parent_id,
-                        access_count, last_accessed, created_at, updated_at,
-                        data_token_count)
-                       VALUES (?, ?, ?, ?, NULL, 0, ?, ?, ?, 0)""",
-                    ("root", "Root", "Top-level memory node — contains all knowledge domains.", "", now, now, now),
-                )
-                self.conn.commit()
-                debug_log("Created root memory node", "memory")
+            self._seed_root_locked()
 
-            # Seed fixed top-level branches under root. Each row is
-            # inserted with INSERT OR IGNORE keyed on the stable id so
-            # repeated boots are no-ops.
-            for branch_id, name, description in FIXED_BRANCHES:
-                self.conn.execute(
-                    """INSERT OR IGNORE INTO memory_nodes
-                       (id, name, description, data, parent_id,
-                        access_count, last_accessed, created_at, updated_at,
-                        data_token_count)
-                       VALUES (?, ?, ?, '', 'root', 0, ?, ?, ?, 0)""",
-                    (branch_id, name, description, now, now, now),
-                )
-            self.conn.commit()
+    def _seed_root_locked(self) -> None:
+        """Caller-locked variant of ``_ensure_root``.
+
+        Used by ``migrate_legacy_shape`` to keep the DELETE + re-seed
+        inside ONE transaction — if a crash interrupts the wipe the
+        next boot must not see an empty ``memory_nodes`` table. Caller
+        MUST hold ``self._lock`` and (ideally) be inside a
+        ``with self.conn:`` transaction.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        row = self.conn.execute(
+            "SELECT id FROM memory_nodes WHERE parent_id IS NULL LIMIT 1"
+        ).fetchone()
+        if row is None:
+            self.conn.execute(
+                """INSERT INTO memory_nodes
+                   (id, name, description, data, parent_id,
+                    access_count, last_accessed, created_at, updated_at,
+                    data_token_count)
+                   VALUES (?, ?, ?, ?, NULL, 0, ?, ?, ?, 0)""",
+                ("root", "Root", "Top-level memory node — contains all knowledge domains.", "", now, now, now),
+            )
+            debug_log("Created root memory node", "memory")
+
+        # Seed fixed top-level branches under root. Each row is
+        # inserted with INSERT OR IGNORE keyed on the stable id so
+        # repeated boots are no-ops.
+        for branch_id, name, description in FIXED_BRANCHES:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO memory_nodes
+                   (id, name, description, data, parent_id,
+                    access_count, last_accessed, created_at, updated_at,
+                    data_token_count)
+                   VALUES (?, ?, ?, '', 'root', 0, ?, ?, ?, 0)""",
+                (branch_id, name, description, now, now, now),
+            )
 
     def migrate_legacy_shape(self) -> bool:
         """Wipe the graph if it has a non-conforming (pre-taxonomy) shape.
@@ -355,11 +400,96 @@ class GraphMemoryStore:
                 f"wiping knowledge graph ({reason}); will re-seed fixed branches",
                 "memory",
             )
-            self.conn.execute("DELETE FROM memory_nodes")
-            self.conn.commit()
-
-        # Re-seed root + fixed branches from scratch.
-        self._ensure_root()
+            # Audit round 10 fix: BACKUP before destructive DELETE.
+            # Previously a misclassified rogue child wiped the entire
+            # User branch with NO recovery path — months of accreted
+            # diary nodes gone in one startup. Now: dump current rows
+            # to a timestamped JSON file under ~/.config/jarvis/backups/
+            # so the user can recover via `jq` + reinsert script. The
+            # backup is best-effort — failure does NOT abort the wipe
+            # (we want migration progress even if disk is full), but
+            # the path is logged for forensics.
+            try:
+                from datetime import datetime as _dt
+                import json as _json
+                import os as _os
+                from pathlib import Path as _P
+                backup_dir = _P.home() / ".config" / "jarvis" / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                # Audit round 14 fix: tighten perms on the backup dir
+                # — pre-wipe backups contain the full memory dump and
+                # default umask leaves them group/other readable.
+                try:
+                    _os.chmod(backup_dir, 0o700)
+                except Exception:
+                    pass
+                ts = _dt.now().strftime("%Y%m%dT%H%M%S")
+                backup_path = backup_dir / f"graph-pre-wipe-{ts}.json"
+                rows = self.conn.execute(
+                    "SELECT * FROM memory_nodes"
+                ).fetchall()
+                # sqlite3.Row → dict
+                dumped = [dict(r) for r in rows]
+                _tmp = backup_path.with_suffix(".json.tmp")
+                _tmp.write_text(
+                    _json.dumps(dumped, ensure_ascii=False, default=str, indent=2),
+                    encoding="utf-8",
+                )
+                _os.replace(_tmp, backup_path)
+                # Audit round 14 fix: chmod 0o600 + bounded retention.
+                # Previously every wipe wrote a new file with no
+                # rotation — a chatty diary could fill the disk over
+                # months. Keep the 5 most-recent backups.
+                try:
+                    _os.chmod(backup_path, 0o600)
+                except Exception:
+                    pass
+                try:
+                    backups = sorted(
+                        backup_dir.glob("graph-pre-wipe-*.json"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for old in backups[5:]:
+                        try:
+                            old.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                debug_log(
+                    f"graph pre-wipe backup written: {backup_path} ({len(dumped)} rows)",
+                    "memory",
+                )
+            except Exception as _be:
+                debug_log(f"graph backup failed (proceeding with wipe): {_be}", "memory")
+            # Audit round 16 fix: wrap DELETE + re-seed in ONE
+            # transaction. The previous flow committed the DELETE
+            # FIRST and then released the lock to call ``_ensure_root``
+            # (which re-acquired the lock). A crash, OOM, or even a
+            # foreign-key cascade error between those two commits left
+            # ``memory_nodes`` empty — the next read crashed in
+            # ``get_warm_profile`` because ``root`` was missing.
+            # ``with self.conn:`` wraps the inner statements in a
+            # transaction that COMMITS on clean exit and ROLLS BACK on
+            # any exception, so the table either has the new root +
+            # branches or stays in its pre-wipe state. The legacy rows
+            # being un-DELETE-able on rollback is the *better* failure
+            # mode here — they were already in a non-conforming shape
+            # and the next migration attempt will retry the wipe.
+            try:
+                with self.conn:
+                    self.conn.execute("DELETE FROM memory_nodes")
+                    self._seed_root_locked()
+            except Exception as e:
+                debug_log(
+                    f"graph migration rolled back (DB unchanged): {e}",
+                    "memory",
+                )
+                # Re-raise so the caller (daemon start-up) surfaces
+                # the failure instead of silently continuing with a
+                # graph that still has the pre-taxonomy shape.
+                raise
         return True
 
     # ── CRUD ────────────────────────────────────────────────────────────
@@ -494,6 +624,33 @@ class GraphMemoryStore:
             node.data = data
             node.data_token_count = _estimate_tokens(data)
         if parent_id is not ...:
+            # Audit round 14 fix: reparenting a node to one of its own
+            # descendants creates a cycle (A → B → A), which makes
+            # ``_resolve_branch``'s capped traversal hit the depth
+            # limit and return None — i.e. the node permanently falls
+            # out of the warm-profile branch index. Walk the proposed
+            # new parent's ancestor chain and refuse the update if
+            # ``node_id`` appears anywhere in it.
+            if parent_id == node_id:
+                raise ValueError(f"update_node: refusing to set parent_id == node_id ({node_id})")
+            if parent_id:
+                cursor = parent_id
+                with self._lock:
+                    for _ in range(MAX_TRAVERSAL_DEPTH * 2):
+                        if cursor == node_id:
+                            raise ValueError(
+                                f"update_node: refusing to create cycle — node {node_id} "
+                                f"is already an ancestor of proposed parent {parent_id}"
+                            )
+                        if cursor is None or cursor == "root":
+                            break
+                        row = self.conn.execute(
+                            "SELECT parent_id FROM memory_nodes WHERE id = ?",
+                            (cursor,),
+                        ).fetchone()
+                        if row is None:
+                            break
+                        cursor = row["parent_id"]
             node.parent_id = parent_id
         node.updated_at = now
 
@@ -511,8 +668,128 @@ class GraphMemoryStore:
         _notify_graph_mutation("update", node_id, self._resolve_branch(node_id))
         return node
 
+    def bulk_split_node(
+        self,
+        parent_id: str,
+        children: "list[dict]",
+        parent_summary: str,
+    ) -> "list[str]":
+        """Atomically split a node into N children + clear parent data
+        + update parent description.
+
+        Audit round 14 fix: ``auto_split_node`` in ``graph_ops.py`` used
+        to issue N+1 separate commits (one per ``create_node`` call,
+        then one for the ``update_node`` clear). A crash or process
+        kill between commits left the graph half-split — the children
+        existed AND the parent still held the original data → next
+        warm-profile rebuild saw every fact twice. Wrap everything in
+        a single transaction so a failure rolls back to the pre-split
+        state.
+
+        Each entry in ``children`` is a dict with keys ``name``,
+        ``description``, ``data`` (already joined into a single
+        string).
+        Returns the list of new child node ids in insertion order.
+        """
+        if not children:
+            return []
+        parent = self.get_node(parent_id)
+        if parent is None:
+            raise ValueError(f"bulk_split_node: parent '{parent_id}' does not exist")
+
+        now = datetime.now(timezone.utc).isoformat()
+        new_ids: list[str] = []
+        rows_to_insert: list[tuple] = []
+        for cat in children:
+            name = str(cat.get("name", ""))[:SUMMARY_MAX_LENGTH] or "Unnamed"
+            desc = str(cat.get("description", f"Memories about: {name}"))[:SUMMARY_MAX_LENGTH]
+            data = str(cat.get("data", ""))
+            cid = str(uuid.uuid4())
+            new_ids.append(cid)
+            rows_to_insert.append(
+                (cid, name, desc, data, parent_id, now, now, now, _estimate_tokens(data))
+            )
+
+        if len(parent_summary) > SUMMARY_MAX_LENGTH:
+            parent_summary = parent_summary[:SUMMARY_MAX_LENGTH]
+
+        # Audit round 19 fix: re-check the split precondition INSIDE the
+        # lock. ``auto_split_node`` reads ``node.data_token_count`` and
+        # then calls back into here, but there is a window between the
+        # read and this transaction during which another caller (a
+        # second audio-callback thread, the cumulative diary flusher,
+        # the warm-profile rebuilder) can complete its own split. Without
+        # this guard the second caller wipes the parent again AND
+        # inserts a second set of children — producing duplicate
+        # sibling sets with identical content. The condition we re-test
+        # is "the parent still holds enough tokens to warrant splitting".
+        # If a peer already split it, ``data_token_count`` has been reset
+        # to 0 (see the UPDATE below) and we abort cleanly.
+        with self._lock:
+            current = self.conn.execute(
+                "SELECT data_token_count FROM memory_nodes WHERE id = ?",
+                (parent_id,),
+            ).fetchone()
+            if current is None:
+                # Parent was deleted out from under us between the
+                # outer get_node and now. Nothing to split.
+                return []
+            current_tokens = int(current["data_token_count"] or 0)
+            if current_tokens <= SPLIT_THRESHOLD:
+                # Either we lost the race or the parent was emptied by
+                # an unrelated op. Either way, splitting again would
+                # produce duplicate children — refuse.
+                return []
+            try:
+                self.conn.execute("BEGIN")
+                self.conn.executemany(
+                    """INSERT INTO memory_nodes
+                       (id, name, description, data, parent_id,
+                        access_count, last_accessed, created_at, updated_at,
+                        data_token_count)
+                       VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+                    rows_to_insert,
+                )
+                self.conn.execute(
+                    """UPDATE memory_nodes
+                       SET data = '', description = ?, updated_at = ?,
+                           data_token_count = 0
+                       WHERE id = ?""",
+                    (parent_summary, now, parent_id),
+                )
+                self.conn.commit()
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+        # Listeners fire OUTSIDE the transaction so a slow listener
+        # can't hold the SQLite write lock. Order: children created
+        # first, then parent updated — matches the pre-bulk semantics.
+        branch = self._resolve_branch(parent_id)
+        for cid in new_ids:
+            _notify_graph_mutation("create", cid, branch)
+        _notify_graph_mutation("update", parent_id, branch)
+        return new_ids
+
     def delete_node(self, node_id: str) -> bool:
-        """Delete a node. Children are orphaned (parent_id set to NULL by FK).
+        """Delete a node and reparent its children to its grandparent.
+
+        Audit round 10 fix: the previous implementation relied on
+        `ON DELETE SET NULL` for the parent_id FK, which left children
+        with `parent_id=NULL` — i.e. they became disconnected roots.
+        That broke `_resolve_branch` for them (warm-profile lookups
+        rooted at FIXED_BRANCHES no longer reached the orphans), they
+        stopped showing in tree traversals, and the next `find_root()`
+        call would either skip them or — on a freshly emptied tree —
+        promote one of them to root with no obvious owner.
+
+        Now we explicitly **reparent** children to the deleted node's
+        own parent before the delete. The subtree shape is preserved
+        as best we can: a → b → {c, d} becomes a → {c, d} when b is
+        deleted, rather than a + (orphan c) + (orphan d).
 
         Root and the seeded fixed branches (see ``FIXED_BRANCHES``) are
         non-deletable — the warm profile and extractor routing rely on
@@ -524,6 +801,28 @@ class GraphMemoryStore:
         # branch attribution even though the row is about to vanish.
         branch = self._resolve_branch(node_id)
         with self._lock:
+            # Look up the doomed node's own parent so we can reparent
+            # its children to it. If the doomed node was a top-level
+            # branch root (parent_id == 'root' or NULL), children get
+            # reparented to 'root' so they remain reachable from the
+            # canonical entry point. Falling back to NULL would put
+            # them back into the orphan state we're trying to avoid.
+            parent_row = self.conn.execute(
+                "SELECT parent_id FROM memory_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if parent_row is None:
+                # Node didn't exist — nothing to do.
+                return False
+            new_parent = parent_row["parent_id"] or "root"
+
+            # Reparent in one statement BEFORE the delete; ordering is
+            # important because the FK cascade would fire SET NULL the
+            # instant we delete the parent row.
+            self.conn.execute(
+                "UPDATE memory_nodes SET parent_id = ? WHERE parent_id = ?",
+                (new_parent, node_id),
+            )
             cur = self.conn.execute(
                 "DELETE FROM memory_nodes WHERE id = ?", (node_id,)
             )
@@ -553,17 +852,43 @@ class GraphMemoryStore:
         """Append text to a node's data field.
 
         Returns True if the node's data_token_count now exceeds SPLIT_THRESHOLD.
+
+        Audit round 19 fix: previously this method performed a
+        ``get_node`` → ``update_node`` round-trip, each acquiring
+        ``self._lock`` separately. Two concurrent diary flushes that
+        both landed on the same node (User branch is dominant) could
+        each read ``data=X``, then both write ``X + fact_A`` and
+        ``X + fact_B`` respectively — one fact was silently lost. The
+        new implementation holds ``self._lock`` across the read, the
+        UPDATE statement, and the post-write token-count read, so the
+        sequence is serialised against any other writer.
         """
-        node = self.get_node(node_id)
-        if node is None:
-            return False
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT data FROM memory_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = row["data"] or ""
+            separator = "\n" if current else ""
+            new_data = current + separator + text
+            new_token_count = _estimate_tokens(new_data)
+            now = datetime.now(timezone.utc).isoformat()
+            self.conn.execute(
+                """UPDATE memory_nodes
+                   SET data = ?, data_token_count = ?, updated_at = ?
+                   WHERE id = ?""",
+                (new_data, new_token_count, now, node_id),
+            )
+            self.conn.commit()
+            crossed_threshold = new_token_count > SPLIT_THRESHOLD
 
-        separator = "\n" if node.data else ""
-        new_data = node.data + separator + text
-        self.update_node(node_id, data=new_data)
-
-        updated = self.get_node(node_id)
-        return updated is not None and updated.data_token_count > SPLIT_THRESHOLD
+        # Fire the graph-mutation listener OUTSIDE the lock so a slow
+        # listener cannot stall the next append. ``_notify_graph_mutation``
+        # is the same notification path ``update_node`` uses.
+        _notify_graph_mutation("update", node_id, self._resolve_branch(node_id))
+        return crossed_threshold
 
     def touch_node(self, node_id: str) -> None:
         """Increment access_count and update last_accessed."""
@@ -733,21 +1058,41 @@ class GraphMemoryStore:
         return nodes
 
     def find_node_by_name(self, name: str, parent_id: Optional[str] = None) -> Optional[MemoryNode]:
-        """Find a node by exact name match (case-insensitive), optionally under a specific parent."""
+        """Find a node by exact name match (case-insensitive), optionally under a specific parent.
+
+        Audit round 10 fix: SQLite `LOWER()` is ASCII-only by default
+        — it does NOT lowercase Cyrillic / Turkish / German umlauts.
+        Result: a graph node stored as "Ярвіс" would NOT be found
+        when searching for "ярвіс". The rest of the module uses
+        Python's `casefold()` + NFKC normalisation via
+        `normalise_fact`. Align this lookup by fetching candidates
+        via a permissive WHERE clause and filtering with Python's
+        casefold in the application. Small N (per-parent or
+        global-no-root) so the post-filter is cheap.
+        """
+        try:
+            needle = name.strip().casefold()
+        except Exception:
+            needle = (name or "").strip().lower()
+        if not needle:
+            return None
         with self._lock:
             if parent_id is not None:
-                row = self.conn.execute(
-                    "SELECT * FROM memory_nodes WHERE LOWER(name) = LOWER(?) AND parent_id = ? LIMIT 1",
-                    (name, parent_id),
-                ).fetchone()
+                rows = self.conn.execute(
+                    "SELECT * FROM memory_nodes WHERE parent_id = ?",
+                    (parent_id,),
+                ).fetchall()
             else:
-                row = self.conn.execute(
-                    "SELECT * FROM memory_nodes WHERE LOWER(name) = LOWER(?) AND id != 'root' LIMIT 1",
-                    (name,),
-                ).fetchone()
-            if row is None:
-                return None
-            return self._row_to_node(row)
+                rows = self.conn.execute(
+                    "SELECT * FROM memory_nodes WHERE id != 'root'",
+                ).fetchall()
+            for row in rows:
+                try:
+                    if (row["name"] or "").strip().casefold() == needle:
+                        return self._row_to_node(row)
+                except Exception:
+                    continue
+            return None
 
     # ── Graph edges for visualisation ───────────────────────────────────
 

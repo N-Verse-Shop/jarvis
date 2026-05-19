@@ -58,6 +58,97 @@ _RELATIVE_THRESHOLD = 0.97
 # guarantees the downstream prompt stays compact regardless.
 _LLM_MAX_SELECTED = 5
 
+# Audit round 18 fix: hard cap on tools fed INTO the LLM router's
+# catalogue prompt. A live MCP setup with chrome-devtools + filesystem +
+# brand-voice MCPs easily exposes 100+ tools, each with a 120-char
+# description — that's 12 KB+ of catalogue that lands in the
+# 4096-num_ctx router prompt and displaces the actual query. The cap
+# below is the upper bound; the catalogue builder applies it AFTER an
+# embedding-ranked shortlist so the most relevant tools still survive.
+_LLM_ROUTER_CATALOGUE_CAP = 40
+
+# Cache of (tool_name, description_hash) -> embedding vector. Tool
+# embeddings are pure functions of (name, description) — caching them
+# turns a hot-path 30-tool×200ms-embed loop (6 seconds of blocking I/O
+# before chat starts) into a single one-shot warm-up plus zero-cost
+# lookups on every subsequent query. Bounded so a runaway MCP-refresh
+# pattern can't grow the cache without limit; LRU-evicted via OrderedDict.
+import hashlib as _hashlib
+from collections import OrderedDict as _OrderedDict
+import threading as _threading
+
+_TOOL_EMBEDDING_CACHE_MAX = 512
+_tool_embedding_cache: "_OrderedDict[tuple[str, str], list[float]]" = _OrderedDict()
+_tool_embedding_cache_lock = _threading.Lock()
+
+
+def _tool_summary_key(
+    name: str, description: str, model_namespace: str
+) -> tuple[str, str, str]:
+    """Cache key for an embedded tool summary.
+
+    The description is hashed (sha256/16-char) so the key stays small
+    even for tools with multi-paragraph descriptions, and so a long
+    description change produces a deterministic new key without
+    storing the whole text in memory.
+
+    ``model_namespace`` segregates the cache by the embedding model
+    in use (round 18 fix). If the operator switches embed model
+    mid-process, the old vectors are the wrong dimension AND the wrong
+    semantic space — keying them under the same bucket would return
+    stale data. The namespace also gives tests a free isolation knob:
+    different fixture model strings ⇒ different cache buckets.
+    """
+    h = _hashlib.sha256(description.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return (model_namespace, name, h)
+
+
+def _cached_tool_embedding(
+    name: str,
+    description: str,
+    embed_fn,
+    model_namespace: str = "",
+) -> Optional[list[float]]:
+    """Return the embedding for a tool summary, computing + caching on miss.
+
+    ``embed_fn`` is the project's ``get_embedding`` callable bound to
+    the right base_url/model; passing it in keeps this module free of
+    a direct Ollama dependency for unit tests.
+
+    ``model_namespace`` should encode the (base_url, model) tuple as
+    a string so a runtime model switch invalidates the cache cleanly.
+    """
+    key = _tool_summary_key(name, description, model_namespace)
+    with _tool_embedding_cache_lock:
+        cached = _tool_embedding_cache.get(key)
+        if cached is not None:
+            _tool_embedding_cache.move_to_end(key)
+            return cached
+    # Compute outside the lock — embed_fn does network IO.
+    try:
+        vec = embed_fn(_tool_summary(name, description))
+    except Exception:
+        return None
+    if vec is None:
+        return None
+    with _tool_embedding_cache_lock:
+        _tool_embedding_cache[key] = vec
+        _tool_embedding_cache.move_to_end(key)
+        while len(_tool_embedding_cache) > _TOOL_EMBEDDING_CACHE_MAX:
+            _tool_embedding_cache.popitem(last=False)
+    return vec
+
+
+def _clear_tool_embedding_cache() -> None:
+    """Drop every entry from the tool-embedding cache.
+
+    Exposed for test isolation and for callers that detect a hard
+    embed-model swap (which would otherwise leave the cache in a
+    mixed-dimension state).
+    """
+    with _tool_embedding_cache_lock:
+        _tool_embedding_cache.clear()
+
 # Common English stop-words excluded from keyword matching.
 _STOP_WORDS = frozenset({
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
@@ -191,16 +282,34 @@ def _select_embedding(
     # Embed each tool description and compute cosine similarity.
     similarities: List[tuple] = []
 
-    all_tools: Dict[str, str] = {}
+    # Audit round 18 fix: use ``_cached_tool_embedding`` so a tool's
+    # description is embedded ONCE per process lifetime (the cache is
+    # keyed by ``(name, sha256(description))`` so a refresh that
+    # genuinely changes the description re-embeds correctly). Previously
+    # every query did N synchronous embed calls on the hot path —
+    # for 30 MCP tools at ~200ms each that's 6 s of blocking I/O
+    # BEFORE the chat model even starts. Embedding the query is still
+    # done on every call (it varies per turn).
+    all_tools: Dict[str, tuple[str, str]] = {}
     for name, tool in builtin_tools.items():
         if name in _ALWAYS_INCLUDED:
             continue
-        all_tools[name] = _tool_summary(name, tool.description)
+        all_tools[name] = (name, tool.description)
     for name, spec in mcp_tools.items():
-        all_tools[name] = _tool_summary(name, spec.description)
+        all_tools[name] = (name, spec.description)
 
-    for name, summary in all_tools.items():
-        tool_vec = get_embedding(summary, embed_base_url, embed_model, timeout_sec=embed_timeout_sec)
+    def _embed_summary_for_cache(text: str):
+        return get_embedding(text, embed_base_url, embed_model, timeout_sec=embed_timeout_sec)
+
+    # Round 18 fix: namespace the cache by the (base_url, model) pair
+    # so a runtime embed-model switch invalidates cleanly instead of
+    # returning vectors in the wrong dimension / semantic space.
+    cache_ns = f"{embed_base_url}::{embed_model}"
+    for name, (tool_name, tool_desc) in all_tools.items():
+        tool_vec = _cached_tool_embedding(
+            tool_name, tool_desc, _embed_summary_for_cache,
+            model_namespace=cache_ns,
+        )
         if tool_vec is None:
             continue
         tool_arr = np.array(tool_vec, dtype=np.float32)
@@ -266,13 +375,31 @@ def _select_llm(
     """
     from ..llm import call_llm_direct
 
+    # Audit round 18 fix: cap the catalogue handed to the LLM router.
+    # Built-ins are small (~10) and always informative, so they stay
+    # in full; MCP tools are capped to ``_LLM_ROUTER_CATALOGUE_CAP``
+    # so a chatty multi-MCP setup cannot flood the router prompt and
+    # displace the actual query. Preference order: built-ins first
+    # (they're closest to voice-loop concerns), then MCP names by
+    # insertion order (which already reflects discovery priority).
+    # A future improvement (S2-followup) is to pre-rank MCP tools by
+    # embedding similarity vs. the query, but the cap alone closes the
+    # context-window blow-up — the dominant pain point.
     catalogue_lines: List[str] = []
     for name, tool in builtin_tools.items():
         if name in _ALWAYS_INCLUDED:
             continue
         catalogue_lines.append(f"- {name}: {tool.description[:120]}")
-    for name, spec in mcp_tools.items():
+    mcp_budget = max(0, _LLM_ROUTER_CATALOGUE_CAP - len(catalogue_lines))
+    mcp_items = list(mcp_tools.items())
+    truncated_mcp = len(mcp_items) > mcp_budget
+    for name, spec in mcp_items[:mcp_budget]:
         catalogue_lines.append(f"- {name}: {spec.description[:120]}")
+    if truncated_mcp:
+        catalogue_lines.append(
+            f"(... {len(mcp_items) - mcp_budget} more MCP tool(s) elided "
+            f"to keep the router prompt compact)"
+        )
     catalogue = "\n".join(catalogue_lines)
 
     sys_prompt = (

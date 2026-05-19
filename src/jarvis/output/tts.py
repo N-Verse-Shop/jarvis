@@ -247,9 +247,12 @@ def _strip_markdown_for_speech(text: str) -> str:
     # underscores inside identifiers like "some_variable_name".
     text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"\1", text)
 
-    # HTML tags: drop tags, keep inner text. Safe here because TTS input is
-    # assistant prose, not code discussing literal inequalities like "x<3".
-    text = re.sub(r"<[^>]+>", "", text)
+    # HTML tags: drop tags, keep inner text. Audit round 11 fix H5: the
+    # previous `<[^>]+>` was too broad — comparison expressions in narrated
+    # code ("set y < 5 if z > 0") matched as `<` to next `>` and the whole
+    # span vanished. Require a letter or `/` immediately after `<` so real
+    # tag syntax matches but math/code doesn't.
+    text = re.sub(r"<(/?[A-Za-z][^>]*)>", "", text)
 
     # True list detection: a numbered line is a list item only if it's part
     # of a contiguous group of ≥2 such lines whose numbers are each ≤ 99.
@@ -534,7 +537,7 @@ class ChatterboxTTS:
         self.cfg_weight = cfg_weight
 
         # Threading and queue setup (same as TextToSpeech)
-        self._q: queue.Queue[str] = queue.Queue()
+        self._q: queue.Queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._is_speaking = threading.Event()
@@ -542,6 +545,15 @@ class ChatterboxTTS:
         self._completion_callback: Optional[Callable[[], None]] = None
         self._duration_callback: Optional[Callable[[float], None]] = None
         self._should_interrupt = threading.Event()
+
+        # Audit round 21 (F02) — interrupt-epoch (see PiperTTS / SystemTTS
+        # docstrings). Same race: ``interrupt()`` sets the bare flag, then
+        # a fresh ``speak()`` races between the set and the worker's
+        # ``clear``. Bumping an epoch on every interrupt and snapshotting
+        # in ``speak`` makes stale sentences detectable in
+        # ``_speak_once``.
+        self._interrupt_epoch: int = 0
+        self._epoch_lock = threading.Lock()
 
         # Chatterbox model (eagerly loaded during initialization)
         self._model = None
@@ -641,36 +653,86 @@ class ChatterboxTTS:
             self.start()
         self._completion_callback = completion_callback
         self._duration_callback = duration_callback
+        # Audit round 17 fix: hard cap text length BEFORE preprocessing —
+        # see SystemTTS.speak for full rationale (ChatterboxTTS shares
+        # the same risk: pygame mixer plays the entire synthesised
+        # buffer with no interruption window).
+        _TTS_MAX_CHARS = 4000
+        if len(text) > _TTS_MAX_CHARS:
+            ellipsis = " … (truncated)"
+            text = text[: _TTS_MAX_CHARS - len(ellipsis)] + ellipsis
         # Preprocess text for speech (convert links to readable descriptions)
         processed_text = _preprocess_for_speech(text)
+        # Audit round 21 (F02) — snapshot epoch into the queue tuple.
+        with self._epoch_lock:
+            current_epoch = self._interrupt_epoch
         try:
-            self._q.put_nowait(processed_text)
+            self._q.put_nowait((current_epoch, processed_text))
         except Exception:
             pass
 
     def interrupt(self) -> None:
-        """Stop current speech immediately"""
+        """Stop current speech immediately AND drain queued sentences.
+
+        Audit round 7 fix C4: previously only set `_should_interrupt`,
+        leaving sentences 2,3,4... from a streaming reply still queued.
+        The current sentence would stop mid-word and the next queued
+        sentence would immediately pull off `_q` and play — "interrupt"
+        became "pause and continue". Now we drain the queue so the
+        interrupt is final.
+
+        Audit round 21 (F02): also bump ``_interrupt_epoch`` so a
+        sentence racing through ``put_nowait`` past the drain is
+        recognised as stale and dropped by ``_speak_once``.
+        """
         self._should_interrupt.set()
+        with self._epoch_lock:
+            self._interrupt_epoch += 1
+        try:
+            while not self._q.empty():
+                try:
+                    self._q.get_nowait()
+                except Exception:
+                    break
+        except Exception:
+            pass
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                text = self._q.get(timeout=0.5)
+                item = self._q.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if not item:
+                continue
+            # Round 21 — items are (epoch, text) tuples; tolerate
+            # plain strings for legacy callers / tests.
+            if isinstance(item, tuple) and len(item) == 2:
+                enq_epoch, text = item
+            else:
+                enq_epoch, text = 0, item
             if not text:
                 continue
             try:
-                self._speak_once(text)
+                self._speak_once(text, enq_epoch=enq_epoch)
             except Exception:
                 continue
 
-    def _speak_once(self, text: str) -> None:
+    def _speak_once(self, text: str, enq_epoch: int = 0) -> None:
+        # Audit round 21 (F02): drop stale-epoch sentences.
+        with self._epoch_lock:
+            current_epoch = self._interrupt_epoch
+        if enq_epoch < current_epoch:
+            debug_log(
+                f"Chatterbox TTS: dropping stale sentence (enq_epoch={enq_epoch} < {current_epoch})",
+                "tts",
+            )
+            return
         self._is_speaking.set()
         self._last_spoken_text = text
         self._should_interrupt.clear()
         interrupted = False
-        
+
         # Signal speaking state to face widget
         self._notify_speaking_state(True)
 
@@ -743,14 +805,22 @@ class ChatterboxTTS:
             # Signal speaking stopped to face widget
             self._notify_speaking_state(False)
             
-            # Call completion callback if set and not interrupted
+            # Call completion callback if set and not interrupted.
+            # Audit round 8 regression fix: always clear the callback
+            # ref at the end of `_speak_once` regardless of interrupt
+            # outcome. Previously `_completion_callback = None` lived
+            # INSIDE the `if not interrupted` branch, so on interrupt
+            # the stale callback persisted across the next `speak()`
+            # call — a fresh speak that didn't pass its own callback
+            # would inherit the dead one. SystemTTS already does this
+            # correctly; aligning PiperTTS/ChatterboxTTS here.
             if self._completion_callback is not None and not interrupted:
                 try:
                     self._completion_callback()
                 except Exception:
                     pass
-                self._completion_callback = None
-    
+            self._completion_callback = None
+
     def _notify_speaking_state(self, is_speaking: bool) -> None:
         """Notify the face widget of speaking state changes.
 
@@ -819,6 +889,21 @@ class PiperTTS:
         self._completion_callback: Optional[Callable[[], None]] = None
         self._duration_callback: Optional[Callable[[float], None]] = None
         self._should_interrupt = threading.Event()
+
+        # Audit round 21 fix (F02): mirror the ``SystemTTS`` epoch
+        # pattern. The bare ``_should_interrupt`` flag had a race —
+        # ``interrupt()`` set it just before a fresh ``speak()``
+        # enqueued a new sentence. The worker popped the new sentence,
+        # saw the still-set flag, and silently returned. User
+        # presses stop, then asks a new question, and the new reply
+        # never gets spoken. ``_interrupt_epoch`` solves it: every
+        # ``speak()`` snapshots the current epoch, every
+        # ``_speak_once`` re-reads it before doing work — if the
+        # epoch advanced since enqueue, the sentence is stale and
+        # we drop it (and only it). New sentences with the new
+        # epoch sail through cleanly.
+        self._interrupt_epoch: int = 0
+        self._epoch_lock = threading.Lock()
 
         # Piper voice (lazy loaded)
         self._voice = None
@@ -946,38 +1031,98 @@ class PiperTTS:
             self.start()
         self._completion_callback = completion_callback
         self._duration_callback = duration_callback
+        # Audit round 17 fix: cap text length BEFORE Piper synthesis —
+        # see SystemTTS.speak for full rationale. Piper synthesises
+        # the entire string offline before playback begins, so a
+        # 100 KB reply can block the queue for many minutes with no
+        # interruption window.
+        _TTS_MAX_CHARS = 4000
+        if len(text) > _TTS_MAX_CHARS:
+            ellipsis = " … (truncated)"
+            text = text[: _TTS_MAX_CHARS - len(ellipsis)] + ellipsis
         # Preprocess text for speech
         processed_text = _preprocess_for_speech(text)
+        # Audit round 21 (F02): snapshot the epoch when ``speak`` is
+        # called, NOT when the worker pops the item. If ``interrupt``
+        # bumps the epoch between enqueue and pop, the worker
+        # recognises the staleness and drops the sentence — without
+        # this, a stale ``_should_interrupt.set()`` from a prior
+        # interrupt would silently kill the first sentence of the
+        # next reply.
+        with self._epoch_lock:
+            current_epoch = self._interrupt_epoch
         try:
-            self._q.put_nowait(processed_text)
+            self._q.put_nowait((current_epoch, processed_text))
         except Exception:
             pass
 
     def interrupt(self) -> None:
-        """Stop current speech immediately."""
+        """Stop current speech immediately AND drain queued sentences.
+
+        Audit round 7 fix C4: drain `_q` so streaming-reply sentence #2
+        doesn't pull off the queue and play right after sentence #1 was
+        aborted. Without the drain, "interrupt" was effectively
+        "pause-current-and-play-next".
+
+        Audit round 21 (F02): also bump ``_interrupt_epoch`` so any
+        sentence that was enqueued just BEFORE this interrupt and is
+        already past the drain (still sitting in another caller's
+        ``put_nowait`` between python-level lock acquire and queue
+        commit) gets dropped by the worker's epoch check.
+        """
         self._should_interrupt.set()
+        with self._epoch_lock:
+            self._interrupt_epoch += 1
         with self._audio_lock:
             if self._audio_stream is not None:
                 try:
                     self._audio_stream.abort()
                 except Exception:
                     pass
+        try:
+            while not self._q.empty():
+                try:
+                    self._q.get_nowait()
+                except Exception:
+                    break
+        except Exception:
+            pass
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                text = self._q.get(timeout=0.5)
+                item = self._q.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if not item:
+                continue
+            # Round 21 — items are now (epoch, text) tuples. Tolerate
+            # plain strings for forward-/back-compat with any test or
+            # internal caller that bypasses speak().
+            if isinstance(item, tuple) and len(item) == 2:
+                enq_epoch, text = item
+            else:
+                enq_epoch, text = 0, item
             if not text:
                 continue
             try:
-                self._speak_once(text)
+                self._speak_once(text, enq_epoch=enq_epoch)
             except Exception as e:
                 debug_log(f"Piper TTS error in _speak_once: {e}", "tts")
                 continue
 
-    def _speak_once(self, text: str) -> None:
+    def _speak_once(self, text: str, enq_epoch: int = 0) -> None:
+        # Audit round 21 (F02): drop stale sentences whose epoch is
+        # behind the current ``_interrupt_epoch`` — they were queued
+        # before the most recent interrupt and must NOT be spoken.
+        with self._epoch_lock:
+            current_epoch = self._interrupt_epoch
+        if enq_epoch < current_epoch:
+            debug_log(
+                f"Piper TTS: dropping stale sentence (enq_epoch={enq_epoch} < {current_epoch})",
+                "tts",
+            )
+            return
         self._is_speaking.set()
         self._last_spoken_text = text
         self._should_interrupt.clear()
@@ -1167,13 +1312,16 @@ class PiperTTS:
             self._is_speaking.clear()
             self._notify_speaking_state(False)
 
-            # Call completion callback if set and not interrupted
+            # Call completion callback if set and not interrupted.
+            # Audit round 8 regression fix: always clear at end (was
+            # only clearing inside the `if not interrupted` branch,
+            # which leaked stale callback refs on interrupt).
             if self._completion_callback is not None and not interrupted:
                 try:
                     self._completion_callback()
                 except Exception as e:
                     print(f"  ⚠️ Piper TTS completion callback error: {e}", flush=True)
-                self._completion_callback = None
+            self._completion_callback = None
 
     def _notify_speaking_state(self, is_speaking: bool) -> None:
         """Notify the face widget of speaking state changes."""
@@ -1189,8 +1337,17 @@ class PiperTTS:
             debug_log(f"failed to set face state to SPEAKING (piper): {e}", "tts")
 
     # Loopback guard helpers (same interface as TextToSpeech)
+    # Audit round 23 fix (F46): queue-aware. See SystemTTS.is_speaking
+    # for full rationale — same race in PiperTTS streaming path.
     def is_speaking(self) -> bool:
-        return self._is_speaking.is_set()
+        if self._is_speaking.is_set():
+            return True
+        try:
+            if not self._q.empty():
+                return True
+        except Exception:
+            pass
+        return False
 
     def get_last_spoken_text(self) -> str:
         return self._last_spoken_text
@@ -1254,14 +1411,15 @@ _RU_ONLY_CHARS = set("ёыэъЁЫЭЪ")
 _RU_WORDS = frozenset([
     # Greetings / common
     "здравствуйте", "привет", "пожалуйста", "спасибо", "сейчас", "сегодня",
-    "конечно", "извините", "пока", "хорошо",
+    "конечно", "извините", "пока", "хорошо", "слушаю", "слушай", "встречи",
     # Function words / pronouns
     "что", "это", "очень", "только", "чем", "если", "когда", "тебя", "меня",
     "вас", "нас", "ещё", "уже", "тоже", "также", "никак", "потому",
     # Verbs - RU forms ending in -ть, -лять, -ать
     "понимаю", "слышу", "помочь", "помогать", "знать", "делать", "делаю",
     "готов", "готовый", "буду", "будет", "был", "была", "сделать", "хочу",
-    "могу", "должен", "должна", "надо", "нужно", "нравится",
+    "могу", "должен", "должна", "надо", "нужно", "нравится", "ответ",
+    "ответить", "помочь", "помогу", "сделаю", "найду", "открою",
     # Nouns / verbs distinctive (RU-specific morphology)
     "дела", "делами", "дело", "вопрос", "ответ", "русск", "москв", "правда",
     "место", "время", "день", "час", "минут", "секунд",
@@ -1313,12 +1471,17 @@ def _detect_language(text: str) -> str:
             return "ru"
 
         # Ambiguous Cyrillic — score common words.
+        # Tie-break: 'ru' (post May 16 uk→ru migration). Previously 'uk'
+        # default caused short RU phrases like "Слушаю, Данило" (no
+        # _RU_ONLY_CHARS, no _UA_ONLY_CHARS, no scoring word match) to be
+        # routed to UA Piper voice → spoken with UA accent. User report:
+        # "вимовляє він неправильно тепер слова з українським акцентом".
         lower = text.lower()
         ua_score = sum(1 for w in _UA_WORDS if w in lower)
         ru_score = sum(1 for w in _RU_WORDS if w in lower)
-        if ru_score > ua_score:
-            return "ru"
-        return "uk"
+        if ua_score > ru_score:
+            return "uk"
+        return "ru"
 
     # No Cyrillic — Latin script. Distinguish EN vs DE.
     # Umlauts/ß alone = definitely German.
@@ -1372,7 +1535,19 @@ class SystemTTS:
         #   "tts_system_voice_map": {"uk": "Lesya", "ru": "Milena", ...}
         self.voice_map = {**_SYSTEM_VOICES_BY_LANG, **(voice_map or {})}
 
-        self._q: "queue.Queue[str]" = queue.Queue()
+        # Audit round 15 fix: queue items are now (epoch, text) tuples.
+        # Each ``speak()`` snapshots the current ``_interrupt_epoch``,
+        # ``interrupt()`` bumps it. The worker drops any popped item
+        # whose epoch is less than the current one — that's a sentence
+        # enqueued before the most-recent interrupt. The previous
+        # design used a global ``_should_interrupt`` event which had a
+        # race window: a fresh ``speak("new")`` arriving AFTER
+        # ``interrupt()`` drained the queue but BEFORE the worker
+        # popped would see ``_should_interrupt.set()`` and silently
+        # drop the new sentence (streaming-reply tail truncation).
+        self._q: "queue.Queue[tuple[int, str]]" = queue.Queue()
+        self._interrupt_epoch: int = 0
+        self._epoch_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._is_speaking = threading.Event()
@@ -1400,13 +1575,64 @@ class SystemTTS:
             self._thread.join(timeout=1.0)
 
     def interrupt(self) -> None:
+        """Stop ALL TTS playback immediately.
+
+        Audit round 7 fixes:
+          C3: ALSO interrupt every cached PiperTTS sub-engine — UA/RU
+              paths route through `_speak_via_piper` → `engine._speak_once`
+              which uses `sounddevice.OutputStream` (not a subprocess),
+              so killing only `_current_proc` (the `say` process) left
+              Piper audio playing for 1-3 more seconds. The mic captured
+              the tail of "Слухаю, Данило..." as a fresh user utterance.
+          C4: DRAIN the pending sentence queue. Streaming replies queue
+              sentences 2,3,4... via _flush_sentence → speak(). Without
+              draining, the current sentence stops mid-word but the
+              next queued sentence pulls off the queue and plays right
+              away. The "interrupt" thus became an unintended pause-
+              and-continue.
+        """
         self._should_interrupt.set()
+        # Audit round 15 fix: bump the epoch. Anything currently in
+        # the queue (or popped but not yet checked) carries the OLD
+        # epoch and will be dropped on the in-worker check below.
+        # Future ``speak()`` calls snapshot the new epoch and survive.
+        with self._epoch_lock:
+            self._interrupt_epoch += 1
+        # Stop the `say` subprocess (LV/EN paths).
         with self._proc_lock:
             if self._current_proc and self._current_proc.poll() is None:
                 try:
                     self._current_proc.terminate()
                 except Exception:
                     pass
+        # C3 — also stop every cached Piper sub-engine.
+        # `_piper_engines` is a class attribute on SystemTTS, so iterate
+        # via the class (works regardless of instance).
+        # Audit round 15 fix: take the class-level lock when iterating
+        # the shared engine cache (previously a bare ``list(...)`` call
+        # raced with concurrent ``_get_piper_for`` insertions — GIL-
+        # safe in CPython today but explicitly NOT guaranteed by the
+        # language spec; breaks under free-threaded 3.13+).
+        try:
+            with SystemTTS._piper_engines_lock:
+                _engines = list(SystemTTS._piper_engines.values())
+            for _engine in _engines:
+                try:
+                    _engine.interrupt()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # C4 — drain queued sentences so the streaming reply that's
+        # being interrupted doesn't continue speaking sentence 2.
+        try:
+            while not self._q.empty():
+                try:
+                    self._q.get_nowait()
+                except Exception:
+                    break
+        except Exception:
+            pass
 
     def speak(
         self,
@@ -1420,17 +1646,59 @@ class SystemTTS:
             self.start()
         self._completion_callback = completion_callback
         self._duration_callback = duration_callback
+        # Audit round 17 fix: hard cap text length BEFORE preprocessing.
+        # A pathological LLM reply (e.g. an unbounded chain-of-thought,
+        # a tool-output that bypassed the response_text 50 000-char
+        # cap, or an injection payload that asks for the assistant to
+        # echo a megabyte) used to be queued in full — Piper would
+        # synthesise it offline for minutes with no interruption
+        # window, and the macOS ``say`` subprocess would hit
+        # ARG_MAX and fail silently because the entire string is one
+        # argv element. 4000 chars is well above any natural spoken
+        # response (~6 minutes of speech) and short enough that argv
+        # limits never apply.
+        _TTS_MAX_CHARS = 4000
+        if len(text) > _TTS_MAX_CHARS:
+            ellipsis = " … (truncated)"
+            text = text[: _TTS_MAX_CHARS - len(ellipsis)] + ellipsis
         processed = _preprocess_for_speech(text)
+        # Audit round 15 fix: snapshot the current epoch under lock
+        # and enqueue together with the text. The worker drops popped
+        # tuples whose epoch is older than the current one — i.e.
+        # anything queued before the most-recent ``interrupt()``.
+        with self._epoch_lock:
+            current_epoch = self._interrupt_epoch
         try:
-            self._q.put_nowait(processed)
+            self._q.put_nowait((current_epoch, processed))
         except Exception:
             pass
 
     # NOTE: kept as a method (not @property) to match PiperTTS interface —
     # the listener thread calls `self.tts.is_speaking()` and a property
     # would crash with "TypeError: 'bool' object is not callable".
+    #
+    # Audit round 23 fix (F46): also report True when sentences are
+    # waiting in the queue. Background: a streaming LLM reply
+    # enqueues 3-6 sentences via ``speak()`` rapid-fire. Between
+    # sentences ``_is_speaking`` is briefly cleared (in the
+    # ``_speak_once`` finally block) before the worker picks up the
+    # next item. The listener's ``_wait_and_activate`` thread polls
+    # ``is_speaking()`` to know when TTS is finished — if it polls
+    # during that gap it sees False and activates the hot window
+    # PREMATURELY, while sentences 2-N are still pending. The
+    # premature LISTENING state transition then competes with the
+    # SPEAKING transition of sentence 2 — visible as coin flicker.
+    # Queue-aware check fixes both: orchestrator only fires
+    # ``_on_tts_complete`` once everything is truly drained.
     def is_speaking(self) -> bool:
-        return self._is_speaking.is_set()
+        if self._is_speaking.is_set():
+            return True
+        try:
+            if not self._q.empty():
+                return True
+        except Exception:
+            pass
+        return False
 
     def get_last_spoken_text(self) -> Optional[str]:
         return self._last_spoken_text
@@ -1441,32 +1709,82 @@ class SystemTTS:
                 self._notify_speaking_cb(bool(speaking))
             except Exception:
                 pass
-        # Also signal to face widget (best-effort).
-        try:
-            from desktop_app.face_widget import JarvisState, get_jarvis_state
-            mgr = get_jarvis_state()
-            mgr.set_state(JarvisState.SPEAKING if speaking else JarvisState.IDLE)
-        except Exception:
-            pass
+        # Audit round 23 fix (F41 + F45): NEVER emit IDLE from the
+        # TTS engine. State ownership now lives entirely with the
+        # listener orchestrator (state_manager.py + _on_tts_complete).
+        # Round 22's F31 queue-peek attempt was structurally broken
+        # for single-sentence replies: by the time the worker called
+        # ``_notify_speaking_state(False)`` in the finally clause,
+        # the only enqueued sentence had already been popped — queue
+        # was empty — so F31 still emitted IDLE. Result: visible 2ms
+        # SPEAKING→IDLE flicker on every single-sentence reply, and
+        # the HUD coin's lerp damping never caught up. Live evidence
+        # from events.jsonl seq=291 (SPEAKING) → seq=292 (IDLE) 2ms
+        # apart for "Нило, ты где?" reply.
+        #
+        # The new contract:
+        #   * TTS engine emits ONLY SPEAKING when audio starts.
+        #   * IDLE / LISTENING is the listener's job, triggered after
+        #     ``activate_hot_window`` + ``track_tts_finish`` fire from
+        #     ``_on_tts_complete`` once the queue actually drains AND
+        #     the playback callback finishes.
+        if speaking:
+            try:
+                from desktop_app.face_widget import JarvisState, get_jarvis_state
+                get_jarvis_state().set_state(JarvisState.SPEAKING)
+            except Exception:
+                pass
+        # speaking == False: no-op. Don't touch face state from here.
+        # If you need a "TTS finished, no follow-up" signal, hook it
+        # via _completion_callback which propagates to _on_tts_complete.
 
     # ── Worker thread ───────────────────────────────────────────────────
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                text = self._q.get(timeout=0.5)
+                item = self._q.get(timeout=0.5)
             except queue.Empty:
                 continue
+            # Audit round 15 fix: queue now holds (epoch, text) tuples.
+            # A bare string from legacy code paths is tolerated as
+            # epoch-0 (i.e. always-stale once any interrupt fires) so
+            # an import-order accident doesn't crash the worker.
+            if isinstance(item, tuple) and len(item) == 2:
+                enq_epoch, text = item
+            else:
+                enq_epoch, text = 0, item
             if not text:
                 continue
             try:
-                self._speak_once(text)
+                self._speak_once(text, enq_epoch=enq_epoch)
             except Exception as e:
                 print(f"⚠️ SystemTTS error: {e}", flush=True)
 
-    def _speak_once(self, text: str) -> None:
+    def _speak_once(self, text: str, enq_epoch: int = 0) -> None:
+        # Audit round 11 fix C4: previously cleared `_should_interrupt`
+        # AFTER `_is_speaking.set()`. If `interrupt()` fired in the tiny
+        # window between the two, the clear obliterated the interrupt
+        # signal and playback ran to completion. Reordering: snapshot
+        # the flag, clear it, then set speaking — any new interrupt
+        # after clear() is captured by the in-loop checks.
+        #
+        # Audit round 15 fix: epoch check replaces the old
+        # ``_should_interrupt.is_set()`` short-circuit. A sentence
+        # enqueued at epoch=N is stale iff the engine has been
+        # interrupted since (i.e. ``_interrupt_epoch > N``). Without
+        # this, a fresh ``speak()`` call that arrived AFTER
+        # ``interrupt()`` drained the queue but BEFORE the worker
+        # popped would see ``_should_interrupt.set()`` and silently
+        # drop the user's new sentence — streaming reply truncated.
+        with self._epoch_lock:
+            current_epoch = self._interrupt_epoch
+        if enq_epoch < current_epoch:
+            # Stale sentence (queued before the most-recent interrupt).
+            self._completion_callback = None
+            return
+        self._should_interrupt.clear()
         self._is_speaking.set()
         self._last_spoken_text = text
-        self._should_interrupt.clear()
         self._notify_speaking_state(True)
 
         try:
@@ -1489,31 +1807,103 @@ class SystemTTS:
             else:
                 self._speak_via_say(text, voice)
         finally:
+            # Check interrupt flag BEFORE clearing speaking state so the
+            # callback decision uses the playback's actual outcome.
+            # Audit round 7 fix C2: previously fired completion_callback
+            # unconditionally — even on interrupt — which would call
+            # `activate_hot_window()` from the ack path and open a
+            # listening window while the speaker was still settling.
+            # Now: skip callback on interrupt to match PiperTTS /
+            # ChatterboxTTS semantics (they already do this).
+            interrupted = self._should_interrupt.is_set()
             self._is_speaking.clear()
             self._notify_speaking_state(False)
-            if self._completion_callback:
+            if self._completion_callback and not interrupted:
                 try:
                     self._completion_callback()
                 except Exception:
                     pass
+            # Always clear the callback ref so the next speak() doesn't
+            # accidentally reuse a stale one if it's called without a
+            # new callback (PiperTTS does this too).
+            self._completion_callback = None
 
     def _speak_via_say(self, text: str, voice: str) -> None:
-        cmd = ["say", "-v", voice, "-r", str(self.rate), text]
+        # Audit round 11 fix C1: stderr was PIPE'd but NEVER drained.
+        # If `say` emits warnings (font/voice fallback notes on macOS
+        # 14+ are common) the OS pipe buffer (typically 16-64KB) fills
+        # and the child blocks on write. `poll()` then returns None
+        # forever, the loop spins, and only `interrupt()` clears it —
+        # the daemon stops speaking but the user thinks Jarvis is mute.
+        # DEVNULL is what we want: `say` errors are not actionable here.
+        # Also drop NUL bytes from text — Popen raises
+        # `ValueError: embedded null byte` on argv with \x00, which
+        # would crash the worker thread silently (M1 from audit).
+        safe_text = (text or "").replace("\x00", "")
+        cmd = ["say", "-v", voice, "-r", str(self.rate), safe_text]
+        # Quick-exit check before spawning a process the interrupt
+        # would only kill in 50ms — saves a syscall round-trip and
+        # closes the "interrupt fires during fallback Popen" race
+        # called out in M4 of round 11.
+        if self._should_interrupt.is_set():
+            return
         with self._proc_lock:
-            self._current_proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-        while self._current_proc.poll() is None:
-            if self._should_interrupt.is_set():
-                try: self._current_proc.terminate()
-                except Exception: pass
-                break
-            time.sleep(0.05)
-        with self._proc_lock:
-            self._current_proc = None
+            try:
+                self._current_proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except (ValueError, OSError) as e:
+                debug_log(f"_speak_via_say: Popen failed: {e}", "tts")
+                self._current_proc = None
+                return
+        try:
+            while True:
+                # Snapshot proc under lock to avoid TOCTOU (interrupt
+                # could clear it between poll() and the kill path).
+                with self._proc_lock:
+                    proc = self._current_proc
+                if proc is None or proc.poll() is not None:
+                    break
+                if self._should_interrupt.is_set():
+                    # Two-stage termination: SIGTERM with 1s grace, then SIGKILL.
+                    # Without the kill fallback, a hung `say` process pinned by
+                    # the audio framework would keep _proc_lock held forever and
+                    # block the next TTS call (silent daemon, no recovery).
+                    try: proc.terminate()
+                    except Exception: pass
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        try: proc.kill()
+                        except Exception: pass
+                        try: proc.wait(timeout=1.0)
+                        except Exception: pass
+                    except Exception: pass
+                    break
+                time.sleep(0.05)
+            # Ensure the natural-completion path also reaps the process
+            # (was missing — zombie risk on long-running daemon).
+            with self._proc_lock:
+                proc = self._current_proc
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+        finally:
+            with self._proc_lock:
+                self._current_proc = None
 
     # ── Piper sub-engine (lazily initialised for male UA/RU) ────────────
+    # Audit round 11 fix C3: class-level dict shared across all SystemTTS
+    # instances; the check-then-build pattern below was unlocked, so two
+    # concurrent first-uses of the same language could both pass the
+    # `cache_key in self._piper_engines` check and instantiate two
+    # PiperTTS engines. Each engine spins up an audio stream thread and
+    # loads a ~60MB ONNX model — the leaked instance stayed alive for
+    # the daemon lifetime. Class-level lock guards the get-or-build.
     _piper_engines: dict = {}  # speaker_name → cached PiperTTS instance
+    _piper_engines_lock = threading.Lock()
 
     def _get_piper_for(self, lang: str, speaker_name: str):
         """Get or build a cached PiperTTS engine for the given language.
@@ -1525,8 +1915,10 @@ class SystemTTS:
                        fallback: ru_RU-irina-medium with notice if no male model
         """
         cache_key = f"{lang}:{speaker_name}"
-        if cache_key in self._piper_engines:
-            return self._piper_engines[cache_key]
+        # Fast path — read without lock (CPython dict reads are atomic).
+        existing = SystemTTS._piper_engines.get(cache_key)
+        if existing is not None:
+            return existing
 
         models_dir = _get_piper_models_dir()
         if lang == "uk":
@@ -1534,10 +1926,38 @@ class SystemTTS:
             speaker_map = {"lada": 0, "mykyta": 1, "tetiana": 2}
             speaker_id = speaker_map.get(speaker_name, 1)
         elif lang == "ru":
-            # Try male first (dmitri), else fall back to irina (female).
-            male = models_dir / "ru_RU-dmitri-medium.onnx"
-            female = models_dir / "ru_RU-irina-medium.onnx"
-            model_path = str(male if male.exists() else female)
+            # Honor speaker_name from tts_system_voice_map: "ruslan" /
+            # "dmitri" / "irina". Pre-May16 this branch was hardcoded to
+            # dmitri and ignored speaker — so when user switched config to
+            # "piper:ruslan" (deeper voice), daemon silently still loaded
+            # dmitri. User report: "голос потрібно зробити більш реалістич-
+            # ним... грубішого тона". The fix: actually use the speaker
+            # name when picking the .onnx file.
+            ru_voice_files = {
+                "ruslan": "ru_RU-ruslan-medium.onnx",  # deepest, most masculine
+                "dmitri": "ru_RU-dmitri-medium.onnx",  # softer male
+                "irina":  "ru_RU-irina-medium.onnx",   # female fallback
+            }
+            requested = ru_voice_files.get(speaker_name, "ru_RU-ruslan-medium.onnx")
+            requested_path = models_dir / requested
+            if requested_path.exists():
+                model_path = str(requested_path)
+            else:
+                # Fallback chain: ruslan → dmitri → irina (in order of preference).
+                for fname in ("ru_RU-ruslan-medium.onnx",
+                              "ru_RU-dmitri-medium.onnx",
+                              "ru_RU-irina-medium.onnx"):
+                    p = models_dir / fname
+                    if p.exists():
+                        model_path = str(p)
+                        debug_log(
+                            f"Piper RU: requested '{speaker_name}' not found, "
+                            f"falling back to {fname}",
+                            "tts",
+                        )
+                        break
+                else:
+                    return None
             speaker_id = None
         else:
             return None
@@ -1553,17 +1973,22 @@ class SystemTTS:
             length, noise, noise_w, silence = 0.92, 0.45, 1.2, 0.25
         else:  # uk / default
             length, noise, noise_w, silence = 0.80, 0.4, 1.0, 0.15
-        engine = PiperTTS(
-            enabled=True, voice=None, rate=self.rate,
-            model_path=model_path, speaker=speaker_id,
-            length_scale=length,
-            noise_scale=noise,
-            noise_w=noise_w,
-            sentence_silence=silence,
-        )
-        engine.start()
-        self._piper_engines[cache_key] = engine
-        return engine
+        # Slow path under lock — double-check then build.
+        with SystemTTS._piper_engines_lock:
+            existing = SystemTTS._piper_engines.get(cache_key)
+            if existing is not None:
+                return existing
+            engine = PiperTTS(
+                enabled=True, voice=None, rate=self.rate,
+                model_path=model_path, speaker=speaker_id,
+                length_scale=length,
+                noise_scale=noise,
+                noise_w=noise_w,
+                sentence_silence=silence,
+            )
+            engine.start()
+            SystemTTS._piper_engines[cache_key] = engine
+            return engine
 
     def _speak_via_piper(self, text: str, lang: str, speaker: str) -> None:
         engine = self._get_piper_for(lang, speaker)
@@ -1585,8 +2010,8 @@ class SystemTTS:
             self._speak_via_say(text, fallback)
 
 
-# Add subprocess import at module level
-import subprocess  # noqa: E402
+# Audit round 11 fix L3: duplicate `import subprocess` removed
+# (already imported at line 3).
 
 
 def create_tts_engine(

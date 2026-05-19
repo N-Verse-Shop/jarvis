@@ -8,6 +8,35 @@ from datetime import datetime, timezone
 
 from ..debug import debug_log
 
+# Audit round 16 fix: ``date_utc`` is a UNIQUE-key component on the
+# conversation_summaries table. The schema accepts any TEXT, so a caller
+# that hands us " 2026-05-17", "2026-5-17", or even "today" creates a
+# brand-new row instead of UPDATE-ing the existing one — silently breaking
+# daily-flush idempotency and producing duplicate diary entries the user
+# never sees. Validate once at the API boundary so the FK-cascade UPDATE
+# path in ``upsert_conversation_summary`` actually fires.
+_DATE_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_date_utc(date_utc: str) -> str:
+    """Validate a ``YYYY-MM-DD`` date string and return the canonical form.
+
+    Raises ``ValueError`` if the input is not a real calendar date in that
+    exact shape. Returns the input unchanged on success so callers can
+    inline the check (``cur.execute(..., (_validate_date_utc(d), ...))``).
+    """
+    if not isinstance(date_utc, str) or not _DATE_UTC_RE.match(date_utc):
+        raise ValueError(
+            f"date_utc must be 'YYYY-MM-DD' (got {date_utc!r})"
+        )
+    # Reject 2026-13-40, 2026-02-30, etc.
+    try:
+        datetime.strptime(date_utc, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"date_utc is not a valid calendar date: {date_utc!r}") from exc
+    return date_utc
+
+
 _SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -126,6 +155,16 @@ class Database:
     def _init_schema(self) -> None:
         with self._lock:
             cur = self.conn.cursor()
+            # Audit round 16 fix: set busy_timeout BEFORE schema init.
+            # The diary flush worker, foreground summary writes, the
+            # meals/nutrition tool, and the FAISS sidecar all operate
+            # against this connection's database file. Without
+            # busy_timeout SQLite returns SQLITE_BUSY instantly on any
+            # writer contention — the writer silently drops the write
+            # and the user loses (e.g.) a logged meal. 5s matches the
+            # graph store's round-14 setting and is well above any
+            # realistic single-statement duration.
+            cur.execute("PRAGMA busy_timeout = 5000")
             cur.executescript(_SCHEMA_SQL)
             if self.is_vss_enabled:
                 cur.executescript(_VSS_SCHEMA_SQL)
@@ -148,17 +187,25 @@ class Database:
                 vector_search_limit = max(top_k * 3, 50)
                 vector_results = self._python_vector_store.search(query_vec, top_k=vector_search_limit)
                 
-                # Get FTS results (use max of top_k*3 and 50 for good hybrid scoring)
+                # Get FTS results (use max of top_k*3 and 50 for good hybrid scoring).
+                # Audit round 20 P2 — bind the LIMIT via parameter,
+                # not f-string. The value is computed locally so this
+                # is not an injection today, but the shape is a latent
+                # footgun: any future refactor that lets a caller
+                # supply ``top_k`` from a tool argument would
+                # immediately produce a real SQL injection here.
+                # SQLite supports parameterised LIMIT (``?``) since
+                # 3.8.0 — no functional cost.
                 fts_search_limit = max(top_k * 3, 50)
-                fts_sql = f"""
+                fts_sql = """
                 SELECT s.id, bm25(summaries_fts) AS bm
                 FROM summaries_fts
                 JOIN conversation_summaries s ON s.id = summaries_fts.rowid
                 WHERE summaries_fts MATCH ?
                 ORDER BY bm
-                LIMIT {fts_search_limit}
+                LIMIT ?
                 """
-                fts_rows = cur.execute(fts_sql, (safe_q,)).fetchall()
+                fts_rows = cur.execute(fts_sql, (safe_q, int(fts_search_limit))).fetchall()
                 fts_scores = {row['id']: row['bm'] for row in fts_rows}
                 
                 # Combine scores
@@ -208,21 +255,26 @@ class Database:
             elif self.is_vss_enabled and query_vec_json is not None and safe_q:
                 # Hybrid search: 60% vector similarity (semantic) + 40% FTS (exact terms)
                 # This balances finding semantically related content with keyword matches
-                # Use dynamic limits for efficiency on large datasets
-                search_limit = max(top_k * 3, 50)
-                summary_sql = f"""
+                # Use dynamic limits for efficiency on large datasets.
+                # Audit round 20 P2 — bind every LIMIT as a parameter
+                # (was f-string). Today ``top_k`` and ``search_limit``
+                # are ints by code-path; a later refactor that lets a
+                # caller pass a string would otherwise produce a
+                # latent SQL-injection.
+                search_limit = int(max(top_k * 3, 50))
+                summary_sql = """
                 WITH fts_sum AS (
                   SELECT s.id, bm25(summaries_fts) AS bm
                   FROM summaries_fts
                   JOIN conversation_summaries s ON s.id = summaries_fts.rowid
                   WHERE summaries_fts MATCH ?
-                  ORDER BY bm LIMIT {search_limit}
+                  ORDER BY bm LIMIT ?
                 ),
                 v_sum AS (
                   SELECT sv.summary_id AS id, distance
                   FROM vss_search(embeddings, 'vec', ?)
                   JOIN summary_vec sv ON sv.emb_id = rowid
-                  LIMIT {search_limit}
+                  LIMIT ?
                 )
                 SELECT s.id, (
                     (1.0/(1.0+COALESCE(v_sum.distance, 1))) * 0.6 +
@@ -235,13 +287,17 @@ class Database:
                 LEFT JOIN fts_sum   ON fts_sum.id = s.id
                 WHERE v_sum.id IS NOT NULL OR fts_sum.id IS NOT NULL
                 ORDER BY score DESC
-                LIMIT {int(top_k)};
+                LIMIT ?;
                 """
-                rows = cur.execute(summary_sql, (safe_q, query_vec_json)).fetchall()
+                rows = cur.execute(
+                    summary_sql,
+                    (safe_q, search_limit, query_vec_json, search_limit, int(top_k)),
+                ).fetchall()
 
             elif safe_q:
-                # FTS-only search over conversation summaries
-                summary_sql = f"""
+                # FTS-only search over conversation summaries.
+                # Audit round 20 P2 — parameterised LIMIT (see above).
+                summary_sql = """
                 SELECT s.id, bm25(summaries_fts) AS score,
                        '[' || s.date_utc || '] ' || s.summary || ' (Topics: ' || COALESCE(s.topics, '') || ')' AS text,
                        'summary' AS result_type
@@ -249,21 +305,22 @@ class Database:
                 JOIN conversation_summaries s ON s.id = summaries_fts.rowid
                 WHERE summaries_fts MATCH ?
                 ORDER BY score
-                LIMIT {int(top_k)};
+                LIMIT ?;
                 """
-                rows = cur.execute(summary_sql, (safe_q,)).fetchall()
+                rows = cur.execute(summary_sql, (safe_q, int(top_k))).fetchall()
 
             else:
-                # Fallback: latest conversation summaries
-                summary_sql = f"""
+                # Fallback: latest conversation summaries.
+                # Audit round 20 P2 — parameterised LIMIT.
+                summary_sql = """
                 SELECT id, 0.0 AS score,
                        '[' || date_utc || '] ' || summary || ' (Topics: ' || COALESCE(topics, '') || ')' AS text,
                        'summary' AS result_type
                 FROM conversation_summaries
                 ORDER BY date_utc DESC
-                LIMIT {int(top_k)};
+                LIMIT ?;
                 """
-                rows = cur.execute(summary_sql).fetchall()
+                rows = cur.execute(summary_sql, (int(top_k),)).fetchall()
 
             return rows
 
@@ -353,22 +410,57 @@ class Database:
         the deflection scrub bulk sweep) should pass through the row's
         original ``ts_utc`` so the audit trail is preserved.
         """
+        # Audit round 16 fix: reject malformed ``date_utc`` BEFORE we
+        # take the write lock or hit the DB. Whitespace, two-digit
+        # months, or non-dates like ``"today"`` would each create a
+        # duplicate UNIQUE-key row that breaks daily-flush idempotency.
+        date_utc = _validate_date_utc(date_utc)
         if ts_utc is None:
             ts_utc = datetime.now(timezone.utc).isoformat()
         with self._lock:
             cur = self.conn.cursor()
+            # Audit round 10 fix C1: `INSERT OR REPLACE` deletes the
+            # existing row (firing FTS delete trigger AND cascading
+            # `summary_vec.summary_id` → ON DELETE removes embedding),
+            # then inserts a fresh autoincrement id. Result: every
+            # daily diary re-flush dropped + recreated the embedding
+            # row → forced the FAISS index to rebuild from scratch
+            # → continuous O(N) churn for a quiet feature.
+            # `ON CONFLICT DO UPDATE` preserves the rowid, keeping
+            # the FK + FTS rows valid, so the lazy-rebuild path in
+            # `fast_vector_store.add_vector` no longer fires on dupes.
             cur.execute(
                 """
-                INSERT OR REPLACE INTO conversation_summaries(date_utc, ts_utc, summary, topics, source_app)
+                INSERT INTO conversation_summaries(date_utc, ts_utc, summary, topics, source_app)
                 VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(date_utc, source_app) DO UPDATE SET
+                    ts_utc = excluded.ts_utc,
+                    summary = excluded.summary,
+                    topics = excluded.topics
                 """,
                 (date_utc, ts_utc, summary, topics, source_app),
             )
             self.conn.commit()
-            return int(cur.lastrowid)
+            # `lastrowid` returns 0 on the UPDATE path of ON CONFLICT;
+            # resolve the actual id via lookup. This also matters for
+            # the caller that hands the id straight to
+            # `upsert_summary_embedding(summary_id, vec)`.
+            row = cur.execute(
+                "SELECT id FROM conversation_summaries WHERE date_utc=? AND source_app=?",
+                (date_utc, source_app),
+            ).fetchone()
+            if row is None:
+                # Insert genuinely failed — fall back so caller doesn't
+                # crash on `None.lastrowid`.
+                return int(cur.lastrowid) if cur.lastrowid else 0
+            return int(row["id"])
 
     def get_conversation_summary(self, date_utc: str, source_app: str = "jarvis") -> Optional[sqlite3.Row]:
         """Get conversation summary for a specific date."""
+        # Audit round 16 fix: same validation as upsert — keep the
+        # read side in lock-step with the write side so a typo in a
+        # caller surfaces immediately rather than as a silent miss.
+        date_utc = _validate_date_utc(date_utc)
         with self._lock:
             cur = self.conn.cursor()
             row = cur.execute(
@@ -414,25 +506,136 @@ class Database:
             return rows
 
     def upsert_summary_embedding(self, summary_id: int, vec: Sequence[float]) -> Optional[int]:
-        """Store or update embedding for a conversation summary."""
+        """Store or update embedding for a conversation summary.
+
+        Audit round 10 fix C3: the previous version inserted a brand-new
+        vss row on every call (vss has no UPDATE path) and then rebound
+        ``summary_vec.emb_id`` to point at it. The OLD ``embeddings``
+        row was never deleted — vss has no FK back, no cascading
+        cleanup, no GC. Over time every diary re-flush left a dead
+        vector forever; ANN search slowed down on stale rows that no
+        summary even referenced. Now we look up the previous ``emb_id``
+        BEFORE insert and delete the orphan AFTER the rebind commits.
+        """
         if self.is_vss_enabled:
             # Use sqlite-vss
+            #
+            # Audit round 16 fix: wrap the three statements (INSERT
+            # embeddings, INSERT-OR-REPLACE summary_vec, DELETE
+            # orphan) in a SINGLE explicit transaction via ``with
+            # self.conn``. Previously each statement ran in its own
+            # implicit autocommit; a crash between the INSERT and
+            # the REPLACE left a dangling vss row (round-10 comment
+            # acknowledged it), and a concurrent writer firing the
+            # FK ON DELETE CASCADE could nuke the rebind in flight.
+            # The ``with self.conn`` block commits on clean exit and
+            # rolls back on exception — atomic.
             with self._lock:
                 cur = self.conn.cursor()
-                cur.execute("INSERT INTO embeddings(vec) VALUES (?)", (sqlite3.Binary(self._pack_vector(vec)),))
-                emb_id = cur.lastrowid
-                cur.execute(
-                    "INSERT OR REPLACE INTO summary_vec(summary_id, emb_id) VALUES (?, ?)",
-                    (summary_id, emb_id),
-                )
-                self.conn.commit()
+                try:
+                    with self.conn:
+                        # Look up the previous binding so we can clean it up
+                        # after the new vector is in and the FK has moved over.
+                        old_row = cur.execute(
+                            "SELECT emb_id FROM summary_vec WHERE summary_id=?",
+                            (summary_id,),
+                        ).fetchone()
+                        old_emb_id = int(old_row["emb_id"]) if old_row else None
+
+                        cur.execute("INSERT INTO embeddings(vec) VALUES (?)", (sqlite3.Binary(self._pack_vector(vec)),))
+                        emb_id = cur.lastrowid
+                        cur.execute(
+                            "INSERT OR REPLACE INTO summary_vec(summary_id, emb_id) VALUES (?, ?)",
+                            (summary_id, emb_id),
+                        )
+                        # GC the orphan AFTER the rebind so a crash between the
+                        # two statements leaves the new row dangling (harmless)
+                        # rather than losing the embedding entirely. Now that
+                        # all three statements are in one transaction, a
+                        # rollback drops the partial insert too.
+                        if old_emb_id is not None and old_emb_id != emb_id:
+                            try:
+                                cur.execute("DELETE FROM embeddings WHERE rowid=?", (old_emb_id,))
+                            except Exception as e:
+                                # Don't fail the whole upsert if cleanup hits a
+                                # vss quirk — just log so the leak is visible.
+                                debug_log(f"upsert_summary_embedding: orphan GC failed for emb_id={old_emb_id}: {e}", "jarvis")
+                except sqlite3.Error as exc:
+                    debug_log(f"upsert_summary_embedding: rolled back — {exc}", "jarvis")
+                    return None
                 return int(emb_id)
         elif self._python_vector_store:
-            # Use Python vector store
+            # Use Python vector store — already an upsert-by-id under the
+            # hood (the FAISS/python fallback indexes by summary_id), so
+            # no orphan-vector accumulation there.
             self._python_vector_store.add_vector(summary_id, list(vec))
             return summary_id  # Return summary_id as a placeholder for emb_id
         else:
             return None
+
+    def delete_conversation_summary(self, summary_id: int) -> bool:
+        """Delete a conversation summary AND its vector representation.
+
+        Audit round 21 fix (F01+F08): the previous "delete a memory"
+        path (``memory_viewer.delete_memory``) issued
+        ``DELETE FROM conversation_summaries WHERE id = ?`` in
+        isolation. That works on the sqlite-vss path because
+        ``embeddings`` has an FK cascade via the ``summary_vec``
+        bridge table. But on the FAISS-fallback path
+        (``_python_vector_store``) the in-memory FAISS index +
+        sidecar table (``faiss_vector_store``) were NEVER touched.
+        Result: subsequent hybrid search returned the deleted
+        summary_id with a phantom distance, and the JOIN with the
+        now-deleted summary row produced silent corruption (NULL
+        text rows or missing entries in the score blend).
+
+        This method handles both backends atomically:
+          1. Delete the summary row in the same transaction as the
+             sqlite-vss bridge cascade (if vss is on).
+          2. If FAISS is the backend, call ``delete_vector`` AFTER
+             the SQL delete commits — that ordering ensures a busy
+             SQLite that rolls back doesn't leave the FAISS index
+             inconsistent with the on-disk row.
+        Returns True if a row was deleted.
+        """
+        with self._lock:
+            try:
+                with self.conn:
+                    cur = self.conn.execute(
+                        "DELETE FROM conversation_summaries WHERE id = ?",
+                        (int(summary_id),),
+                    )
+                    deleted = cur.rowcount > 0
+                    # On the sqlite-vss path, FK cascade handles
+                    # ``summary_vec`` → ``embeddings``. Belt-and-
+                    # braces: explicitly clean ``summary_vec`` in
+                    # case FKs were ever disabled.
+                    if self.is_vss_enabled:
+                        try:
+                            self.conn.execute(
+                                "DELETE FROM summary_vec WHERE summary_id = ?",
+                                (int(summary_id),),
+                            )
+                        except sqlite3.Error:
+                            pass
+            except sqlite3.Error as exc:
+                debug_log(
+                    f"delete_conversation_summary: SQL failed for id={summary_id}: {exc}",
+                    "jarvis",
+                )
+                return False
+        # FAISS path — outside the SQLite lock so a slow FAISS
+        # remove_ids doesn't hold the connection.
+        if not self.is_vss_enabled and self._python_vector_store is not None:
+            try:
+                self._python_vector_store.delete_vector(int(summary_id))
+            except Exception as exc:
+                debug_log(
+                    f"delete_conversation_summary: vector store delete failed for "
+                    f"id={summary_id}: {exc}",
+                    "jarvis",
+                )
+        return bool(deleted)
 
     def close(self) -> None:
         try:

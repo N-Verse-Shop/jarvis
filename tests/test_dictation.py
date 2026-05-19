@@ -393,8 +393,12 @@ class TestRecordingStateMachine:
         engine._recording = True
         engine._stream = stream_mock
         # Pre-fill up to the limit so one more frame triggers the cap.
+        # Round 18 fix: ``_audio_sample_count`` is the running counter
+        # the callback now consults instead of an O(n) ``sum(len(f))``
+        # walk — seed it to match the pre-filled frame list.
         engine._max_frames = 100
         engine._audio_frames = [np.zeros(100, dtype=np.float32)]
+        engine._audio_sample_count = 100
 
         with patch("src.jarvis.dictation.dictation_engine._play_beep"):
             indata = np.random.randn(1600, 1).astype(np.float32)
@@ -614,9 +618,13 @@ class TestAudioCallback:
         import numpy as np
         engine = _make_engine()
         engine._recording = True
-        # Pre-fill near the max
+        # Pre-fill near the max. Round 18 fix: the callback now reads
+        # the running ``_audio_sample_count`` instead of recomputing
+        # ``sum(len(f) ...)`` per tick, so the test must seed the
+        # counter alongside the frame list.
         engine._max_frames = 100
         engine._audio_frames = [np.zeros(100, dtype=np.float32)]
+        engine._audio_sample_count = 100
 
         indata = np.random.randn(1600, 1).astype(np.float32)
         with patch.object(engine, "_stop_recording"):
@@ -674,7 +682,15 @@ class TestTranscribeAndPaste:
 
         frames = [np.zeros(8000, dtype=np.float32)]  # 0.5s
         engine._transcribe_and_paste(frames)
-        mock_paste.assert_called_once_with("hello world")
+        # Round 18 fix: _clipboard_paste now takes a keyword arg
+        # ``restore_previous`` to preserve the user's prior clipboard
+        # contents. The wrapper snapshots whatever pbpaste returns
+        # before the call; under test that's whatever the patched
+        # subprocess returns (None on failure → restore_previous=None).
+        mock_paste.assert_called_once()
+        args, kwargs = mock_paste.call_args
+        assert args == ("hello world",)
+        assert "restore_previous" in kwargs
 
     @patch("src.jarvis.dictation.dictation_engine._clipboard_paste")
     def test_empty_transcription_does_not_paste(self, mock_paste):

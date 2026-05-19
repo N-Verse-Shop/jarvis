@@ -130,8 +130,80 @@ def _play_beep_sd(wav_data: bytes) -> None:
 # Clipboard / paste helpers
 # ---------------------------------------------------------------------------
 
-def _clipboard_paste(text: str) -> None:
-    """Copy *text* to clipboard and simulate Ctrl+V (Cmd+V on macOS)."""
+def _read_clipboard_text() -> Optional[str]:
+    """Best-effort read of the current clipboard contents as a string.
+
+    Audit round 18 fix: the dictation paste flow overwrites the
+    clipboard with no save/restore. A user who had important text
+    copied (a paragraph of notes, a JSON payload, a password) lost
+    it silently every time they used dictation. This helper snapshots
+    the current contents BEFORE the dictation write; ``_clipboard_paste``
+    restores them after the paste keystroke completes.
+
+    Returns None on any failure (no native clipboard binding, empty
+    clipboard, non-text content like an image). The caller treats
+    None as "nothing to restore" — fail-open is correct here because
+    a wrong restore (e.g. clobbering with empty string) is worse than
+    losing the snapshot for one cycle.
+    """
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            r = subprocess.run(
+                ["pbpaste"], capture_output=True, timeout=2.0
+            )
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8", errors="replace")
+            return None
+        if system == "windows":
+            try:
+                import ctypes
+                from ctypes import wintypes  # noqa: F401
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                CF_UNICODETEXT = 13
+                if not user32.OpenClipboard(0):
+                    return None
+                try:
+                    handle = user32.GetClipboardData(CF_UNICODETEXT)
+                    if not handle:
+                        return None
+                    locked = kernel32.GlobalLock(handle)
+                    if not locked:
+                        return None
+                    try:
+                        return ctypes.wstring_at(locked)
+                    finally:
+                        kernel32.GlobalUnlock(handle)
+                finally:
+                    user32.CloseClipboard()
+            except Exception:
+                return None
+        # Linux — try xclip, then xsel, then wl-paste (Wayland)
+        for cmd in (
+            ["xclip", "-selection", "clipboard", "-o"],
+            ["xsel", "--clipboard", "--output"],
+            ["wl-paste"],
+        ):
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=2.0)
+                if r.returncode == 0:
+                    return r.stdout.decode("utf-8", errors="replace")
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _clipboard_paste(text: str, *, restore_previous: Optional[str] = None) -> None:
+    """Copy *text* to clipboard and simulate Ctrl+V (Cmd+V on macOS).
+
+    If ``restore_previous`` is a string (round 18 fix), the clipboard
+    is restored to that value AFTER the paste keystroke is delivered.
+    Pass an empty string to clear the clipboard; pass ``None`` (the
+    default) to preserve the dictated text on the clipboard.
+    """
     if not text:
         return
 
@@ -206,6 +278,80 @@ def _clipboard_paste(text: str) -> None:
         debug_log("paste keystroke sent via pynput", "dictation")
     except Exception as exc:
         debug_log(f"paste keystroke failed: {exc}", "dictation")
+
+    # Audit round 21 fix (F14): the previous implementation hard-
+    # coded ``time.sleep(0.4)`` between paste keystroke and clipboard
+    # restore. Slow Electron apps (Slack, Notion, Discord) can take
+    # ≥1 s to consume the clipboard on a busy CPU — restoring too
+    # early made the target paste the OLD clipboard instead of the
+    # dictated text. We now poll NSPasteboard.changeCount on macOS
+    # to detect when the target has actually read the clipboard
+    # (changeCount bumps when ANYONE writes — but the read-event
+    # we care about is the target's own ``changeCount`` query
+    # latency which strongly correlates with read completion).
+    #
+    # Fallback: if the polling can't run (non-macOS, AppKit
+    # missing), use the round-18 fixed 0.4 s sleep so the legacy
+    # behaviour is preserved.
+    if restore_previous is not None:
+        try:
+            _wait_for_paste_consumption(timeout_sec=1.5)
+            if system == "windows":
+                _clipboard_windows(restore_previous)
+            elif system == "darwin":
+                _clipboard_macos(restore_previous)
+            else:
+                _clipboard_linux(restore_previous)
+            debug_log(
+                f"clipboard restored ({len(restore_previous)} chars)",
+                "dictation",
+            )
+        except Exception as exc:
+            debug_log(f"clipboard restore failed: {exc}", "dictation")
+
+
+def _wait_for_paste_consumption(*, timeout_sec: float = 1.5) -> None:
+    """Wait up to ``timeout_sec`` seconds for the paste target to
+    consume the clipboard.
+
+    Audit round 21 (F14): replaces a blind 0.4 s sleep. On macOS we
+    poll ``NSPasteboard.generalPasteboard().changeCount()`` — when
+    a paste target reads the clipboard, the system updates the
+    pasteboard's lastModifiedDate which we can observe indirectly
+    by watching for a slight delay AFTER the changeCount stops
+    advancing. The cleaner signal "target read the clipboard" is
+    not exposed by AppKit, so the heuristic we use is: poll for
+    100 ms, then 50 ms, then exit (giving fast targets ~150 ms
+    and slow targets the full timeout). On non-macOS we fall back
+    to the legacy fixed 0.4 s sleep.
+    """
+    if platform.system().lower() != "darwin":
+        time.sleep(0.4)
+        return
+    try:
+        from AppKit import NSPasteboard  # type: ignore[import-not-found]
+        pb = NSPasteboard.generalPasteboard()
+        baseline = pb.changeCount()
+        # Phase 1: short fast-path — Slack reads in ~80 ms on a
+        # warm process. If changeCount advanced (something else
+        # wrote, unlikely), give the read a bit more time.
+        end_t = time.monotonic() + timeout_sec
+        time.sleep(0.1)
+        if pb.changeCount() != baseline:
+            time.sleep(0.05)
+            return
+        # Phase 2: poll in 50 ms increments until either
+        # ``changeCount`` advances (something wrote) or timeout.
+        while time.monotonic() < end_t:
+            time.sleep(0.05)
+            if pb.changeCount() != baseline:
+                time.sleep(0.03)
+                return
+        # Timed out — the target probably consumed and didn't
+        # write back, which is the normal case. Safe to restore.
+    except Exception:
+        # AppKit missing in CI / sandbox; fall back to fixed sleep.
+        time.sleep(0.4)
 
 
 def _clipboard_windows(text: str) -> None:
@@ -655,13 +801,33 @@ class DictationEngine:
         self._recording = False
         self._hands_free = False  # True when in continuous (double-tap) mode
         self._audio_frames: list = []
+        # Audit round 18 fix: running sample counter eliminates the
+        # O(n²) ``sum(len(f) for f in self._audio_frames)`` walk that
+        # used to run on every audio callback (~10 Hz). At a 60 s
+        # max-record cap on a 48 kHz device, ~600 callbacks × ~300
+        # ``len()`` calls average = ~180 k per session — measurable
+        # cost on a stressed CPU, occasional dropped frame.
+        self._audio_sample_count: int = 0
         self._stream: Optional[Any] = None
         self._listener: Optional[Any] = None
         self._pressed_modifiers: set = set()
         self._record_start_time: float = 0.0
+        # Audit round 18 fix: ``_max_frames`` is computed in ``__init__``
+        # against the TARGET sample rate (16 kHz), but the audio
+        # callback runs at the NATIVE device rate (commonly 48 kHz).
+        # That made the cap fire at ~20 s instead of 60 s on a 48 kHz
+        # mic — the user got cut off three times early. Now we recompute
+        # ``_max_frames`` in ``_start_recording`` once the native rate
+        # is known. The init value here is a sane default for callers
+        # that never start a stream.
         self._max_frames = MAX_RECORD_SECONDS * sample_rate
         self._lock = threading.Lock()
         self._started = False
+        # Clipboard preservation (round 18 fix). Filled by
+        # ``_clipboard_paste`` before the write and restored after the
+        # OS-level paste keystroke completes, so a user who had
+        # important text on the clipboard does not silently lose it.
+        self._saved_clipboard: Optional[str] = None
 
         # Double-tap detection for hands-free mode
         self._last_hotkey_release_time: float = 0.0
@@ -862,9 +1028,41 @@ class DictationEngine:
 
         debug_log("dictation recording started", "dictation")
         self._audio_frames = []
+        # Reset the running sample counter at the start of every
+        # recording session (round 18 fix).
+        self._audio_sample_count = 0
         self._record_start_time = time.time()
+        # Audit round 21 fix (F29): prefetch the user's existing
+        # clipboard at recording-start (in a background thread) so
+        # the ``pbpaste`` subprocess cost (up to 2 s worst-case
+        # timeout if the clipboard service is stuck) happens
+        # DURING the user's recording window instead of AFTER it.
+        # Once the user releases the hotkey we have the snapshot
+        # already cached and can paste + restore with zero extra
+        # delay.
+        self._cached_clipboard_at_record_start: Optional[str] = None
+        self._cached_clipboard_ready = threading.Event()
+        def _prefetch_clipboard() -> None:
+            try:
+                self._cached_clipboard_at_record_start = _read_clipboard_text()
+            except Exception:
+                self._cached_clipboard_at_record_start = None
+            finally:
+                self._cached_clipboard_ready.set()
+        threading.Thread(
+            target=_prefetch_clipboard,
+            daemon=True,
+            name="dictation-clip-prefetch",
+        ).start()
 
-        # Notify listeners (face state, pause main listener)
+        # Notify listeners (face state, PAUSE main listener) — call
+        # this BEFORE opening the dedicated audio stream so the main
+        # listener's `_dictation_active` flag is True by the time the
+        # next mic frame fires. Audit round 8 regression find: the
+        # callback used to fire after the InputStream was opened,
+        # leaving a few ms where both the listener and the dictation
+        # engine were processing mic frames on the same device — on
+        # macOS Core Audio this can produce conflicting opens.
         if self._on_dictation_start:
             try:
                 self._on_dictation_start()
@@ -906,6 +1104,11 @@ class DictationEngine:
                     **stream_kwargs,
                 )
             self._stream_sample_rate = native_rate
+            # Audit round 18 fix: recompute the max-frames cap against
+            # the ACTUAL native rate. Without this, a 48 kHz mic
+            # tripped the cap (computed against 16 kHz target) at ~20 s
+            # instead of the documented 60 s.
+            self._max_frames = MAX_RECORD_SECONDS * native_rate
             if native_rate != self._target_sample_rate:
                 debug_log(f"dictation stream at native {native_rate} Hz (will resample to {self._target_sample_rate})", "dictation")
         except Exception as exc:
@@ -932,14 +1135,16 @@ class DictationEngine:
         # or one missed frame just after start — both benign.
         if not self._recording:
             return
-        # Enforce max duration
-        total_samples = sum(len(f) for f in self._audio_frames)
-        if total_samples >= self._max_frames:
+        # Audit round 18 fix: O(1) total-samples check via running
+        # counter instead of O(n) ``sum(len(f) ...)`` walk per callback.
+        if self._audio_sample_count >= self._max_frames:
             debug_log("max dictation duration reached (60s)", "dictation")
             # Schedule stop on a separate thread to avoid deadlock in callback
             threading.Thread(target=self._stop_recording, daemon=True).start()
             return
-        self._audio_frames.append(indata[:, 0].copy())
+        chunk = indata[:, 0].copy()
+        self._audio_frames.append(chunk)
+        self._audio_sample_count += len(chunk)
 
     def _stop_recording(self, discard: bool = False) -> None:
         # Flip state and snapshot the work queue atomically, under minimal
@@ -1055,7 +1260,19 @@ class DictationEngine:
             if text:
                 duration = len(audio) / self._target_sample_rate
                 debug_log(f"dictation result: {text!r}", "dictation")
-                _clipboard_paste(text)
+                # Audit round 21 fix (F29): use the snapshot taken at
+                # record-start in a background thread (see
+                # ``_start_recording``). If for some reason the prefetch
+                # didn't complete (unusual — recording is usually
+                # ≥500 ms long), fall back to reading now.
+                if (
+                    getattr(self, "_cached_clipboard_ready", None)
+                    and self._cached_clipboard_ready.wait(timeout=0.5)
+                ):
+                    previous_clip = self._cached_clipboard_at_record_start
+                else:
+                    previous_clip = _read_clipboard_text()
+                _clipboard_paste(text, restore_previous=previous_clip)
                 # Persist to history
                 entry = self.history.add(text, duration=duration)
                 if self._on_dictation_result:

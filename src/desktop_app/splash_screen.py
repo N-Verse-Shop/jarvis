@@ -43,67 +43,98 @@ class AnimatedOrb(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        """Draw the animated orb."""
+        """Draw the animated orb.
+
+        Audit round 21 fix (F09): wrap the body in ``try/finally``
+        with explicit ``painter.end()`` and a defensive
+        ``painter.restore()`` per saved state. The original code
+        leaked Qt painter state on any exception (theme key missing
+        in unit tests, font fallback failure, math overflow), and
+        Qt would print "QPainter::end: Painter ended with X saved
+        states" — the next paint then corrupted. Mirrors the
+        round-17 fix applied to face_widget.py.
+        """
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        save_depth = 0
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        center_x = self.width() / 2
-        center_y = self.height() / 2
+            center_x = self.width() / 2
+            center_y = self.height() / 2
 
-        # Colors from theme
-        accent = QColor(COLORS["accent_primary"])
-        accent_secondary = QColor(COLORS["accent_secondary"])
-        bg = QColor(COLORS["bg_primary"])
+            # Colors from theme
+            accent = QColor(COLORS["accent_primary"])
+            accent_secondary = QColor(COLORS["accent_secondary"])
+            bg = QColor(COLORS["bg_primary"])
 
-        # Draw outer glow
-        glow_radius = 50 + 5 * math.sin(self._pulse_phase)
-        glow = QRadialGradient(center_x, center_y, glow_radius)
-        glow_color = QColor(accent)
-        glow_color.setAlphaF(self._glow_intensity * 0.3)
-        glow.setColorAt(0, glow_color)
-        glow_color.setAlphaF(0)
-        glow.setColorAt(1, glow_color)
-        painter.setBrush(QBrush(glow))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QRectF(center_x - glow_radius, center_y - glow_radius,
-                                   glow_radius * 2, glow_radius * 2))
+            # Draw outer glow
+            glow_radius = 50 + 5 * math.sin(self._pulse_phase)
+            glow = QRadialGradient(center_x, center_y, glow_radius)
+            glow_color = QColor(accent)
+            glow_color.setAlphaF(self._glow_intensity * 0.3)
+            glow.setColorAt(0, glow_color)
+            glow_color.setAlphaF(0)
+            glow.setColorAt(1, glow_color)
+            painter.setBrush(QBrush(glow))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QRectF(center_x - glow_radius, center_y - glow_radius,
+                                       glow_radius * 2, glow_radius * 2))
 
-        # Draw core orb
-        core_radius = 25 + 3 * math.sin(self._pulse_phase)
-        core_gradient = QRadialGradient(center_x - 5, center_y - 5, core_radius * 1.5)
-        core_gradient.setColorAt(0, accent_secondary)
-        core_gradient.setColorAt(0.7, accent)
-        darker = QColor(COLORS["accent_muted"])
-        core_gradient.setColorAt(1, darker)
-        painter.setBrush(QBrush(core_gradient))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QRectF(center_x - core_radius, center_y - core_radius,
-                                   core_radius * 2, core_radius * 2))
+            # Draw core orb
+            core_radius = 25 + 3 * math.sin(self._pulse_phase)
+            core_gradient = QRadialGradient(center_x - 5, center_y - 5, core_radius * 1.5)
+            core_gradient.setColorAt(0, accent_secondary)
+            core_gradient.setColorAt(0.7, accent)
+            darker = QColor(COLORS["accent_muted"])
+            core_gradient.setColorAt(1, darker)
+            painter.setBrush(QBrush(core_gradient))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QRectF(center_x - core_radius, center_y - core_radius,
+                                       core_radius * 2, core_radius * 2))
 
-        # Draw rotating arcs
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        arc_pen = QPen(accent_secondary)
-        arc_pen.setWidth(3)
-        arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(arc_pen)
-
-        arc_rect = QRectF(center_x - 40, center_y - 40, 80, 80)
-
-        # Three arcs at different rotations
-        for i, offset in enumerate([0, 120, 240]):
-            painter.save()
-            painter.translate(center_x, center_y)
-            painter.rotate(self._rotation + offset)
-            painter.translate(-center_x, -center_y)
-
-            # Vary alpha for each arc
-            arc_color = QColor(accent_secondary)
-            arc_color.setAlphaF(0.6 + 0.2 * math.sin(self._pulse_phase + i))
-            arc_pen.setColor(arc_color)
+            # Draw rotating arcs
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            arc_pen = QPen(accent_secondary)
+            arc_pen.setWidth(3)
+            arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(arc_pen)
 
-            painter.drawArc(arc_rect, 0 * 16, 60 * 16)  # 60 degree arc
-            painter.restore()
+            arc_rect = QRectF(center_x - 40, center_y - 40, 80, 80)
+
+            # Three arcs at different rotations
+            for i, offset in enumerate([0, 120, 240]):
+                painter.save()
+                save_depth += 1
+                try:
+                    painter.translate(center_x, center_y)
+                    painter.rotate(self._rotation + offset)
+                    painter.translate(-center_x, -center_y)
+
+                    # Vary alpha for each arc
+                    arc_color = QColor(accent_secondary)
+                    arc_color.setAlphaF(0.6 + 0.2 * math.sin(self._pulse_phase + i))
+                    arc_pen.setColor(arc_color)
+                    painter.setPen(arc_pen)
+
+                    painter.drawArc(arc_rect, 0 * 16, 60 * 16)  # 60 degree arc
+                finally:
+                    painter.restore()
+                    save_depth -= 1
+        finally:
+            # Drain any saved states that an exception above
+            # bypassed, then end the painter explicitly. ``end()``
+            # is implicitly called on the painter's __del__ in
+            # CPython, but relying on GC for Qt is asking for
+            # leaks under PyPy / debug builds.
+            for _ in range(save_depth):
+                try:
+                    painter.restore()
+                except Exception:
+                    break
+            try:
+                painter.end()
+            except Exception:
+                pass
 
     def stop(self):
         """Stop the animation."""
@@ -177,19 +208,29 @@ class SplashScreen(QWidget):
             self.move(x, y)
 
     def paintEvent(self, event):
-        """Draw the splash background."""
+        """Draw the splash background.
+
+        Audit round 21 fix (F09): same try/finally + explicit
+        ``painter.end()`` pattern as the orb above.
+        """
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Semi-transparent dark background with rounded corners
-        bg_color = QColor(COLORS["bg_primary"])
-        bg_color.setAlphaF(0.95)
-        painter.setBrush(QBrush(bg_color))
+            # Semi-transparent dark background with rounded corners
+            bg_color = QColor(COLORS["bg_primary"])
+            bg_color.setAlphaF(0.95)
+            painter.setBrush(QBrush(bg_color))
 
-        border_color = QColor(COLORS["border"])
-        painter.setPen(QPen(border_color, 1))
+            border_color = QColor(COLORS["border"])
+            painter.setPen(QPen(border_color, 1))
 
-        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 16, 16)
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 16, 16)
+        finally:
+            try:
+                painter.end()
+            except Exception:
+                pass
 
     def set_status(self, status: str):
         """Update the status message."""

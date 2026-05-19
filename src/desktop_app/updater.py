@@ -194,17 +194,36 @@ def parse_version(tag: str) -> tuple[int, ...]:
     """Parse version string to tuple for comparison.
 
     Handles both 'v1.2.3' and 'latest' (develop) formats.
+
+    Audit round 14 fix: previously any non-pure-integer component
+    (``v1.2.3-rc1``, ``v1.2.3-beta.4``, ``v1.2.3+dirty``) hit
+    ``int(p)`` and the whole tag collapsed to ``(0, 0, 0)`` — i.e.
+    the upgrade machinery treated every RC tag as ancient and
+    "upgraded" the user back to whatever stable was newer. Strip
+    pre-release / build metadata before the int parse, and gracefully
+    skip components that still can't be parsed instead of nuking the
+    entire tuple.
     """
     if tag == "latest":
         return (0, 0, 0)
 
     version_str = tag.lstrip("v")
+    # Cut off pre-release ("-rc1", "-beta") and build metadata ("+sha").
+    for sep in ("-", "+"):
+        if sep in version_str:
+            version_str = version_str.split(sep, 1)[0]
 
-    try:
-        parts = version_str.split(".")
-        return tuple(int(p) for p in parts)
-    except ValueError:
+    parts: list[int] = []
+    for p in version_str.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            # Skip non-numeric trailing segments rather than zeroing
+            # the tuple — better partial answer than wrong ordering.
+            break
+    if not parts:
         return (0, 0, 0)
+    return tuple(parts)
 
 
 def _make_release_info(release: dict, asset: dict) -> ReleaseInfo:
@@ -581,7 +600,36 @@ def install_update_linux(download_path: Path) -> bool:
 
     try:
         with tarfile.open(download_path, "r:gz") as tf:
-            tf.extractall(temp_dir)
+            # Audit round 17 SECURITY fix: pass ``filter='data'`` to
+            # reject member names with ``..``, absolute paths, or
+            # special device files. Without this, a malicious release
+            # tarball can write arbitrary paths outside ``temp_dir``
+            # via crafted ``../`` member names — combined with the
+            # absence of a signature/hash check on the download itself,
+            # this is a complete remote-code-execution chain on Linux.
+            # Python 3.12+ supports the filter parameter natively;
+            # older runtimes fall back to a manual safe-path check.
+            try:
+                tf.extractall(temp_dir, filter="data")
+            except TypeError:
+                # Python < 3.12 — manual safety check on every member
+                # before extraction.
+                temp_resolved = temp_dir.resolve()
+                for member in tf.getmembers():
+                    member_path = (temp_dir / member.name).resolve()
+                    try:
+                        member_path.relative_to(temp_resolved)
+                    except ValueError:
+                        raise RuntimeError(
+                            f"Refused: tarball member tries to escape "
+                            f"extract dir: {member.name!r}"
+                        )
+                    if member.issym() or member.islnk():
+                        raise RuntimeError(
+                            f"Refused: tarball contains link member "
+                            f"{member.name!r} which is unsafe to extract."
+                        )
+                tf.extractall(temp_dir)
 
         new_app_dir = temp_dir / "Jarvis"
 

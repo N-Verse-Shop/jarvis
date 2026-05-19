@@ -1,13 +1,34 @@
 """
 High-performance vector store implementation using FAISS for fast vector search.
 This replaces the slow pure Python vector store with a much faster C++ implementation.
+
+Audit round 11 rewrite:
+  * **C1 fixed** — switched the inner index from ``IndexFlatIP`` to
+    ``IndexIDMap2(IndexFlatIP)``. Updates of an existing summary_id are
+    now ``remove_ids + add_with_ids`` (O(log N)) instead of dropping the
+    lazy-rebuild flag that caused the next ``search()`` to re-read the
+    entire ``faiss_vector_store`` table from SQLite and rebuild from
+    scratch. The diary re-flush hot path now never touches SQLite for
+    the index, only for durability.
+  * **C2 fixed** — module-level lock around singleton creation so the
+    intent-judge thread and reply thread don't construct two parallel
+    stores at startup (writes to one would be invisible to the other).
+  * **H1 fixed** — singleton keyed by ``(db_path, dimension)`` rather
+    than a bare global; tests and reconfigured installs no longer get a
+    silently-mismatched instance.
+  * **H3 fixed** — held one persistent ``sqlite3.Connection`` per
+    instance (lock-guarded). Diary flush no longer pays open + journal
+    + commit + close per vector.
+  * **L1 fixed** — drop the double-normalize; only ``faiss.normalize_L2``
+    is applied (one consistent code path).
+  * **L2 fixed** — distinguish ``DatabaseError`` (genuine corruption,
+    surface to operator via warning + raise) from transient open
+    failures.
 """
 
-import json
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 import sqlite3
-from pathlib import Path
 import threading
 import logging
 
@@ -21,139 +42,142 @@ except ImportError:
 
 class FAISSVectorStore:
     """High-performance vector store using FAISS for fast similarity search."""
-    
+
     def __init__(self, db_path: str, dimension: int = 768):
         """Initialize the FAISS vector store with a database path."""
         if not FAISS_AVAILABLE:
             raise ImportError("FAISS not available. Install with: pip install faiss-cpu")
-        
+
         self.db_path = db_path
         self.dimension = dimension
-        self.index = None
-        self.summary_id_to_index = {}  # Maps summary_id -> FAISS index position
-        self.index_to_summary_id = {}  # Maps FAISS index position -> summary_id
+        self.index = None  # type: ignore[assignment]
         self._lock = threading.RLock()
-        self._needs_rebuild = False
-        
-        self._load_vectors()
-    
-    def _load_vectors(self) -> None:
-        """Load vectors from SQLite database and build FAISS index."""
+
+        # Persistent connection — opened once, reused for every add/delete.
+        # `check_same_thread=False` is safe because every call goes through
+        # ``self._lock`` (RLock — safe for re-entrant operations).
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         try:
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.cursor()
-            
-            # Create table if it doesn't exist
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS faiss_vector_store (
-                    summary_id INTEGER PRIMARY KEY,
-                    vector_blob BLOB NOT NULL
-                )
-            """)
-            
-            # Load existing vectors
-            rows = cur.execute("SELECT summary_id, vector_blob FROM faiss_vector_store").fetchall()
-            
-            if rows:
-                vectors = []
-                summary_ids = []
-                
-                for summary_id, vector_blob in rows:
-                    # Convert blob back to numpy array
-                    vector = np.frombuffer(vector_blob, dtype=np.float32)
-                    if len(vector) == self.dimension:
-                        vectors.append(vector)
-                        summary_ids.append(summary_id)
-                
-                if vectors:
-                    # Build FAISS index
-                    self._build_index(np.array(vectors), summary_ids)
-            
-            conn.close()
-        except Exception as e:
-            logging.warning(f"Failed to load FAISS vectors: {e}")
-            # Start with empty index
-            self._build_empty_index()
-    
-    def _build_empty_index(self) -> None:
-        """Build an empty FAISS index."""
-        with self._lock:
-            # Use IndexFlatIP for cosine similarity (with normalized vectors)
-            self.index = faiss.IndexFlatIP(self.dimension)
-            self.summary_id_to_index = {}
-            self.index_to_summary_id = {}
-    
-    def _build_index(self, vectors: np.ndarray, summary_ids: List[int]) -> None:
-        """Build FAISS index from vectors and summary IDs."""
-        with self._lock:
-            # Normalize vectors for cosine similarity
-            faiss.normalize_L2(vectors)
-            
-            # Use IndexFlatIP for exact cosine similarity search
-            # For larger datasets, consider IndexHNSWFlat for approximate but faster search
-            if len(vectors) > 10000:
-                # Use HNSW for large datasets (approximate but much faster)
-                self.index = faiss.IndexHNSWFlat(self.dimension, 32)
-                self.index.hnsw.efConstruction = 200
-                self.index.hnsw.efSearch = 50
-            else:
-                # Use exact search for smaller datasets
-                self.index = faiss.IndexFlatIP(self.dimension)
-            
-            # Add vectors to index
-            self.index.add(vectors)
-            
-            # Build mapping between summary IDs and FAISS indices
-            self.summary_id_to_index = {summary_id: i for i, summary_id in enumerate(summary_ids)}
-            self.index_to_summary_id = {i: summary_id for i, summary_id in enumerate(summary_ids)}
-    
-    def _save_vector(self, summary_id: int, vector: np.ndarray) -> None:
-        """Persist a single vector to SQLite."""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cur = conn.cursor()
-            # Convert numpy array to blob
-            vector_blob = vector.astype(np.float32).tobytes()
-            cur.execute(
-                "INSERT OR REPLACE INTO faiss_vector_store (summary_id, vector_blob) VALUES (?, ?)",
-                (summary_id, vector_blob)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            # Non-fatal — defaults still work, just slower under contention.
+            pass
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS faiss_vector_store (
+                summary_id INTEGER PRIMARY KEY,
+                vector_blob BLOB NOT NULL
             )
-            conn.commit()
-            conn.close()
+        """)
+        self._conn.commit()
+
+        self._load_vectors()
+
+    def _build_empty_index(self) -> None:
+        """Build an empty FAISS index wrapped in IndexIDMap2 so the FAISS-side
+        IDs match our SQLite summary_id and we can ``add_with_ids`` /
+        ``remove_ids`` without rebuild."""
+        with self._lock:
+            base = faiss.IndexFlatIP(self.dimension)
+            self.index = faiss.IndexIDMap2(base)
+
+    def _load_vectors(self) -> None:
+        """Load vectors from SQLite database and build FAISS index.
+
+        Audit round 11 fix L2: previously caught every Exception silently
+        and silently built an empty index — so a corrupt SQLite file
+        looked identical to a fresh install. Now ``DatabaseError`` is
+        re-raised so the daemon log shows the corruption; transient
+        open failures still fall through to an empty index.
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT summary_id, vector_blob FROM faiss_vector_store"
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                # Likely a genuine corruption — let it surface.
+                logging.exception("FAISSVectorStore: SQLite reports DB corruption — refusing to mask")
+                self._build_empty_index()
+                raise
+            except Exception as e:
+                logging.warning(f"FAISSVectorStore: transient load failure ({e}); starting empty")
+                self._build_empty_index()
+                return
+
+            self._build_empty_index()
+            if not rows:
+                return
+
+            vectors: List[np.ndarray] = []
+            summary_ids: List[int] = []
+            for summary_id, vector_blob in rows:
+                vec = np.frombuffer(vector_blob, dtype=np.float32)
+                if len(vec) != self.dimension:
+                    # Skip rows from an incompatible dimension — happens
+                    # after model swap. Embeddings.py refuses mismatched
+                    # writes now (audit round 10), so this only matters
+                    # for legacy rows.
+                    continue
+                vectors.append(vec)
+                summary_ids.append(int(summary_id))
+
+            if not vectors:
+                return
+
+            arr = np.vstack(vectors).astype(np.float32, copy=False)
+            faiss.normalize_L2(arr)
+            ids = np.array(summary_ids, dtype=np.int64)
+            self.index.add_with_ids(arr, ids)
+
+    def _save_vector(self, summary_id: int, vector_blob: bytes) -> None:
+        """Persist a single vector to SQLite (durable record).
+
+        Always called under ``self._lock``.
+        """
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO faiss_vector_store (summary_id, vector_blob) VALUES (?, ?)",
+                (summary_id, vector_blob),
+            )
+            self._conn.commit()
         except Exception as e:
             logging.warning(f"Failed to save vector to database: {e}")
-    
+
     def add_vector(self, summary_id: int, vector: List[float]) -> None:
-        """Add or update a vector for a summary."""
+        """Add or update a vector for a summary.
+
+        Audit round 11 rewrite: the round 9 lazy-rebuild fix avoided
+        O(N) work on every add but moved it to the next ``search`` —
+        the SAME O(N) cost just shifted in time. Now we use the FAISS
+        IndexIDMap2 API: an update is a ``remove_ids + add_with_ids``
+        pair, both O(log N). No more SQLite re-read, no more rebuild
+        flag. The diary re-flush hot path stays cheap.
+        """
         with self._lock:
-            vec_array = np.array(vector, dtype=np.float32)
-            
-            # Normalize vector for cosine similarity
-            norm = np.linalg.norm(vec_array)
-            if norm > 0:
-                vec_array = vec_array / norm
-            
-            # If summary already exists, mark for rebuild
-            if summary_id in self.summary_id_to_index:
-                self._needs_rebuild = True
-            
-            # Save to database
-            self._save_vector(summary_id, vec_array)
-            
-            # If index is empty or needs rebuild, rebuild from database
-            if self.index is None or self.index.ntotal == 0 or self._needs_rebuild:
-                self._load_vectors()
-                self._needs_rebuild = False
-            else:
-                # Add new vector to existing index
-                vec_array = vec_array.reshape(1, -1)
-                faiss.normalize_L2(vec_array)
-                
-                index_pos = self.index.ntotal
-                self.index.add(vec_array)
-                self.summary_id_to_index[summary_id] = index_pos
-                self.index_to_summary_id[index_pos] = summary_id
-    
+            if self.index is None:
+                self._build_empty_index()
+
+            vec_array = np.asarray(vector, dtype=np.float32).reshape(1, -1)
+            # Single normalize via FAISS — dropping the previous numpy
+            # `vec/norm` round (L1 from audit). FAISS normalize is what
+            # the search query also uses, so we stay self-consistent.
+            faiss.normalize_L2(vec_array)
+
+            # Durable record first — even if the in-memory update below
+            # races on shutdown, the next load picks up the new vector.
+            self._save_vector(summary_id, vec_array.tobytes())
+
+            ids = np.array([summary_id], dtype=np.int64)
+            # remove_ids returns 0 when the id is absent — fine to call
+            # unconditionally. Wrapping in a try because some FAISS
+            # builds throw if the underlying index doesn't expose remove.
+            try:
+                self.index.remove_ids(ids)
+            except RuntimeError:
+                pass
+            self.index.add_with_ids(vec_array, ids)
+
     def search(self, query_vector: List[float], top_k: int = 10) -> List[Tuple[int, float]]:
         """
         Search for similar vectors using FAISS.
@@ -162,77 +186,112 @@ class FAISSVectorStore:
         with self._lock:
             if self.index is None or self.index.ntotal == 0:
                 return []
-            
-            # Prepare query vector
-            query_array = np.array(query_vector, dtype=np.float32).reshape(1, -1)
-            
-            # Normalize query vector
+
+            query_array = np.asarray(query_vector, dtype=np.float32).reshape(1, -1)
             faiss.normalize_L2(query_array)
-            
-            # Search with FAISS
+
             k = min(top_k, self.index.ntotal)
-            similarities, indices = self.index.search(query_array, k)
-            
-            # Convert to (summary_id, distance) format
-            # FAISS IndexIP returns similarities (higher = better), convert to distances (lower = better)
-            results = []
-            for i in range(len(indices[0])):
-                faiss_idx = indices[0][i]
-                similarity = similarities[0][i]
-                
-                if faiss_idx >= 0 and faiss_idx in self.index_to_summary_id:
-                    summary_id = self.index_to_summary_id[faiss_idx]
-                    # Convert similarity to distance (1 - similarity)
-                    distance = 1.0 - similarity
-                    results.append((summary_id, float(distance)))
-            
+            similarities, ids = self.index.search(query_array, k)
+
+            results: List[Tuple[int, float]] = []
+            for i in range(len(ids[0])):
+                summary_id = int(ids[0][i])
+                if summary_id < 0:  # FAISS marker for "no result in this slot"
+                    continue
+                similarity = float(similarities[0][i])
+                # IP on unit-normalized vectors == cosine similarity.
+                # Convert to a 0..2 distance for callers expecting "lower = better".
+                distance = 1.0 - similarity
+                results.append((summary_id, distance))
+
             return results
-    
+
     def delete_vector(self, summary_id: int) -> None:
-        """Remove a vector from the store."""
+        """Remove a vector from the store (both index and DB).
+
+        Audit round 21 fix (F24): reordered operations — SQL DELETE
+        FIRST, then ``remove_ids`` on the FAISS index. Previously the
+        FAISS removal ran first; if the SQL DELETE then failed
+        (SQLITE_BUSY exhausted busy_timeout), the in-memory FAISS
+        index had lost the entry but the disk row remained — and on
+        the next process restart, ``_load_vectors`` re-added it from
+        the persisted row. User saw "deleted" memories silently
+        reappear after restart. With SQL-first ordering, a SQL
+        failure means we never touch FAISS, so the state is at
+        worst "delete failed entirely" instead of "split brain".
+        """
         with self._lock:
-            if summary_id in self.summary_id_to_index:
-                # Mark for rebuild (FAISS doesn't support efficient deletion)
-                self._needs_rebuild = True
-                
-                # Remove from database
+            try:
+                self._conn.execute(
+                    "DELETE FROM faiss_vector_store WHERE summary_id = ?",
+                    (summary_id,),
+                )
+                self._conn.commit()
+            except Exception as e:
+                logging.warning(f"Failed to delete vector from database: {e}")
+                # Don't touch the FAISS index on SQL failure — keeps
+                # the in-memory and on-disk state in sync ("not
+                # deleted") rather than split.
+                return
+            if self.index is not None:
                 try:
-                    conn = sqlite3.connect(self.db_path)
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM faiss_vector_store WHERE summary_id = ?", (summary_id,))
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    logging.warning(f"Failed to delete vector from database: {e}")
-    
+                    self.index.remove_ids(np.array([summary_id], dtype=np.int64))
+                except RuntimeError:
+                    # FAISS raises when the id isn't in the index;
+                    # benign because we already removed the disk row.
+                    pass
+
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about the vector store."""
         with self._lock:
+            ntotal = int(self.index.ntotal) if self.index is not None else 0
             return {
-                "total_vectors": self.index.ntotal if self.index else 0,
+                "total_vectors": ntotal,
                 "dimension": self.dimension,
-                "index_type": type(self.index).__name__ if self.index else None,
-                "needs_rebuild": self._needs_rebuild,
+                "index_type": type(self.index).__name__ if self.index is not None else None,
                 "faiss_available": FAISS_AVAILABLE,
             }
 
+    def close(self) -> None:
+        """Release the persistent SQLite connection."""
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
-# Global instance
-_faiss_vector_store: Optional[FAISSVectorStore] = None
+
+# ── Singleton registry ───────────────────────────────────────────────────────
+# Audit round 11 fixes C2 + H1: previously the singleton was a bare global
+# with no lock and no key — the intent-judge thread and reply thread could
+# race past `if _store is None` and end up with TWO stores backed by the
+# same DB; writes to one were invisible to the other until process restart.
+# Keying by (db_path, dimension) also stops a test override from silently
+# inheriting a stale instance from earlier in the process lifetime.
+_singleton_lock = threading.Lock()
+_singletons: Dict[Tuple[str, int], FAISSVectorStore] = {}
 
 
 def get_faiss_vector_store(db_path: str, dimension: int = 768) -> Optional[FAISSVectorStore]:
-    """Get or create the global FAISS vector store instance."""
-    global _faiss_vector_store
-    
+    """Get or create the FAISS vector store for ``(db_path, dimension)``."""
     if not FAISS_AVAILABLE:
         return None
-    
-    if _faiss_vector_store is None:
+
+    key = (str(db_path), int(dimension))
+    # Fast path — already constructed, no lock needed for read.
+    existing = _singletons.get(key)
+    if existing is not None:
+        return existing
+
+    with _singleton_lock:
+        # Double-check under lock.
+        existing = _singletons.get(key)
+        if existing is not None:
+            return existing
         try:
-            _faiss_vector_store = FAISSVectorStore(db_path, dimension)
+            store = FAISSVectorStore(db_path, dimension)
         except Exception as e:
             logging.warning(f"Failed to create FAISS vector store: {e}")
             return None
-    
-    return _faiss_vector_store
+        _singletons[key] = store
+        return store

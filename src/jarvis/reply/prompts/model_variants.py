@@ -5,6 +5,7 @@ Small models (1b, 3b, 7b) need explicit guidance on when NOT to use tools,
 while larger models can infer this from context.
 """
 
+import re
 from enum import Enum
 from typing import Optional
 
@@ -18,26 +19,42 @@ from .system import (
 
 class ModelSize(Enum):
     """Classification of model sizes for prompt selection."""
-    SMALL = "small"  # 1b, 3b, 7b - needs explicit tool constraints
-    LARGE = "large"  # 8b+ - can infer tool usage from context
+    SMALL = "small"  # ≤9b - needs explicit tool constraints
+    LARGE = "large"  # >9b - can infer tool usage from context
 
 
-# Model size patterns - models matching these are considered SMALL
-# SMALL means: needs explicit tool constraints AND must use text-based
-# tool descriptions (in system prompt) rather than native tools API.
-# Add 8b/9b/gemma2/aya here because:
-#  - gemma2:9b doesn't support Ollama's native /api/chat tools= param
-#  - aya:8b same — multilingual but no native tool API
-#  - All ≤9B models benefit from explicit text-based tool guidance
-_SMALL_MODEL_PATTERNS = (
-    ":1b", ":3b", ":7b", ":8b", ":9b",
-    "-1b", "-3b", "-7b", "-8b", "-9b",
-    "_1b", "_3b", "_7b", "_8b", "_9b",
-    "gemma4",   # Gemma 4 - always small regardless of tag
-    "gemma2",   # Gemma 2 - no native tools API
-    "aya",      # Cohere Aya - no native tools API
-    "mistral-nemo",  # 12B but uses text tools more reliably than native
+# Audit round 10 fix: the old enumeration only listed integer billion
+# sizes (1b/3b/7b/8b/9b). Modern Ollama tags routinely use decimals
+# (qwen2.5:0.5b, :1.5b, llama3.2:3.2b, phi3:3.8b) and even-integer
+# sizes (gemma2:2b, qwen3:4b, ibm-granite:6b). Every miss promoted a
+# tiny model to the LARGE prompt branch — which sends `tools=` over
+# Ollama native API even though the model doesn't support it, and
+# skips the repeated text constraints small models need. Net effect:
+# false refusals + raw tool-protocol leakage at the user.
+#
+# Now a regex captures any size ≤ 9b with optional decimal. The
+# ordering matters — we check substrings first (fast path for the
+# old names that other code may grep for) then fall through to the
+# numeric matcher.
+_SMALL_MODEL_NAME_HINTS = (
+    "gemma4",         # Gemma 4 - always small regardless of tag
+    "gemma2",         # Gemma 2 - no native tools API
+    "aya",            # Cohere Aya - no native tools API
+    "mistral-nemo",   # 12B but uses text tools more reliably than native
+    "tinyllama",      # 1.1B
+    "phi3",           # phi3 family — mini variants are small
+    "phi-3",
+    "smollm",         # small-by-design
 )
+
+# Match a token like ":1.5b" / "-3b" / "_8b" / ":9.0b". Numeric part is
+# captured for size comparison. Word boundary handled by the leading
+# separator class.
+_SIZE_TOKEN_RE = re.compile(r"[:_\-](\d+(?:\.\d+)?)\s*b\b")
+
+# Models AT OR BELOW this size are considered SMALL. Bumped to 9 to
+# cover the prior :8b/:9b enumeration; 10b+ falls to LARGE.
+_SMALL_MAX_BILLIONS = 9.0
 
 
 def detect_model_size(model_name: Optional[str]) -> ModelSize:
@@ -48,16 +65,27 @@ def detect_model_size(model_name: Optional[str]) -> ModelSize:
         model_name: Ollama model name (e.g., "gemma4", "gpt-oss:20b")
 
     Returns:
-        ModelSize.SMALL for 1b/3b/7b models, ModelSize.LARGE otherwise
+        ModelSize.SMALL for ≤9b models (including decimals like 0.5b,
+        1.5b, 3.8b), ModelSize.LARGE otherwise.
     """
     if not model_name:
         return ModelSize.LARGE  # Default to large for safety
 
     name_lower = model_name.lower()
 
-    for pattern in _SMALL_MODEL_PATTERNS:
-        if pattern in name_lower:
+    # Family hints first — cheap substring check, and keeps the audit
+    # trail of which families are forced-small regardless of tag.
+    for hint in _SMALL_MODEL_NAME_HINTS:
+        if hint in name_lower:
             return ModelSize.SMALL
+
+    # Numeric size matcher — picks up :1b, :1.5b, :3.8b, -2b, _4b, etc.
+    # If the model tag has multiple size-like tokens (rare), pick the
+    # LARGEST so a "8b-instruct-q4_K_M" doesn't get misread by the q4
+    # quant suffix happening to contain a number.
+    sizes = [float(m.group(1)) for m in _SIZE_TOKEN_RE.finditer(name_lower)]
+    if sizes and max(sizes) <= _SMALL_MAX_BILLIONS:
+        return ModelSize.SMALL
 
     return ModelSize.LARGE
 

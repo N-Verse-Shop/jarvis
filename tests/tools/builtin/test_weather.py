@@ -115,7 +115,7 @@ class TestWeatherTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "could not find" in result.reply_text.lower()
+        assert "could not find" in result.error_message.lower()
 
     @patch('src.jarvis.tools.builtin.weather.get_location_info')
     def test_run_empty_location_uses_fallback(self, mock_location):
@@ -128,7 +128,7 @@ class TestWeatherTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert result.reply_text and any(kw in result.reply_text.lower() for kw in ("location", "city"))
+        assert result.error_message and any(kw in result.error_message.lower() for kw in ("location", "city"))
 
     @patch('src.jarvis.tools.builtin.weather.get_location_info')
     def test_run_none_location_uses_fallback(self, mock_location):
@@ -143,7 +143,7 @@ class TestWeatherTool:
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
         # Should use fallback, not geocode the string "None"
-        assert result.reply_text and any(kw in result.reply_text.lower() for kw in ("location", "city"))
+        assert result.error_message and any(kw in result.error_message.lower() for kw in ("location", "city"))
         # Verify location detection was called (fallback was attempted)
         mock_location.assert_called_once()
 
@@ -157,7 +157,7 @@ class TestWeatherTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert result.reply_text and any(kw in result.reply_text.lower() for kw in ("location", "city"))
+        assert result.error_message and any(kw in result.error_message.lower() for kw in ("location", "city"))
 
     @patch('requests.get')
     @patch('src.jarvis.tools.builtin.weather.get_location_info')
@@ -272,8 +272,8 @@ class TestWeatherTool:
         result = self.tool.run({}, self.context)
 
         assert result.success is False
-        assert result.reply_text and any(
-            kw in result.reply_text.lower() for kw in ("location", "city")
+        assert result.error_message and any(
+            kw in result.error_message.lower() for kw in ("location", "city")
         )
 
     @patch('requests.get')
@@ -286,7 +286,7 @@ class TestWeatherTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "timeout" in result.reply_text.lower() or "taking too long" in result.reply_text.lower()
+        assert "timeout" in result.error_message.lower() or "taking too long" in result.error_message.lower()
 
     @patch('requests.get')
     def test_run_network_error(self, mock_get):
@@ -298,7 +298,7 @@ class TestWeatherTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert "unavailable" in result.reply_text.lower()
+        assert "unavailable" in result.error_message.lower()
 
     def test_wmo_codes_coverage(self):
         """Test that WMO codes dictionary has expected entries."""

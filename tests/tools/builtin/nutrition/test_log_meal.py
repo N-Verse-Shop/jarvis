@@ -88,7 +88,7 @@ class TestLogMealTool:
 
         assert isinstance(result, ToolExecutionResult)
         assert result.success is False
-        assert result.reply_text == "Failed to log meal"
+        assert result.error_message == "Failed to log meal"
 
     def test_run_returns_friendly_failure_when_both_meal_and_redacted_empty(self):
         """If neither the 'meal' arg nor context.redacted_text carries any
@@ -101,7 +101,7 @@ class TestLogMealTool:
             result = self.tool.run({"meal": "  "}, self.context)
 
         assert result.success is False
-        assert result.reply_text == "No meal description provided"
+        assert result.error_message == "No meal description provided"
         mock_extract.assert_not_called()
 
     def test_run_treats_none_redacted_text_as_empty(self):
@@ -114,7 +114,7 @@ class TestLogMealTool:
             result = self.tool.run(None, self.context)
 
         assert result.success is False
-        assert result.reply_text == "No meal description provided"
+        assert result.error_message == "No meal description provided"
         mock_extract.assert_not_called()
 
 

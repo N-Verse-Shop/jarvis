@@ -76,7 +76,27 @@ def check_ollama_endpoint() -> tuple[str, str, str]:
 def check_ollama_models() -> tuple[str, str, str]:
     """Required models present on Ollama server."""
     url = os.environ.get("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-    required = ["gemma2:9b", "qwen2.5:3b"]
+    # Audit round 14 fix: this hardcoded ``gemma2:9b`` drifted off the
+    # actual default (``qwen3:8b`` for chat, ``qwen2.5:3b`` for intent
+    # judge) and meant ``jarvis doctor`` would report "missing" for a
+    # perfectly working install. Read from settings so the check
+    # tracks whatever the user has configured.
+    try:
+        from .config import load_settings as _load_settings
+        _cfg = _load_settings()
+        required = [
+            getattr(_cfg, "ollama_chat_model", "qwen3:8b"),
+            getattr(_cfg, "intent_judge_model", "qwen2.5:3b")
+                or getattr(_cfg, "ollama_chat_model", "qwen3:8b"),
+        ]
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        required = [m for m in required if m and not (m in seen or seen.add(m))]
+    except Exception:
+        # If config load fails (very early boot, malformed JSON),
+        # fall back to the historic doctor list so the check still
+        # tells the user *something*.
+        required = ["qwen3:8b", "qwen2.5:3b"]
     try:
         with urllib.request.urlopen(f"{url}/api/tags", timeout=5) as r:
             import json

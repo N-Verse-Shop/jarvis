@@ -86,14 +86,37 @@ def _resolve_command(command: str) -> str:
     if _sys.platform != "win32":
         try:
             import subprocess
+            import os as _os
             shell = _get_user_shell()
             # Quote the command so shell metacharacters in a misconfigured
             # ``mcps[*].command`` cannot inject extra commands into the
             # login shell. Defensive — config is user-owned, but keeping
             # the value safe for any path that touches a shell is cheap.
+            #
+            # Audit round 16 fix: pass a STRIPPED env to the login-shell
+            # ``which`` call. ``-lc`` sources the user's rc files; if
+            # those rc files print env on entry (some setups dump env
+            # for debugging), or zsh's ``extended_history`` captures the
+            # invocation line, the FULL parent env (including
+            # ``JARVIS_*_TOKEN``, ``OPENAI_API_KEY``, ``ANTHROPIC_KEY``
+            # etc.) leaks into the shell history file. The ``which``
+            # subprocess only needs ``PATH`` and ``HOME``; everything
+            # else is pure attack surface.
+            stripped_env = {
+                "PATH": _os.environ.get("PATH", ""),
+                "HOME": _os.environ.get("HOME", ""),
+                # SHELL is needed for some rc files that branch on it
+                # without ever printing/logging.
+                "SHELL": shell,
+                # LANG keeps `which`'s diagnostics in the user's locale
+                # (some macOS rc setups treat missing LANG as POSIX and
+                # change which's behaviour).
+                "LANG": _os.environ.get("LANG", "C.UTF-8"),
+            }
             result = subprocess.run(
                 [shell, "-lc", f"which {_shlex.quote(command)}"],
                 capture_output=True, text=True, timeout=5,
+                env=stripped_env,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
@@ -168,12 +191,25 @@ class MCPClient:
         # replaces (not merges) the parent env when env is not None.
         cmd_dir = os.path.dirname(command)
         current_path = os.environ.get("PATH", "")
+        # Audit round 20 SECURITY P1 fix: every MCP subprocess used to
+        # inherit the daemon's FULL env via ``{**os.environ, ...}``,
+        # so every third-party npm/pip MCP saw OPENAI_API_KEY,
+        # ANTHROPIC_API_KEY, JARVIS_*_TOKEN, JARVIS_GITLAB_TOKEN,
+        # BRAVE_SEARCH_API_KEY, etc. A compromised or curious MCP
+        # could read ``os.environ`` from its own process and exfil
+        # every credential the daemon holds. Now: scrub the parent
+        # env BEFORE merging in the per-server ``user_env`` (which
+        # explicitly supplies the credentials THIS MCP actually
+        # needs). Net: each MCP only sees what the user listed plus
+        # non-secret base env (PATH, HOME, LANG, LC_*, etc.).
+        from ...utils.env_scrub import scrub_secret_env
+        scrubbed_parent = scrub_secret_env()
         if cmd_dir and cmd_dir not in current_path.split(os.pathsep):
-            env = {**os.environ, **user_env, "PATH": cmd_dir + os.pathsep + current_path}
+            env = {**scrubbed_parent, **user_env, "PATH": cmd_dir + os.pathsep + current_path}
         elif user_env:
-            env = {**os.environ, **user_env}
+            env = {**scrubbed_parent, **user_env}
         else:
-            env = None  # inherit parent env as-is
+            env = scrubbed_parent  # still scrubbed even when no user_env
         params = StdioServerParameters(command=command, args=args, env=env)
         # Suppress MCP server stderr noise (npm warnings, usage banners, etc.)
         # from polluting the daemon's log output.

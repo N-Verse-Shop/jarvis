@@ -185,7 +185,14 @@ def test_fetch_web_page_success(monkeypatch):
     """Test fetchWebPage tool with a mocked successful response."""
     import jarvis.tools.registry as tools_mod
     
-    # Mock a successful HTTP response
+    # Mock a successful HTTP response.
+    #
+    # Audit round 19 fix: the production tool was hardened in round 17
+    # to stream the body via ``iter_content`` (so a 1 GB response can
+    # be truncated without OOM) and to pre-check ``Content-Length``
+    # before reading. The mock must therefore expose ``headers``,
+    # ``iter_content``, ``encoding`` and ``apparent_encoding`` for the
+    # tool to consume it.
     class MockResponse:
         def __init__(self):
             self.status_code = 200
@@ -200,9 +207,21 @@ def test_fetch_web_page_success(monkeypatch):
             </html>
             '''
             self.text = self.content.decode()
-        
+            self.encoding = "utf-8"
+            self.apparent_encoding = "utf-8"
+            self.headers = {
+                "Content-Length": str(len(self.content)),
+                "Content-Type": "text/html; charset=utf-8",
+            }
+
         def raise_for_status(self):
             pass
+
+        def iter_content(self, chunk_size=8192, decode_unicode=False):
+            # Yield the whole body in one chunk — small enough that the
+            # truncation guard in the production tool is never hit.
+            payload = self.text if decode_unicode else self.content
+            yield payload
 
         # The production tool wraps the response in ``with requests.get(...)``
         # so the connection is released deterministically — mirror that here.
@@ -213,6 +232,8 @@ def test_fetch_web_page_success(monkeypatch):
             return False
 
     def mock_requests_get(url, **kwargs):
+        # Round 17 hardening: the production call passes stream=True
+        # plus a timeout; we accept and ignore kwargs.
         return MockResponse()
     
     monkeypatch.setattr(tools_mod.requests, 'get', mock_requests_get)
@@ -256,4 +277,8 @@ def test_fetch_web_page_missing_url():
     
     assert isinstance(res, ToolExecutionResult)
     assert res.success is False
-    assert "url" in (res.reply_text or "").lower()
+    # Audit round 12 + 13 update: the ToolExecutionResult contract now
+    # routes failure messages through `error_message` (auto-migrated
+    # from legacy `reply_text=err` shape). Read via `error_text` which
+    # falls back to the legacy field for backward compat.
+    assert "url" in (res.error_text or "").lower()

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import socket
 import ipaddress
 from pathlib import Path
@@ -131,8 +132,14 @@ def _persist_disk_caches(location_cache_minutes: int = 60) -> None:
             now = datetime.now(timezone.utc).isoformat()
             for ip, data in _location_cache.items():
                 loc_out[ip] = {"data": data, "ts": now, "ttl": int(location_cache_minutes)}
-            with _LOCATION_CACHE_FILE.open("w", encoding="utf-8") as f:
+            # Audit round 9 fix #7: write to .tmp then atomic rename
+            # so a crash mid-write doesn't leave a partial/empty
+            # cache file (which the reader silently ignores → loses
+            # the cache for an hour).
+            _tmp = _LOCATION_CACHE_FILE.with_suffix(".json.tmp")
+            with _tmp.open("w", encoding="utf-8") as f:
                 json.dump(loc_out, f)
+            os.replace(_tmp, _LOCATION_CACHE_FILE)
         except Exception:
             pass
         # CGNAT cache
@@ -140,8 +147,10 @@ def _persist_disk_caches(location_cache_minutes: int = 60) -> None:
             cgnat_out = {}
             for ip, (ts, resolved) in _cgnat_resolution_cache.items():
                 cgnat_out[ip] = {"ts": ts.isoformat(), "resolved": resolved}
-            with _CGNAT_CACHE_FILE.open("w", encoding="utf-8") as f:
+            _tmp = _CGNAT_CACHE_FILE.with_suffix(".json.tmp")
+            with _tmp.open("w", encoding="utf-8") as f:
                 json.dump(cgnat_out, f)
+            os.replace(_tmp, _CGNAT_CACHE_FILE)
         except Exception:
             pass
 
@@ -459,27 +468,33 @@ def get_location_info(
                 debug_log(f"CGNAT IP {ip_address} resolved to public {resolved} via OpenDNS", "location")
                 ip_address = resolved
 
-    # Return cached location result if we already computed for this final ip_address
-    if ip_address in _location_cache:
-        cached = _location_cache[ip_address]
-        # Negative results (errors) expire after location_cache_minutes so DB updates can take effect
-        if "error" in cached:
-            cached_at = cached.get("_cached_at")
-            if cached_at and datetime.now(timezone.utc) - cached_at > timedelta(minutes=location_cache_minutes):
-                with _cache_lock:
+    # Audit round 13 fix: the entire lookup MUST hold ``_cache_lock``.
+    # Writers elsewhere in this file hold it; readers used to slip
+    # through without — a concurrent dict mutation during the
+    # `in _location_cache` containment check could raise
+    # ``RuntimeError: dictionary changed size during iteration`` or
+    # return a torn read of `cached`. Critical section is short
+    # (just a dict lookup + copy) so contention is negligible.
+    with _cache_lock:
+        if ip_address in _location_cache:
+            cached = _location_cache[ip_address]
+            # Negative results (errors) expire after location_cache_minutes so DB updates can take effect
+            if "error" in cached:
+                cached_at = cached.get("_cached_at")
+                if cached_at and datetime.now(timezone.utc) - cached_at > timedelta(minutes=location_cache_minutes):
                     _location_cache.pop(ip_address, None)
+                else:
+                    # Ensure we always include ip key even if older cache missing it
+                    if 'ip' not in cached:
+                        cached['ip'] = ip_address
+                    result = cached.copy()
+                    result.pop("_cached_at", None)
+                    return result
             else:
                 # Ensure we always include ip key even if older cache missing it
                 if 'ip' not in cached:
                     cached['ip'] = ip_address
-                result = cached.copy()
-                result.pop("_cached_at", None)
-                return result
-        else:
-            # Ensure we always include ip key even if older cache missing it
-            if 'ip' not in cached:
-                cached['ip'] = ip_address
-            return cached.copy()
+                return cached.copy()
 
     # Check if database is available
     db_path = _get_database_path()
@@ -507,9 +522,18 @@ def get_location_info(
             # Clean up None values and empty strings
             cleaned_info = {k: v for k, v in location_info.items() if v is not None and v != ""}
             debug_log(f"Location detected: {cleaned_info.get('city', 'Unknown city')}, {cleaned_info.get('country', 'Unknown country')}", "location")
-            # Cache successful lookup
-            _location_cache[ip_address] = cleaned_info.copy()
-            _persist_disk_caches(location_cache_minutes)
+            # Cache successful lookup.
+            # Audit round 19 fix: round 13 protected the READ side with
+            # ``_cache_lock`` but the WRITE sites here were doing bare
+            # ``_location_cache[ip_address] = ...`` and ``_persist_disk_caches``
+            # OUTSIDE any lock. A concurrent reader between the write
+            # and the persist call saw a partially-mutated dict — same
+            # ``RuntimeError: dictionary changed size during iteration``
+            # the read-side fix was meant to prevent. Re-acquire the
+            # lock around every mutation+persist.
+            with _cache_lock:
+                _location_cache[ip_address] = cleaned_info.copy()
+                _persist_disk_caches(location_cache_minutes)
             return cleaned_info
 
     except geoip2.errors.AddressNotFoundError:
@@ -529,16 +553,20 @@ def get_location_info(
         # Cache negative result with TTL so it expires and retries after DB updates
         cached_result = result.copy()
         cached_result["_cached_at"] = datetime.now(timezone.utc)
-        _location_cache[ip_address] = cached_result
-        _persist_disk_caches(location_cache_minutes)
+        # Audit round 19 fix: lock-protect the write + persist.
+        with _cache_lock:
+            _location_cache[ip_address] = cached_result
+            _persist_disk_caches(location_cache_minutes)
         return result
     except Exception as e:
         debug_log(f"Error looking up location: {e}", "location")
         result = {"error": f"Error looking up location: {e}", "ip": ip_address}
         cached_result = result.copy()
         cached_result["_cached_at"] = datetime.now(timezone.utc)
-        _location_cache[ip_address] = cached_result
-        _persist_disk_caches(location_cache_minutes)
+        # Audit round 19 fix: lock-protect the write + persist.
+        with _cache_lock:
+            _location_cache[ip_address] = cached_result
+            _persist_disk_caches(location_cache_minutes)
         return result
 
 

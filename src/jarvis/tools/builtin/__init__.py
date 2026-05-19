@@ -14,6 +14,8 @@ from .nutrition.fetch_meals import FetchMealsTool
 from .nutrition.delete_meal import DeleteMealTool
 from .weather import WeatherTool
 from .stop import StopTool
+# Audit round 20 P3 — Mac-control capability.
+from .mac_control import MacControlTool
 
 # Import supporting functions that may still be used elsewhere
 
@@ -28,4 +30,5 @@ __all__ = [
     'DeleteMealTool',
     'WeatherTool',
     'StopTool',
+    'MacControlTool',
 ]

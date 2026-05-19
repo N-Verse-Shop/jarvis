@@ -55,13 +55,20 @@ class TranscriptBuffer:
     Thread-safe for concurrent access from audio processing threads.
     """
 
-    def __init__(self, max_duration_sec: float = 120.0):
+    def __init__(self, max_duration_sec: float = 120.0, max_segments: int = 500):
         """Initialize the transcript buffer.
 
         Args:
             max_duration_sec: Maximum duration of transcripts to retain (default 2 minutes)
+            max_segments: Hard cap on buffer count (audit round 9 M5).
+                Defence against VAD-flooded sessions (TV + family
+                producing ~30 segments/min). Without this cap, the
+                list grows unbounded if new segments arrive faster
+                than 2-min window churn → _prune_locked scans grow
+                quadratically.
         """
         self.max_duration_sec = max_duration_sec
+        self.max_segments = max_segments
         self._segments: List[TranscriptSegment] = []
         self._lock = threading.Lock()
 
@@ -295,6 +302,18 @@ class TranscriptBuffer:
                     debug_log(f"transcript buffer: marked segment as processed: '{seg.text[:50]}...'", "voice")
                     return True
 
+        # Audit round 9 fix M3: previously returned False silently.
+        # All 17 callers ignore the return value, so a whitespace/
+        # punctuation drift between the listener's text and what's
+        # in the buffer caused the segment to NOT be marked → the
+        # next intent-judge pass re-extracted the same query →
+        # duplicate dispatch ("Jarvis answers same question twice").
+        # Now logs the mismatch so future drift surfaces in voice.log.
+        debug_log(
+            f"transcript buffer: mark_segment_processed FAILED to find text='{text_lower[:60]}' "
+            f"(buffer has {len(self._segments)} segs)",
+            "voice",
+        )
         return False
 
     def mark_last_segment_processed(self) -> bool:
@@ -341,6 +360,19 @@ class TranscriptBuffer:
         original_count = len(self._segments)
 
         self._segments = [s for s in self._segments if s.end_time >= cutoff]
+
+        # Audit round 9 fix M5: hard count cap as defence against
+        # VAD-storm sessions. Without this, time-based prune alone
+        # could leave thousands of segments if they all fit inside
+        # the 2-min window — quadratic blow-up on subsequent prunes.
+        if len(self._segments) > self.max_segments:
+            count_dropped = len(self._segments) - self.max_segments
+            self._segments = self._segments[-self.max_segments:]
+            debug_log(
+                f"transcript buffer: count-capped, dropped {count_dropped} "
+                f"oldest (kept newest {self.max_segments})",
+                "voice",
+            )
 
         removed = original_count - len(self._segments)
         if removed > 0:

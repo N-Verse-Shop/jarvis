@@ -7,6 +7,7 @@ Coordinates audio capture, speech recognition, echo detection, and state managem
 from __future__ import annotations
 import functools
 import os
+import re
 import threading
 import time
 import queue
@@ -16,6 +17,7 @@ from collections import deque
 from typing import Optional, TYPE_CHECKING, Any
 from datetime import datetime
 
+import requests  # round 25 (F51): module-level import for _start_llm_keepalive
 from rapidfuzz import fuzz
 from .echo_detection import EchoDetector
 from .state_manager import StateManager, ListeningState
@@ -24,6 +26,55 @@ from .transcript_buffer import TranscriptBuffer
 from .intent_judge import IntentJudge, create_intent_judge, warm_up_ollama_model
 from ..debug import debug_log
 from ..utils.location import is_location_available
+
+
+# Audit round 17 fix: voice queries are printed to stdout for the
+# user-facing log viewer AND piped into the desktop_app log file.
+# A misheard "Jarvis, remember my password Hunter2..." used to land
+# verbatim in plaintext logs that survive process restart. Wrap every
+# user-print of a transcript through this helper to scrub credentials
+# AND truncate at 80 chars so we don't slip back into ungated logging
+# the next time a new print-site lands. Truncation matches the
+# already-truncated debug sites elsewhere in this file.
+def _safe_user_text(text: Optional[str], limit: int = 80) -> str:
+    if not text:
+        return ""
+    try:
+        from ..utils.redact import scrub_secrets as _scrub
+        scrubbed = _scrub(str(text))
+    except Exception:
+        scrubbed = str(text)
+    flat = scrubbed.replace("\n", " ").strip()
+    if len(flat) > limit:
+        return flat[: limit - 1] + "…"
+    return flat
+
+
+# Round 30 (F93): module-level PII-aware print helper. All voice-loop
+# prints that include user transcripts MUST route through this rather
+# than calling print() directly — otherwise the text leaks to
+# ~/Library/Logs/jarvis-assistant.out.log, which is world-readable
+# (mode 644) and persists indefinitely (rotation only at 8MB).
+# Live evidence (R30 audit): out.log carried multiple "📝 Heard:
+# <family conversation>" lines for ambient mic capture before the
+# flag-gate was added.
+def _voice_debug_on() -> bool:
+    """Cached check; mirrors debug._is_debug_enabled but cheap-fast.
+
+    We don't want the audio thread paying for a config-load on every
+    transcribe. Cache for 2s — matches the debug.py TTL.
+    """
+    try:
+        from ..debug import _is_debug_enabled as _check
+        return bool(_check())
+    except Exception:
+        return False
+
+
+def _vprint(*args, **kwargs) -> None:
+    """Gated print: emits to stdout ONLY when voice_debug is enabled."""
+    if _voice_debug_on():
+        print(*args, **kwargs)
 
 if TYPE_CHECKING:
     from ..memory.db import Database
@@ -86,18 +137,20 @@ except OSError as e:
 # slow decode and hurt non-listed words. The prompt is in Ukrainian
 # to anchor the language model on UA pronunciation rules.
 VOICE_WHISPER_INITIAL_PROMPT = (
-    "Запит до голосового асистента Джарвіс українською мовою. "
-    "Користувач — Данило Молянко з Nexus Studio. "
-    "Бренди і проєкти: Nexus Studio, IBONS, Hydrogen, Shopify, "
-    "Cloudflare, Hetzner, Tailscale, Render, Ollama, Qdrant, "
+    # CRITICAL — Whisper REGURGITATES initial_prompt content verbatim
+    # when audio is unclear. Previous version had explicit phrases like
+    # "Джарвіс відкрий, Джарвіс закрий, Джарвіс заблокуй" — Whisper
+    # decoded quiet audio as that exact text. User report: "почув один
+    # раз і фіксується на тому і надалі не слухає більше". Per Whisper
+    # docs: keep initial_prompt to vocabulary list, NO example sentences.
+    # Just bare brand/tech terms + the wake word. No commands, no
+    # templates, no full phrases.
+    "Українська мова. Данило, Джарвіс, Nexus Studio, IBONS, Hydrogen, "
+    "Shopify, Cloudflare, Hetzner, Tailscale, Render, Ollama, "
     "Founder Cockpit, Telegram, Linear, GitHub, Notion, Obsidian, "
-    "macOS, Safari, Chrome, Mail, Calendar, Slack, DACH. "
-    "Технічні терміни: TTFB, TTFT, SaaS, API, JSON, MLX, Whisper, "
-    "qwen, gemma, llama, mistral, npm, deploy, frontend, бекенд, "
-    "лендінг, конверсія, кеш, токен, промпт, streaming, latency, "
-    "Lighthouse, PageSpeed, CDN, edge, worker, віджет. "
-    "Команди: відкрий, закрий, перезапусти, заблокуй, скажи, "
-    "знайди, покажи, створи задачу, додай нотатку."
+    "macOS, Safari, Chrome, Slack, DACH, API, JSON, MLX, Whisper, "
+    "qwen, llama, mistral, deploy, frontend, бекенд, лендінг, "
+    "конверсія, кеш, токен, промпт, streaming, latency, CDN, edge."
 )
 
 
@@ -108,6 +161,39 @@ FASTER_WHISPER_AVAILABLE = False
 def _is_apple_silicon() -> bool:
     """Check if running on Apple Silicon Mac."""
     return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+# ─── SINGLE SOURCE OF TRUTH for "bare junk" tokens ──────────────────────
+# Audit round 6 unified three drifting copies: the collection-mode
+# BARE_JUNK (around line 2181), `_canned_voice_reply`'s _STRICT_BARE_JUNK
+# (~2875), and `_persist_memory_pair`'s _MEMORY_BARE_JUNK (~703). They
+# had different entries, which meant a query like "продолжение следует"
+# could be persisted as memory even though the canned-reply path rejected
+# it. Now there's ONE constant referenced everywhere — touch this set
+# once and the change applies to every gate. All tokens are lowercase,
+# exact-match strings stripped of trailing punctuation.
+BARE_JUNK_SET: frozenset = frozenset({
+    # Pleasantries
+    "спасибо", "благодарю", "дякую", "дяки", "спасибі", "дякуємо",
+    "thanks", "thank you", "thx", "danke", "пожалуйста",
+    # Farewells
+    "пока", "па", "па-па", "бувай", "bye", "goodbye",
+    # Acknowledgements
+    "ага", "угу", "ок", "окей", "ok", "okay", "так", "yes", "yep", "yeah",
+    "ладно", "хорошо", "понятно", "добре", "гаразд", "зрозумів",
+    "ну", "это я",
+    # Test / probing phrases
+    "тест", "test", "проверка", "перевірка",
+    # Compliments
+    "круто", "супер", "молодец", "молодець", "класс", "класно",
+    # Greetings (when arriving WITHOUT wake context they're ambient)
+    "доброе утро", "добрый день", "добрый вечер",
+    "здравствуйте", "всем привет",
+    # Whisper hallucinations frequently seen in archived polluted dialogs
+    "субтитры", "продолжение следует", "продолжения следует",
+    "продовження буде", "редактор субтитров", "удачи", "удачи!",
+    "корректор", "субтитры от", "перевод субтитров",
+})
 
 
 # Single source of truth for the voice-mode system prompt. Used by
@@ -134,17 +220,30 @@ VOICE_STATIC_SYSTEM_PROMPT = (
     #   list, just the single rule "if user requests an action, say
     #   one trigger phrase".
     # - 10 numbered response rules: collapsed into 3 essentials.
-    "Ти — Джарвіс, голосовий AI-асистент Данила Молянка (Nexus Studio, "
-    "B2B agency, DACH-ринок; стек: Shopify Hydrogen, React Native, Render).\n"
+    # MIGRATED uk → ru (May 15). Користувач попросив повний перехід на
+    # російську для голосової взаємодії — Whisper medium має ~10x більше
+    # RU training даних, тому розпізнавання значно точніше. qwen3:8b
+    # відповідає RU природно. UA-фрази в коді залишаються тільки для
+    # коментарів і документації.
+    "Ты — Джарвис, голосовой AI-ассистент Данила Молянко (Nexus Studio, "
+    "B2B agency, DACH-рынок; стек: Shopify Hydrogen, React Native, Render). "
+    "ВАЖНО: обращайся к нему ПОЛНЫМ ИМЕНЕМ 'Данило' (украинская форма, как он "
+    "себя называет). НИКОГДА не сокращай до 'Нило', 'Данил', 'Данилу', "
+    "'Даня' — только 'Данило'.\n"
     "ПРАВИЛА:\n"
-    "1. Відповідай українською, природно і змістовно. Без markdown, emoji, "
-    "посилань, формул — текст для голосу.\n"
-    "2. Без вигуків і слів-наповнювачів ('Угу', 'Звичайно', 'Зараз подумаю').\n"
-    "3. Не знаєш — почни з 'Не знаю напевно' (тригер веб-пошуку).\n"
-    "4. Якщо просять дію Mac (відкрити app, скріншот, гучність, нотатка) — "
-    "одна фраза-тригер ('Зараз відкрию Safari' / 'Зроблю скріншот'), потім "
-    "чекай слова 'виконуй'.\n"
-    "5. Кожна нова репліка — нова тема. Не повертайся до попередньої."
+    "1. КОРОТКО. Голосовые ответы — 1-3 предложения. Если запрос сложный, "
+    "дай суть в 2 предложениях, потом спроси раскрыть ли детали.\n"
+    "2. По-русски, естественно. Без markdown, emoji, ссылок, формул — "
+    "текст для голоса.\n"
+    "3. Без восклицаний ('Угу', 'Конечно', 'Сейчас подумаю').\n"
+    "4. Не знаешь — начни с 'Не знаю наверняка' (триггер веб-поиска).\n"
+    "5. Действие Mac (открыть app, скриншот, громкость, заметка, "
+    "буфер обмена, iMessage, set volume): СНАЧАЛА скажи фразу-триггер "
+    "С ИМЕНЕМ ОБЪЕКТА ('Сейчас открою Safari', 'Сейчас открою YouTube "
+    "в Safari', 'Сейчас сделаю скриншот', 'Сейчас прочитаю буфер'), "
+    "ПОТОМ сразу добавь 'Подтверди моё действие, пожалуйста' и ЖДИ "
+    "слова 'подтверждаю' или 'выполняй'. БЕЗ имени объекта триггер "
+    "НЕ сработает — обязательно укажи ЧТО ИМЕННО открываешь."
 )
 
 
@@ -431,6 +530,19 @@ class VoiceListener(threading.Thread):
         self.dialogue_memory = dialogue_memory
         self._should_stop = False
         self._dictation_active = False  # Pause flag set by dictation engine
+        # Round 25 (F51): timestamp of last user activity (dispatch,
+        # wake, command). Used by the LLM keepalive thread to skip
+        # pings when the user is actively engaging — avoids queuing
+        # prompt-eval work behind a real query. Bumped at every
+        # ``_dispatch_query`` and wake-word detection site.
+        self._last_user_activity_ts: float = 0.0
+        # Round 28 (F68): unsanitized LLM reply used for parse_action().
+        # _voice_direct_chat stashes the raw response here (with Latin
+        # app names intact like "Safari"/"YouTube") BEFORE running
+        # _sanitize_for_piper_uk which strips all Latin words ≥2 chars
+        # for the Piper TTS engine. _dispatch_query reads this for
+        # action parsing so it sees the original LLM intent.
+        self._last_raw_reply: str = ""
         self._first_utterance = True  # Suppress turn separator before the very first transcription
         # ISO-639-1 code Whisper detected for the most recent utterance.
         # Updated at every successful transcription site (MLX + faster-
@@ -457,6 +569,7 @@ class VoiceListener(threading.Thread):
         # Voice activity detection
         self.is_speech_active = False
         self._silence_frames = 0
+        self._voice_run = 0  # Run of consecutive voiced frames; see endpoint loop hysteresis
         self._utterance_frames: list = []
         self._frame_samples = 0
         # Live transcription bookkeeping — sample buffer counter so we
@@ -483,15 +596,29 @@ class VoiceListener(threading.Thread):
         # Initialise modular components
         self.echo_detector = EchoDetector(
             echo_tolerance=float(getattr(self.cfg, "echo_tolerance", 0.3)),
-            energy_spike_threshold=float(getattr(self.cfg, "echo_energy_threshold", 2.0))
+            energy_spike_threshold=float(getattr(self.cfg, "echo_energy_threshold", 2.0)),
+            # Pass persistent-mode flag so echo_detector skips its
+            # 3.5s stale-clear timer in persistent hot-window — see
+            # `EchoDetector.track_tts_finish` for the bug history.
+            hot_window_persistent=bool(getattr(self.cfg, "hot_window_persistent", False)),
         )
 
         self.state_manager = StateManager(
             hot_window_seconds=float(getattr(self.cfg, "hot_window_seconds", 3.0)),
             echo_tolerance=float(getattr(self.cfg, "echo_tolerance", 0.3)),
-            voice_collect_seconds=float(getattr(self.cfg, "voice_collect_seconds", 2.0)),
+            voice_collect_seconds=float(getattr(self.cfg, "voice_collect_seconds", 3.0)),
             max_collect_seconds=float(getattr(self.cfg, "voice_max_collect_seconds", 60.0)),
             hot_window_persistent=bool(getattr(self.cfg, "hot_window_persistent", False)),
+            # Persistent-session safety nets — kill switch for runaway
+            # echo loops that "talk to themselves" forever. These two
+            # ceilings are the only way out of a persistent session
+            # besides a stop command or HUD End-session click.
+            hot_window_max_session_seconds=float(
+                getattr(self.cfg, "hot_window_max_session_seconds", 1800.0)
+            ),
+            hot_window_max_idle_seconds=float(
+                getattr(self.cfg, "hot_window_max_idle_seconds", 180.0)
+            ),
         )
 
         # Energy tracking for echo detection
@@ -499,6 +626,34 @@ class VoiceListener(threading.Thread):
 
         # Audio-level wake word detection timestamp
         self._wake_timestamp: Optional[float] = None
+
+        # Streaming-reply abort flag — set by any tts.interrupt() call site
+        # AND by stop-command handlers. Checked at the top of
+        # `_flush_sentence` and inside the `iter_lines` loop of
+        # `_voice_direct_chat` so that interrupting Jarvis mid-reply also
+        # stops the LLM stream from queuing more sentences to speak.
+        # Cleared at the start of every new `_voice_direct_chat` call.
+        self._stream_abort = threading.Event()
+
+        # Provenance of the next dispatch — used by `_persist_memory_pair`
+        # to decide whether to write the exchange to disk AND to enrich
+        # the memory record with where the query came from. Set by the
+        # call sites of `_dispatch_query` BEFORE the call:
+        #   "wake"             → explicit wake word in transcript
+        #   "wake_collection"  → collection started by wake, completed
+        #                        on a later transcript (timeout/finalise)
+        #   "hot_window"       → persistent hot-window follow-up gated
+        #                        by intent judge directed=True
+        # `_dispatch_source` is the "next dispatch's source", set by
+        # call sites BEFORE invoking `_dispatch_query`. Cleared
+        # ATOMICALLY at the top of `_dispatch_query` into a local stored
+        # as `_active_dispatch_source` for the persist helper to read.
+        # This split prevents the cross-turn leak that happened pre-
+        # audit-round-6 (early-return paths in `_dispatch_query`
+        # skipped `_persist_memory_pair`, so the old write-side clear
+        # never fired → stale "wake" tag poisoned the next turn).
+        self._dispatch_source: Optional[str] = None
+        self._active_dispatch_source: Optional[str] = None
 
         # Rolling transcript buffer for context-aware processing
         # Used for both retention and context passed to intent judge
@@ -516,14 +671,23 @@ class VoiceListener(threading.Thread):
         # Thinking tune player
         self._tune_player: Optional = None
 
-        # Active reply language. Defaults to UA. Switched explicitly via
-        # detect_language_switch() + user confirmation. Resets to UA on
-        # force_end_session().
-        self._active_language: str = "uk"
+        # Active reply language. Defaults to RU (post May 16 uk→ru migration).
+        # Switched explicitly via detect_language_switch() + user confirmation.
+        # Resets to RU on force_end_session().
+        # CRITICAL — this is the main control of which language the LLM is
+        # asked to reply in. Was "uk" → caused "speaks UA still" bug after
+        # whisper_language was migrated to "ru".
+        self._active_language: str = "ru"
         self._pending_lang_switch: Optional[str] = None
         self._pending_action = None
         self._pending_upgrade = None
         self._pending_confirmation = None
+        # Lock around the cross-thread pending-* state. HUD watcher
+        # thread mutates `_pending_confirmation`/`_pending_action`;
+        # dispatch thread reads + clears them. Pre-existing risk per
+        # round-11 audit: read-then-clear sequence without lock can
+        # double-fire on simultaneous HUD click + voice arrival.
+        self._pending_lock = threading.Lock()
 
         # Persistent dialog memory — JSONL file in ~/.config/jarvis/memory/.
         # User asked: "нехай зробиться окремий мозочок ... він там записує
@@ -534,6 +698,47 @@ class VoiceListener(threading.Thread):
         # remembers across daemon restarts. Compression: we keep only the
         # text (no metadata bloat) and the per-line tail-load is O(1).
         self._init_persistent_memory()
+
+    def _consume_pending_confirmation_from_hud(self) -> None:
+        """Execute or cancel a pending action when the HUD set the flag.
+
+        Audit round 11 fix C1: the HUD ✓/✗ buttons only set
+        ``_pending_confirmation`` and the dispatch path consumed the
+        flag — but the dispatch path only fires on voice arrival. So a
+        user clicking ✓ without speaking would see no effect. This
+        helper runs from the HUD watcher thread immediately after the
+        flag is set; it fires the pending fn synchronously and speaks
+        the outcome, matching what the voice path would do.
+
+        The function is intentionally tolerant: missing pending action,
+        TTS not initialised, or fn raising are all swallowed with a
+        debug log — better silent skip than a watcher-thread crash.
+        """
+        try:
+            with self._pending_lock:
+                choice = self._pending_confirmation
+                pending = self._pending_action
+                if choice not in ("yes", "no") or pending is None:
+                    # Lang switch / upgrade flow is consumed by the
+                    # voice dispatch path; HUD direct-execute only
+                    # covers the action-fn flow.
+                    return
+                # Clear flags BEFORE running fn so a slow fn doesn't
+                # get double-fired by a fast second click.
+                self._pending_confirmation = None
+                self._pending_action = None
+            if choice == "yes":
+                debug_log(f"executing pending action via HUD direct: {pending.name}", "voice")
+                try:
+                    ok, msg = pending.fn()
+                except Exception as e:
+                    ok, msg = False, f"Помилка під час дії: {e}"
+                self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+            else:
+                debug_log(f"cancelled pending action via HUD direct: {pending.name}", "voice")
+                self._speak_and_continue("Скасовано.")
+        except Exception as e:
+            debug_log(f"_consume_pending_confirmation_from_hud failed: {e}", "voice")
 
     def _init_persistent_memory(self) -> None:
         """Load recent dialog history from the persistent memory file.
@@ -546,6 +751,19 @@ class VoiceListener(threading.Thread):
         import json
         from datetime import datetime
         mem_dir = os.path.expanduser("~/.config/jarvis/memory")
+        # Audit round 21 fix (F28): protect ``_dialog_history`` with a
+        # dedicated lock. The list is touched from at least three
+        # threads — the voice direct-chat reply path (append + slice
+        # trim), the HUD control watcher (``clear()`` on end_session
+        # and confirmation flows), and the TTS completion callback
+        # (also can reach back via the pending-action mechanism).
+        # Under GIL the individual ``append``/``pop``/slice ops are
+        # safe, but the "trim to last 16" pattern is two distinct
+        # operations — a concurrent reader sees a 17-element history
+        # briefly and ``messages.extend(self._dialog_history[-2:])``
+        # in ``_voice_direct_chat`` can grab two messages of mixed
+        # vintage. The lock makes the invariant atomic.
+        self._dialog_history_lock = threading.RLock()
         try:
             os.makedirs(mem_dir, exist_ok=True)
         except Exception as e:
@@ -554,6 +772,14 @@ class VoiceListener(threading.Thread):
             self._memory_file = None
             return
         # One file per day — keeps individual files manageable.
+        # Audit round 12 fix: also remember the directory so
+        # `_persist_memory_pair` can recompute the per-day path on
+        # every write. The previous implementation froze today's date
+        # at startup; a daemon running across midnight kept appending
+        # to yesterday's file until restart (data ends up in the
+        # wrong dialog-YYYY-MM-DD.jsonl and the per-file size grows
+        # unbounded since there's no rotation logic for it).
+        self._memory_dir = mem_dir
         today = datetime.now().strftime("%Y-%m-%d")
         self._memory_file = os.path.join(mem_dir, f"dialog-{today}.jsonl")
         # Also remember yesterday's file for cross-day context loading.
@@ -568,6 +794,13 @@ class VoiceListener(threading.Thread):
             files_to_load = [os.path.join(mem_dir, f) for f in all_files[:2]]
         except Exception:
             pass
+        # Audit round 7 fix M2: use a bounded deque so we never load
+        # tens of thousands of lines into a Python list just to slice
+        # off the last 16. With `maxlen=200` we keep enough headroom
+        # for the lang-filter to drop wrong-language records and still
+        # hand `recent = loaded[-16:]` a meaningful tail.
+        from collections import deque
+        rolling: deque = deque(maxlen=200)
         for path in reversed(files_to_load):  # oldest first so latest end up at tail
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -578,63 +811,246 @@ class VoiceListener(threading.Thread):
                         try:
                             obj = json.loads(line)
                             if obj.get("role") in ("user", "assistant") and obj.get("content"):
-                                loaded.append({"role": obj["role"], "content": obj["content"]})
+                                # Audit round 7 fix M1: preserve `lang`
+                                # and `source` metadata when present.
+                                # The filter below now prefers explicit
+                                # `lang` over char-heuristic so a record
+                                # tagged `lang:"uk"` from a UA session
+                                # is correctly dropped under active=ru.
+                                rec = {"role": obj["role"], "content": obj["content"]}
+                                if obj.get("lang"):
+                                    rec["lang"] = obj["lang"]
+                                if obj.get("source"):
+                                    rec["source"] = obj["source"]
+                                rolling.append(rec)
                         except Exception:
                             continue
             except Exception as e:
                 debug_log(f"failed to load memory from {path}: {e}", "voice")
+        loaded = list(rolling)
         # Keep only most recent 16 messages (8 pairs).
         recent = loaded[-16:]
-        # Filter out contaminated non-Ukrainian entries — they pollute
-        # the model's language anchor (it sees RU/EN in history and
-        # switches modes). We're strict: drop any assistant message
-        # without at least 3 distinct Cyrillic UA characters
-        # (а-я,А-Я + ї/є/і/ґ). User messages we keep regardless (the
-        # user is allowed to speak any language).
-        ua_chars = set("абвгґдеєжзиіїйклмнопрстуфхцчшщьюяАБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ")
-        def _is_ua(text: str) -> bool:
+        # Filter contaminated entries from the WRONG language — they pollute
+        # the model's language anchor (it sees prior UA replies in history
+        # and continues UA even when current system prompt asks for RU).
+        # User report (May 16): "він всерівно спілкується українською" even
+        # after full uk→ru migration. Root cause: old UA dialog files were
+        # loaded as history, model mimicked their language.
+        #
+        # Strategy: drop assistant messages whose dominant language differs
+        # from the active language (whisper_language config). User messages
+        # are kept regardless (user is free to speak any language).
+        ua_only = set("іїєґІЇЄҐ")
+        ru_only = set("ёыэъЁЫЭЪ")
+        active_lang = getattr(self.cfg, "whisper_language", "ru") or "ru"
+        def _msg_is_active_lang(msg: dict) -> bool:
+            """Return True if `msg` matches the current active language.
+
+            Audit round 7 fix M1: prefer the explicit `lang` field
+            (set by `_persist_memory_pair` since round 5) over the
+            char-heuristic. Old records without `lang` still fall
+            back to char-counting for backwards compatibility.
+            """
+            # Prefer explicit metadata when present.
+            explicit_lang = msg.get("lang")
+            if explicit_lang:
+                # EN/DE replies kept regardless of active (rare but
+                # legitimate — user may have asked something in EN).
+                if explicit_lang not in ("uk", "ru"):
+                    return True
+                return explicit_lang == active_lang
+            text = msg.get("content") or ""
             if not text:
                 return False
-            hits = sum(1 for c in text if c in ua_chars)
-            return hits >= 3
+            ua_hits = sum(1 for c in text if c in ua_only)
+            ru_hits = sum(1 for c in text if c in ru_only)
+            if active_lang == "ru":
+                # RU: drop if has UA-only chars (іїєґ) and no RU-only chars
+                if ua_hits > 0 and ru_hits == 0:
+                    return False
+                # No conflict — accept (could be RU, or generic Cyrillic that's
+                # safe to keep)
+                return True
+            elif active_lang == "uk":
+                # UA: drop if has RU-only chars (ёыэъ) and no UA-only chars
+                if ru_hits > 0 and ua_hits == 0:
+                    return False
+                return True
+            return True  # other languages (en/de) — no filter
         cleaned: list[dict] = []
         dropped = 0
         for m in recent:
             if m["role"] == "user":
-                cleaned.append(m)
-            elif _is_ua(m["content"]):
-                cleaned.append(m)
+                # User messages: keep regardless of language (user is free
+                # to speak any language); strip metadata for prompt size.
+                cleaned.append({"role": m["role"], "content": m["content"]})
+            elif _msg_is_active_lang(m):
+                # Assistant message in the right language — strip
+                # metadata fields before passing to the LLM (model
+                # doesn't need `lang`/`source` in the chat history).
+                cleaned.append({"role": m["role"], "content": m["content"]})
             else:
                 dropped += 1
         self._dialog_history: list[dict] = cleaned
         debug_log(
             f"persistent memory loaded: {len(self._dialog_history)} messages "
-            f"from {len(files_to_load)} file(s) (dropped {dropped} non-UA)",
+            f"from {len(files_to_load)} file(s) (dropped {dropped} wrong-lang, active={active_lang})",
             "voice",
         )
+
+    # `_MEMORY_BARE_JUNK` removed in audit round 6 — replaced by the
+    # module-level `BARE_JUNK_SET` so all three gates (collection-mode,
+    # canned-reply, persist-memory) reference one source of truth.
 
     def _persist_memory_pair(self, query: str, reply: str) -> None:
         """Append a (user, assistant) pair to today's memory file.
 
-        One JSON object per line, atomic append. Failure is logged but
-        non-fatal — we never block the voice loop on disk errors.
+        Quality filters — applied BEFORE writing so junk never enters
+        the long-term context. The polluted 144-line dialog file we
+        had to archive on 2026-05-16 came from skipping these checks:
+          • bare-junk queries ("спасибо", "ок", "пока") got persisted
+            with canned-reply pleasantries → re-anchored the LLM on
+            restart into content-free responses
+          • Whisper hallucinations ("Субтитры от...") got persisted
+            as user turns → the model would later "remember" them
+            and reference "subtitles" in unrelated replies
+          • dispatches without wake confirmation (`_dispatch_source`
+            unset or "collection_timeout") slip through as user turns
+            even though they're often misheard ambient speech
+
+        Metadata block records provenance so a future audit can
+        distinguish wake-confirmed turns from low-confidence ones and
+        we can selectively scrub by source rather than nuking the
+        whole file. The `ts` field is per-record (paired) so a manual
+        scrub can use file mtime + content to identify suspect runs.
+
+        Always clears `self._dispatch_source` on return so a missed
+        call site can't leak provenance from a prior turn into the
+        next persist.
         """
+        # ── Read provenance set at top of `_dispatch_query` ───────────
+        # `_active_dispatch_source` is set once per dispatch and lives
+        # for the lifetime of the dispatch (read-only here). The "next
+        # dispatch source" intent (`self._dispatch_source`) is cleared
+        # at the top of `_dispatch_query`. Falls back to "unknown" if
+        # called from outside `_dispatch_query` (defence in depth).
+        source = getattr(self, "_active_dispatch_source", None) or "unknown"
+
         if not self._memory_file:
             return
+        if not query or not reply:
+            debug_log(f"persist-memory: refused empty pair (q={bool(query)} r={bool(reply)})", "voice")
+            return
+
+        q_strip = query.strip().lower().rstrip("?.!,;:")
+        # ── Quality filter 1: bare-junk user query ────────────────────
+        if q_strip in BARE_JUNK_SET:
+            debug_log(
+                f"persist-memory: refused bare-junk query '{q_strip}' "
+                f"(source={source})",
+                "voice",
+            )
+            return
+        # ── Quality filter 2: too-short user query (<3 chars / 1 char alpha) ─
+        if len(q_strip) < 3:
+            debug_log(
+                f"persist-memory: refused too-short query '{q_strip}' "
+                f"(source={source})",
+                "voice",
+            )
+            return
+        # ── Quality filter 3: dispatch came from low-confidence source ─
+        # `collection_timeout` means the user opened collection (often
+        # via misheard fuzzy wake) and then said nothing or said
+        # ambient noise that timed out. Reply went out (canned ack),
+        # but the user-turn text is rarely something we should
+        # remember. `unknown` is the fail-safe — any new dispatch
+        # site we add must explicitly set `_dispatch_source` to opt-in.
+        if source in ("collection_timeout", "unknown"):
+            debug_log(
+                f"persist-memory: refused low-confidence source '{source}' "
+                f"query='{q_strip[:40]}'",
+                "voice",
+            )
+            return
+
+        # ── Quality filter 4: reply is a hard-fail placeholder ────────
+        # Only refuse persistence for "I tried and failed" failure
+        # responses — those would train the rolling history to expect
+        # more failures. Pre-audit-round-6 this list also included
+        # "не понял" / "не зрозумів" / "не понимаю" / "не розумію" —
+        # but those are legitimate ask-for-clarification responses
+        # that anchor the model to be a good listener
+        # ("Не зрозумів, повтори будь ласка. Що саме?"). Dropping them
+        # made Jarvis re-ask the same clarification over and over
+        # because he never "remembered" he just asked. Kept ONLY
+        # operational-failure prefixes here.
+        r_strip = reply.strip().lower()
+        _APOLOGY_PREFIXES = (
+            "не вийшло", "не зміг", "не получилось", "не смог",
+            "вибач, не вийшло", "извини, не получилось",
+            "sorry, i couldn't",
+            # The system speaks this when LLM call times out — pure
+            # placeholder, never useful as memory.
+            "вибач, не встиг подумати",
+            "извини, не успел подумать",
+        )
+        if any(r_strip.startswith(p) for p in _APOLOGY_PREFIXES):
+            debug_log(
+                f"persist-memory: refused hard-fail reply '{r_strip[:40]}' "
+                f"(source={source})",
+                "voice",
+            )
+            return
+
+        # ── All filters passed — write with provenance metadata ───────
         import json
         import time as _t
+        ts = _t.time()
+        lang = getattr(self, "_active_language", "ru")
+        # Audit round 12 fix: recompute today's path on each write so
+        # a daemon running across midnight rolls over into the new day's
+        # file. Cheap: one strftime + os.path.join per persist.
+        mem_dir = getattr(self, "_memory_dir", None)
+        if mem_dir:
+            today = datetime.now().strftime("%Y-%m-%d")
+            self._memory_file = os.path.join(mem_dir, f"dialog-{today}.jsonl")
         try:
             with open(self._memory_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(
-                    {"role": "user", "content": query, "ts": _t.time()},
+                    {
+                        "role": "user",
+                        "content": query,
+                        "ts": ts,
+                        "source": source,
+                        "lang": lang,
+                    },
                     ensure_ascii=False,
                 ) + "\n")
                 f.write(json.dumps(
-                    {"role": "assistant", "content": reply, "ts": _t.time()},
+                    {
+                        "role": "assistant",
+                        "content": reply,
+                        "ts": ts,
+                        "source": source,
+                        "lang": lang,
+                    },
                     ensure_ascii=False,
                 ) + "\n")
+            debug_log(
+                f"persist-memory: wrote pair (source={source}, "
+                f"q={len(query)}c r={len(reply)}c)",
+                "voice",
+            )
         except Exception as e:
             debug_log(f"failed to persist memory: {e}", "voice")
+        finally:
+            # Audit round 7 (regression find R4): clear the active
+            # source so a future caller invoking persist outside the
+            # `_dispatch_query` lifecycle can't pick up a stale value
+            # from the prior turn. The defence-in-depth claim in the
+            # docstring is now actually enforced.
+            self._active_dispatch_source = None
 
     def stop(self) -> None:
         """Stop the voice listener."""
@@ -652,17 +1068,19 @@ class VoiceListener(threading.Thread):
             self._tune_player.start_tune()
 
     def _stop_thinking_tune(self) -> None:
-        """Stop the thinking tune and revert face state to IDLE."""
+        """Stop the thinking tune. Caller decides what state to set next.
+
+        Previously this forcibly set state to IDLE, which caused the HUD
+        to collapse captions for ~50ms between THINKING and SPEAKING
+        (or LISTENING after hot window activation). User report:
+        "після відповіді закривається". The IDLE flicker was the trigger
+        — daemonActive went false → captions fade timer fired → next
+        SPEAKING state didn't re-show captions until a sentence event
+        arrived (which is too late for short responses).
+        """
         if self._tune_player is not None:
             self._tune_player.stop_tune()
             self._tune_player = None
-            try:
-                from desktop_app.face_widget import get_jarvis_state, JarvisState
-                get_jarvis_state().set_state(JarvisState.IDLE)
-            except ImportError:
-                pass
-            except Exception:
-                pass
 
     def _is_thinking_tune_active(self) -> bool:
         """Check if thinking tune is currently active."""
@@ -687,6 +1105,37 @@ class VoiceListener(threading.Thread):
                 baseline_energy = sum(self._recent_audio_energy) / len(self._recent_audio_energy)
 
             self.echo_detector.track_tts_start(tts_text, baseline_energy)
+
+    def _interrupt_tts(self, reason: str = "") -> None:
+        """Stop current TTS AND abort any in-flight streaming LLM reply.
+
+        Every caller that previously did `self.tts.interrupt()` standalone
+        was leaking the rest of a streamed reply: the iter_lines loop in
+        `_voice_direct_chat` kept pulling tokens, `_flush_sentence` kept
+        queueing them into Piper, and Jarvis kept talking over the user
+        for another 5-15 seconds after the "interrupt". This helper sets
+        `self._stream_abort` so both the iter_lines loop and the next
+        `_flush_sentence` call short-circuit immediately.
+
+        Safe to call when there's no TTS engine, no active reply, or
+        no streaming in flight — it's a no-op in those cases. `reason`
+        is logged only when debug is enabled.
+        """
+        # Always set the abort flag first so that if `tts.interrupt()`
+        # races with `_flush_sentence` reading the flag (different
+        # threads — TTS callback vs HTTP stream consumer), the flag is
+        # already visible by the time interrupt unblocks the audio.
+        try:
+            self._stream_abort.set()
+        except Exception:
+            pass
+        if self.tts:
+            try:
+                self.tts.interrupt()
+            except Exception as e:
+                debug_log(f"tts.interrupt failed: {e}", "voice")
+        if reason:
+            debug_log(f"_interrupt_tts: {reason}", "voice")
 
     def activate_hot_window(self) -> None:
         """Activate hot window after TTS completion."""
@@ -731,6 +1180,17 @@ class VoiceListener(threading.Thread):
             if self.state_manager.check_collection_timeout():
                 query = self.state_manager.clear_collection()
                 if query.strip():
+                    # Collection was started by an earlier wake, so the
+                    # collected query is wake-confirmed even though the
+                    # final dispatch fires on a silent transcript that
+                    # triggers the timeout. Tag accordingly — but only
+                    # if a more-specific source (e.g. "hot_window")
+                    # wasn't already set by the path that opened the
+                    # collection. Without the None-check, a hot-window
+                    # follow-up would be re-tagged "wake_collection"
+                    # and lose its hot-window provenance in memory.
+                    if self._dispatch_source is None:
+                        self._dispatch_source = "wake_collection"
                     self._dispatch_query(query)
 
             # Check hot window expiry
@@ -746,6 +1206,60 @@ class VoiceListener(threading.Thread):
             self.state_manager.check_hot_window_expiry(self.cfg.voice_debug)
             return
 
+        # Min-duration filter for AMBIENT (not in hot-window, no TTS).
+        #
+        # Original threshold was 1.2s — too aggressive after RU migration.
+        # Single-word "Джарвис" (3 syllables, ~0.4-0.7s) was being dropped
+        # as ambient. Real failing case from log:
+        #   'ambient drop (<1.2s, no wake): 'Джай' dur=0.62s'
+        # — Whisper heard real "Джарвис" as "Джай", fuzzy ratio
+        # ('джарвис' ~ 'джай') = 0.545 < 0.78 threshold → not recognized
+        # as wake → ambient drop. So the user's actual wake call gets
+        # silently swallowed.
+        #
+        # Tighter threshold (0.4s) catches single-frame breath / clicks
+        # but lets short wake-words through. Family-chatter false-positive
+        # defence is now carried by voice_min_energy + RU hallucination
+        # pattern blocklist below.
+        utterance_duration = (
+            (utterance_end_time - utterance_start_time)
+            if (utterance_end_time and utterance_start_time)
+            else 0.0
+        )
+        try:
+            _in_hot = self.state_manager.was_speech_during_hot_window(
+                utterance_start_time, utterance_end_time
+            )
+        except Exception:
+            _in_hot = False
+        _tts_active = bool(self.tts and self.tts.is_speaking())
+        if (
+            utterance_duration > 0
+            and utterance_duration < 0.4
+            and not _in_hot
+            and not _tts_active
+            and len(text.strip()) < 25  # very short text + very short audio
+        ):
+            # Quick wake-word check — let real isolated "Джарвіс" through.
+            # USE THE CONFIG'D fuzzy ratio (default 0.78, user-tuned 0.68).
+            # The hardcoded 0.78 here was the user's exact "doesn't fire"
+            # bug: Whisper outputs "Джагуис"/"Драйвис" (ratio 0.71) which
+            # passes everywhere ELSE in the codebase using cfg 0.68, but
+            # was silently dropped here.
+            _ww_quick = getattr(self.cfg, "wake_word", "jarvis")
+            _wal_quick = list(set(getattr(self.cfg, "wake_aliases", [])) | {_ww_quick})
+            _wfr_quick = float(getattr(self.cfg, "wake_fuzzy_ratio", 0.78))
+            if not is_wake_word_detected(text.lower(), _ww_quick, _wal_quick, _wfr_quick):
+                debug_log(
+                    f"ambient drop (<0.4s, no wake): '{text.strip()[:60]}' dur={utterance_duration:.2f}s",
+                    "voice",
+                )
+                try:
+                    self._transcript_buffer.mark_segment_processed(text.strip().lower())
+                except Exception:
+                    pass
+                return
+
         # Reset wake timestamp — it must reflect only the current utterance.
         # If this utterance contains a wake word, the early-beep check below
         # will set it. Without this reset, a prior rejected wake-worded
@@ -757,8 +1271,43 @@ class VoiceListener(threading.Thread):
         end_time_str = datetime.fromtimestamp(utterance_end_time).strftime('%H:%M:%S.%f')[:-3] if utterance_end_time > 0 else "N/A"
         debug_log(f"heard: '{text}' (utterance from {start_time_str} to {end_time_str})", "voice")
 
-        # Track if this input was received during TTS (for logging purposes)
-        received_during_tts = self.tts and self.tts.is_speaking()
+        # Track if this input was received during TTS.
+        # CRITICAL: check both (a) TTS currently speaking AND (b) whether
+        # the utterance start time falls within a recent TTS window.
+        # Previously this only checked is_speaking() at processing time,
+        # which is False by the time Whisper finishes — so echo audio
+        # captured during TTS leaked past the gate and was processed as
+        # a real query. User report: TTS said "Слухаю, Даниле", mic
+        # picked it up, Whisper transcribed it as "Привінжер", echo
+        # check failed (text didn't match TTS), and "Привінжер" got
+        # dispatched as a query.
+        received_during_tts = bool(self.tts and self.tts.is_speaking())
+        if not received_during_tts:
+            try:
+                # Audit round 14 fix C3: snapshot the TTS window
+                # atomically — reading start_time and finish_time
+                # separately races with track_tts_start/_finish.
+                tts_start_t, tts_finish_t, _, _ = (
+                    self.echo_detector.snapshot_tts_window()
+                )
+                tts_finish_t = tts_finish_t or 0.0
+                tts_start_t = tts_start_t or 0.0
+                tol = float(self.echo_detector.echo_tolerance or 0.3)
+                # Utterance overlaps a TTS window if it started before
+                # TTS finished (+tolerance) AND ended after TTS started.
+                if (
+                    tts_finish_t > 0
+                    and utterance_start_time > 0
+                    and utterance_start_time < (tts_finish_t + tol)
+                    and (utterance_end_time <= 0 or utterance_end_time > tts_start_t - tol)
+                ):
+                    received_during_tts = True
+                    debug_log(
+                        f"utterance overlapped recent TTS window — flagging as during-TTS",
+                        "voice",
+                    )
+            except Exception:
+                pass
 
         # ─── PRE-EMPTIVE WAKE-WORD INTERRUPT ────────────────────────────
         # User asked: "коли я знову говорю йому Джарвіс він повинен
@@ -772,11 +1321,24 @@ class VoiceListener(threading.Thread):
             _ww = getattr(self.cfg, "wake_word", "jarvis")
             _wal = list(set(getattr(self.cfg, "wake_aliases", [])) | {_ww})
             _wfr = float(getattr(self.cfg, "wake_fuzzy_ratio", 0.78))
-            if is_wake_word_detected(text_lower, _ww, _wal, _wfr):
+            # HEAD CHECK (May 16): pre-emptive interrupt only fires when
+            # the wake word is in the FIRST 4 tokens. Whisper sometimes
+            # mishears TTS echo as "...джарвіс..." mid-sentence (e.g.
+            # "Добавил субтитры джарвіс джарвіс джарвіс") and used to
+            # spuriously interrupt TTS + dispatch garbage as a new query.
+            _head_text = " ".join(text_lower.split()[:2])
+            if is_wake_word_detected(_head_text, _ww, _wal, _wfr):
                 debug_log(f"pre-emptive wake-interrupt during TTS: '{text_lower[:60]}'", "voice")
                 print(f"  ⏸  Wake interrupt: \"{text_lower[:60]}\"", flush=True)
-                if self.tts:
-                    self.tts.interrupt()
+                # Confirmed wake → reset persistent-session idle timer.
+                try:
+                    self.state_manager.mark_user_wake()
+                except Exception:
+                    pass
+                # Use the helper so any streaming reply from the previous
+                # turn aborts cleanly — without this, sentence #2/#3 of
+                # the prior answer would keep playing after wake.
+                self._interrupt_tts(reason=f"wake re-fire: {text_lower[:40]}")
                 try:
                     while not self._audio_q.empty():
                         self._audio_q.get_nowait()
@@ -784,19 +1346,95 @@ class VoiceListener(threading.Thread):
                     pass
                 # Clear echo-detector's "last_tts" so the next utterance
                 # isn't classified as echo of the interrupted TTS.
+                # Audit round 14 fix C3: use helper so the write goes
+                # through _tts_state_lock instead of racing track_tts_start.
                 try:
-                    self.echo_detector._last_tts_text = ""
+                    self.echo_detector.clear_last_tts_text()
                 except Exception:
                     pass
                 from .wake_detection import extract_query_after_wake
                 extracted = extract_query_after_wake(text_lower, _ww, _wal).strip()
                 if extracted and len(extracted) > 2:
+                    # Explicit wake + inline query — highest-confidence
+                    # source. Tag for persist-memory provenance.
+                    self._dispatch_source = "wake"
                     self._dispatch_query(extracted)
                 else:
                     # Just the wake word — open collection for follow-up.
                     self.state_manager.start_collection("")
                     self._set_face_state_listening()
                 return
+
+            # No wake word and we DID overlap TTS — this is echo OR
+            # user speaking simultaneously over Jarvis. Reject hard so
+            # garbled Whisper output of TTS echo ("Привінжер" from
+            # "Слухаю, Даниле") doesn't reach intent-judge → dispatch.
+            # User can always re-say "Джарвіс" to interrupt cleanly.
+            session_stop_words_quick = getattr(
+                self.cfg, "session_stop_commands",
+                ["стоп", "досить", "тиша", "замовкни"],
+            )
+            if not is_stop_command(text_lower, session_stop_words_quick):
+                debug_log(
+                    f"rejected utterance overlapping TTS window (no wake, no stop): '{text_lower[:80]}'",
+                    "voice",
+                )
+                print(f"  🔇 Dropped TTS-overlap audio: \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
+                # CRITICAL: also mark as processed in transcript_buffer.
+                # Without this, the rejected TTS-echo segment stays as
+                # context for the NEXT utterance's intent judge, which
+                # then "inlines references" from the garbage echo. User
+                # report: "відбувається привязка розмови до старих запитів".
+                try:
+                    self._transcript_buffer.mark_segment_processed(text_lower)
+                except Exception:
+                    pass
+                return
+
+        # Audit round 23 fix (F39): POST-TTS extended echo check.
+        # Round 22 (F35) extended ``EchoDetector.should_reject_as_echo``
+        # after-TTS window from 3s to 12s — but the listener only
+        # called the detector with ``is_during_tts=True`` (line ~1501
+        # below), so the extended window was unreachable dead code.
+        # Live evidence (events.jsonl seq=288):
+        #   Jarvis TTS "Джарвис здесь." finished at 12:00:06
+        #   Whisper stt_final "здесь." at 12:00:16  (Δ=10s)
+        # That "здесь." (single common word, lifted from Jarvis-own
+        # TTS) reached the LLM and triggered the "Нило, ты где?"
+        # nonsense reply. The 10s gap fits within F35's 12s window
+        # but no caller invoked it.
+        #
+        # Now we explicitly call it here, ONLY when the utterance
+        # didn't already overlap the TTS window (the overlap path
+        # above handles its own rejection). Strict threshold 92
+        # via in_hot_window=True avoids false rejections of
+        # legitimate user follow-ups that share a single common
+        # word with TTS.
+        if not received_during_tts:
+            try:
+                if self.echo_detector.should_reject_as_echo(
+                    text_lower,
+                    utterance_energy,
+                    is_during_tts=False,
+                    tts_rate=getattr(self.cfg, "tts_rate", 200),
+                    utterance_start_time=utterance_start_time,
+                    in_hot_window=True,
+                ):
+                    debug_log(
+                        f"rejected delayed echo (post-TTS extended window): '{text_lower[:80]}'",
+                        "echo",
+                    )
+                    print(
+                        f"  🔇 Dropped delayed echo: \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"",
+                        flush=True,
+                    )
+                    try:
+                        self._transcript_buffer.mark_segment_processed(text_lower)
+                    except Exception:
+                        pass
+                    return
+            except Exception as _echo_exc:
+                debug_log(f"post-TTS echo check raised: {_echo_exc}", "echo")
 
         # --- Early echo check + early beep ---
         # Check for echo BEFORE starting beep and BEFORE intent judge.
@@ -811,7 +1449,9 @@ class VoiceListener(threading.Thread):
                 # Only catches pure echo (transcript ≈ TTS text). Mixed
                 # echo+speech chunks (user spoke over echo) go to the
                 # intent judge which can extract the user's speech.
-                last_tts_text = self.echo_detector._last_tts_text or ""
+                # Audit round 14 fix C3: snapshot under lock.
+                _, _, last_tts_text, _ = self.echo_detector.snapshot_tts_window()
+                last_tts_text = last_tts_text or ""
                 if last_tts_text:
                     echo_score = fuzz.partial_ratio(
                         text_lower, last_tts_text.lower()
@@ -860,7 +1500,7 @@ class VoiceListener(threading.Thread):
                             text_lower = salvaged
                         else:
                             debug_log(f"🔇 Early echo rejection (score={echo_score}): \"{text_lower}\"", "voice")
-                            print(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
+                            _vprint(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
                             return
 
                 # Non-echo (or salvaged) in hot window — start beep
@@ -872,11 +1512,32 @@ class VoiceListener(threading.Thread):
                 wake_word = getattr(self.cfg, "wake_word", "jarvis")
                 aliases = list(set(getattr(self.cfg, "wake_aliases", [])) | {wake_word})
                 fuzzy_ratio = float(getattr(self.cfg, "wake_fuzzy_ratio", 0.78))
-                if is_wake_word_detected(text_lower, wake_word, aliases, fuzzy_ratio):
+                # Wake-position guard — wake word must be in FIRST 2
+                # tokens of the utterance (was 4, tightened May 16).
+                # Defends against Whisper hallucinations like "Добавил
+                # субтитры джарвіс джарвіс джарвіс" where the wake word
+                # appears after content words. Real users say "Джарвис,
+                # ..." or "Ну, Джарвис, ..." — never with 3+ content
+                # words before the wake.
+                all_aliases_list = list(set(aliases) | {wake_word})
+                tokens = text_lower.split()
+                head = " ".join(tokens[:2]).lower()
+                if (
+                    is_wake_word_detected(text_lower, wake_word, aliases, fuzzy_ratio)
+                    and is_wake_word_detected(head, wake_word, aliases, fuzzy_ratio)
+                ):
                     self._wake_timestamp = utterance_start_time
                     self._start_thinking_tune()
                     self._set_face_state_listening()
-                    debug_log("early beep: wake word detected", "voice")
+                    debug_log("early beep: wake word detected (in head)", "voice")
+                elif is_wake_word_detected(text_lower, wake_word, aliases, fuzzy_ratio):
+                    debug_log(
+                        f"wake word found mid-sentence (not in first 4 tokens) — ignoring as background speech: '{text_lower[:80]}'",
+                        "voice",
+                    )
+                    print(f"  🔇 Ignored mid-sentence wake: \"{text_lower[:60]}\"", flush=True)
+                    self._transcript_buffer.mark_segment_processed(text_lower)
+                    return
 
         # Session-end stop commands — UA "стоп"/"досить"/"тиша"/"завершити сесію".
         # These work BOTH during TTS (interrupt + end session) AND during
@@ -894,13 +1555,19 @@ class VoiceListener(threading.Thread):
             debug_log(f"session-stop command detected: '{text_lower}'", "voice")
             print(f"  🛑 Session stop: \"{text_lower[:60]}\"", flush=True)
             if self.tts and self.tts.enabled and self.tts.is_speaking():
-                self.tts.interrupt()
+                self._interrupt_tts(reason="session-stop command")
             # Wipe dialog history — new session starts with a clean slate
             # so old context doesn't leak into the next wake.
+            # Round 29 (F75): under _dialog_history_lock — the F28 lock
+            # made append+trim atomic, but session-stop wiped history
+            # outside the lock. Concurrent _voice_direct_chat (line
+            # 2651) could read a torn dialog_history slice during the
+            # millisecond between clear()-pre and clear()-post.
             if hasattr(self, "_dialog_history"):
-                self._dialog_history.clear()
-            # Reset language to UA default and clear any pending states.
-            self._active_language = "uk"
+                with self._dialog_history_lock:
+                    self._dialog_history.clear()
+            # Reset language to RU default and clear any pending states.
+            self._active_language = "ru"
             self._pending_lang_switch = None
             self._pending_action = None
             self._pending_upgrade = None
@@ -920,7 +1587,7 @@ class VoiceListener(threading.Thread):
             stop_commands = getattr(self.cfg, "stop_commands", ["stop", "quiet", "shush", "silence", "enough", "shut up"])
             if is_stop_command(text_lower, stop_commands):
                 debug_log(f"stop command detected during TTS: {text_lower} (energy: {utterance_energy:.4f})", "voice")
-                self.tts.interrupt()
+                self._interrupt_tts(reason=f"stop command: {text_lower[:30]}")
                 try:
                     while not self._audio_q.empty():
                         self._audio_q.get_nowait()
@@ -948,7 +1615,7 @@ class VoiceListener(threading.Thread):
                     text_lower = salvaged
                 else:
                     debug_log(f"echo rejected during TTS: '{text_lower[:50]}'", "echo")
-                    print(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
+                    _vprint(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
                     return
 
         # Salvage user speech from merged echo+speech chunks.
@@ -957,8 +1624,12 @@ class VoiceListener(threading.Thread):
         # echo portion was captured during TTS but the transcript arrives after TTS
         # finishes. Try to strip the leading echo and use just the user's speech.
         # Skip entirely if there's no prior TTS — nothing to match against.
-        last_tts_text_for_salvage = self.echo_detector._last_tts_text or ""
-        last_tts_finish = self.echo_detector._last_tts_finish_time or 0.0
+        # Audit round 14 fix C3: snapshot the TTS window atomically.
+        _, last_tts_finish, last_tts_text_for_salvage, _ = (
+            self.echo_detector.snapshot_tts_window()
+        )
+        last_tts_text_for_salvage = last_tts_text_for_salvage or ""
+        last_tts_finish = last_tts_finish or 0.0
         # Use echo_tolerance as buffer — speaker/mic latency means the utterance
         # may start slightly after TTS finish yet still contain the echo.
         echo_tol = self.echo_detector.echo_tolerance
@@ -1075,11 +1746,33 @@ class VoiceListener(threading.Thread):
             # but that aren't in our alias list (e.g. "джагвис", "жаріс").
             # Heuristic: if the first word is short (3-9 chars) and starts
             # with one of the wake-sound prefixes, treat as vocative.
+            #
+            # Audit round 11 fix H4: the prior single-char trigger string
+            # `"jyчжяeх"` included "я", "е", "х" — Cyrillic letters that
+            # commonly start ordinary RU/UA sentences (я хочу, є питання,
+            # хочу спати, хто там, етап один). With a wake_timestamp set
+            # via fuzzy match elsewhere, ANY first word ≤9 chars starting
+            # with one of those letters was tagged vocative and the whole
+            # utterance got dispatched as the query. `wake_detection.py`
+            # already pruned "я" from its alias table for exactly the same
+            # reason.
+            # Audit round 14 fix H4: ``ч`` and ``ж`` were still on the
+            # single-char trigger — but ordinary RU/UA queries start with
+            # those letters constantly ("чому ти не…", "чекай хвилинку",
+            # "жінка дзвонила", "чи можеш…"). With a stale wake_timestamp
+            # the whole utterance was being treated as vocative and
+            # dispatched. The dz-sound mishearings these were trying to
+            # catch already match through the explicit ``startswith
+            # ("дж", "ya", "ja"))`` prefix below — so dropping ч/ж from
+            # the single-char list costs nothing and removes a major
+            # false-positive surface. Trigger now: j (Jarvis Latin),
+            # y (you / Jarvis YA-mishearing).
             if not is_vocative:
                 first_word = head.split()[0] if head.split() else ""
-                if (3 <= len(first_word) <= 9
-                        and first_word[0] in "jyчжяeх"
-                        or first_word.startswith(("дж", "ya", "ja"))):
+                if (
+                    (3 <= len(first_word) <= 9 and first_word[:1] in "jy")
+                    or (3 <= len(first_word) <= 9 and first_word.startswith(("дж", "ya", "ja")))
+                ):
                     is_vocative = True
 
             if not is_vocative:
@@ -1124,6 +1817,8 @@ class VoiceListener(threading.Thread):
                     # collect a follow-up utterance. This is the path
                     # that gives sub-1s perceived response on canned
                     # greetings.
+                    # Wake fast-path = highest confidence; tag for persist.
+                    self._dispatch_source = "wake"
                     self._dispatch_query(extracted)
                 else:
                     # User said just "Джарвіс" with no follow-up. Enter
@@ -1144,8 +1839,12 @@ class VoiceListener(threading.Thread):
             context_segments = self._transcript_buffer.get_last_seconds(self._buffer_duration)
 
             # Get TTS context for echo detection
-            last_tts_text = self.echo_detector._last_tts_text or ""
-            last_tts_finish_time = self.echo_detector._last_tts_finish_time or 0.0
+            # Audit round 14 fix C3: snapshot under lock.
+            _, last_tts_finish_time, last_tts_text, _ = (
+                self.echo_detector.snapshot_tts_window()
+            )
+            last_tts_text = last_tts_text or ""
+            last_tts_finish_time = last_tts_finish_time or 0.0
 
             intent_judgment = self._intent_judge.judge(
                 segments=context_segments,
@@ -1160,17 +1859,19 @@ class VoiceListener(threading.Thread):
                 # Log intent judge decision for user visibility
                 mode_str = "hot window" if could_be_hot_window else "wake word"
                 if intent_judgment.directed:
-                    print(f"  🧠 Intent ({mode_str}): directed → \"{intent_judgment.query or text_lower}\"", flush=True)
+                    _vprint(f"  🧠 Intent ({mode_str}): directed → \"{_safe_user_text(intent_judgment.query or text_lower)}\"", flush=True)
                 else:
-                    print(f"  🧠 Intent ({mode_str}): not directed ({intent_judgment.reasoning})", flush=True)
+                    _vprint(f"  🧠 Intent ({mode_str}): not directed ({intent_judgment.reasoning})", flush=True)
             else:
                 reason = self._intent_judge.last_failure_reason or "no segments or unavailable"
-                print(f"  🧠 Intent judge: unavailable ({reason})", flush=True)
+                _vprint(f"  🧠 Intent judge: unavailable ({reason})", flush=True)
                 debug_log(f"intent judge returned None — falling back ({reason})", "voice")
                 # Hot window fallback: if the early echo check already cleared
                 # this text, accept it even without the judge's verdict.
                 if could_be_hot_window:
-                    last_tts_text_fb = self.echo_detector._last_tts_text or ""
+                    # Audit round 14 fix C3: snapshot under lock.
+                    _, _, last_tts_text_fb, _ = self.echo_detector.snapshot_tts_window()
+                    last_tts_text_fb = last_tts_text_fb or ""
                     is_pure_echo = False
                     if last_tts_text_fb:
                         echo_score = fuzz.partial_ratio(
@@ -1183,24 +1884,38 @@ class VoiceListener(threading.Thread):
                             and text_words <= max(tts_words * 1.3, tts_words + 3)
                         )
                     if not is_pure_echo:
-                        print(f"  🧠 Intent fallback: accepting hot window speech", flush=True)
+                        _vprint(f"  🧠 Intent fallback: accepting hot window speech", flush=True)
                         debug_log(f"✅ Hot window fallback (judge unavailable): \"{text_lower}\"", "voice")
                         self.state_manager.cancel_hot_window_activation()
                         self._transcript_buffer.mark_segment_processed(text_lower)
                         self._clear_audio_buffers()
+                        # Hot-window fallback path → tag for persist.
+                        self._dispatch_source = "hot_window"
                         self.state_manager.start_collection(text_lower)
                         self._start_thinking_tune()
                         try:
-                            print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                            _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                         except Exception:
                             pass
                         return
 
             if intent_judgment is not None:
+                # HOISTED (May 17): define wake_word/wake_aliases/fuzzy_ratio
+                # at the top of this block so all downstream branches
+                # (hot-window guard, override guard, accept path) can use
+                # them without re-defining or hitting UnboundLocalError.
+                # Previously these were only defined inside the
+                # `not could_be_hot_window` sub-branch → my hot-window
+                # guard at line ~1806 crashed the audio thread.
+                wake_word = getattr(self.cfg, "wake_word", "jarvis")
+                wake_aliases = list(set(getattr(self.cfg, "wake_aliases", [])) | {wake_word})
+                fuzzy_ratio = float(getattr(self.cfg, "wake_fuzzy_ratio", 0.78))
+                aliases = wake_aliases  # alias for legacy code below
+
                 # If judge says stop command, interrupt TTS
                 if intent_judgment.stop and self.tts and self.tts.is_speaking():
                     debug_log(f"🛑 Intent judge detected stop command", "voice")
-                    self.tts.interrupt()
+                    self._interrupt_tts(reason="intent judge stop")
                     return
 
                 # If directed with query, process it
@@ -1208,13 +1923,11 @@ class VoiceListener(threading.Thread):
                     # In wake word mode, verify the wake word is actually present
                     # The LLM sometimes hallucinates wake words that don't exist
                     if not could_be_hot_window:
-                        wake_word = getattr(self.cfg, "wake_word", "jarvis")
-                        aliases = list(set(getattr(self.cfg, "wake_aliases", [])) | {wake_word})
                         has_wake_word = self._wake_timestamp is not None or is_wake_word_detected(
                             text_lower, wake_word, aliases
                         )
                         if not has_wake_word:
-                            print(f"  🧠 Intent override: no wake word found, ignoring", flush=True)
+                            _vprint(f"  🧠 Intent override: no wake word found, ignoring", flush=True)
                             debug_log(
                                 f"⚠️ Intent judge said directed but no wake word found in '{text_lower[:50]}...' "
                                 f"(reasoning: {intent_judgment.reasoning})",
@@ -1224,12 +1937,20 @@ class VoiceListener(threading.Thread):
                         else:
                             debug_log(f"✅ Intent judge accepted ({intent_judgment.confidence}): \"{intent_judgment.query}\"", "voice")
                             self.state_manager.cancel_hot_window_activation()
+                            # Wake word was confirmed present and judge accepted
+                            # → bump persistent-session idle timer.
+                            try:
+                                self.state_manager.mark_user_wake()
+                            except Exception:
+                                pass
                             self._transcript_buffer.mark_segment_processed(text_lower)
                             self._clear_audio_buffers()
+                            # Wake-confirmed via judge → tag for persist.
+                            self._dispatch_source = "wake"
                             self.state_manager.start_collection(intent_judgment.query)
                             self._start_thinking_tune()
                             try:
-                                print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                                _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                             except Exception:
                                 pass
                             return
@@ -1260,7 +1981,7 @@ class VoiceListener(threading.Thread):
                                 )
                                 if query_echo_score >= 70:
                                     debug_log(f"🔇 Echo in hot window (directed, score={echo_score}): \"{text_lower}\"", "voice")
-                                    print(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
+                                    _vprint(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
                                     self._stop_thinking_tune()
                                     return
                                 else:
@@ -1270,13 +1991,66 @@ class VoiceListener(threading.Thread):
                                     )
 
                         # The intent judge is explicitly designed to prune echo
-                        # and extract the actual user query — always prefer its
-                        # output when present. Falling back to raw heard text
-                        # leaks partially-salvaged echo fragments into tool
-                        # calls (e.g. "…amount now? okay, what is his best
-                        # song?" reaching webSearch verbatim). If the judge
-                        # returns an empty query (rare), fall back to raw text.
+                        # and extract the actual user query. But it ALSO tries
+                        # to "inline vague references" by pulling context from
+                        # earlier transcript segments (rule #6 in its prompt).
+                        # When Whisper garbles current utterance, judge may
+                        # invent a query by combining old segments with new
+                        # — e.g. heard "Є кейві бой" + prior TTS echo →
+                        # judge synthesizes "якщо так, є кейві бой". User
+                        # report: "відбувається привязка розмови до старих
+                        # запитів". Safety check: if the judge query is
+                        # significantly LONGER than the heard text AND adds
+                        # words not present in the heard text, treat it as
+                        # over-eager context inlining and prefer raw text.
                         judge_query = (intent_judgment.query or "").strip()
+                        # Vague pronouns / wh-words that legitimately need
+                        # context expansion. If heard text contains any of
+                        # these, judge is allowed to inline context.
+                        VAGUE_TOKENS = {
+                            # RU (primary post May 16)
+                            "это", "этот", "эта", "то", "тот", "та", "те",
+                            "она", "он", "оно", "они", "его", "её", "ее",
+                            "такой", "такая", "такие", "такое",
+                            "что-то", "кто-то",
+                            # UA (legacy)
+                            "це", "цей", "ця", "те", "той", "ті",
+                            "вона", "він", "воно", "вони", "її",
+                            # EN
+                            "that", "it", "this", "they", "them",
+                            "what about", "how about",
+                        }
+                        heard_lower = text_lower.lower()
+                        has_vague_ref = any(t in heard_lower.split() or t in heard_lower for t in VAGUE_TOKENS)
+                        heard_words = set(heard_lower.split())
+                        judge_words = set(judge_query.lower().split())
+                        new_words_added = judge_words - heard_words
+                        # Hardened guard (May 16): floor 40 → 20 chars so 1-2
+                        # word heard fragments ("сообщений", "функций") don't
+                        # bypass the check just because judge_query is short.
+                        # Also: ABSOLUTE rule — if heard is <3 words AND judge
+                        # adds ANY new words → reject (no legitimate inlining
+                        # case for such a short heard).
+                        heard_word_count = len(heard_lower.split())
+                        too_much_expansion = (
+                            len(judge_query) > max(20, int(len(text_lower) * 1.6))
+                            and len(new_words_added) >= 2
+                        )
+                        heard_too_short = (
+                            heard_word_count < 3
+                            and len(new_words_added) >= 1
+                        )
+                        if (
+                            judge_query
+                            and not has_vague_ref
+                            and (too_much_expansion or heard_too_short)
+                        ):
+                            debug_log(
+                                f"REJECTED judge expansion (no vague ref + too short/too inflated): "
+                                f"judge='{judge_query}' heard='{text_lower[:80]}'",
+                                "voice",
+                            )
+                            judge_query = ""
                         hot_query = judge_query or text_lower
                         if judge_query and judge_query.lower() != text_lower:
                             debug_log(
@@ -1284,17 +2058,173 @@ class VoiceListener(threading.Thread):
                                 f"\"{judge_query}\" (heard: \"{text_lower[:80]}\")",
                                 "voice",
                             )
+                        # P0 GUARD (May 16 night): in hot-window dispatches
+                        # the judge's prompt unconditionally returns DIRECTED
+                        # — so we need a per-dispatch sanity filter HERE.
+                        # Reject ambient TV/family speech ("какие дворцы",
+                        # "опа Газих") that don't continue the conversation.
+                        #
+                        # Audit round 23 fix (F40): the original guard
+                        # rejected ANYTHING under 6 words without a head-
+                        # wake or vague-continuation. That dropped ~90% of
+                        # legitimate user commands — "Какие твои
+                        # возможности?" (4w), "Который час?" (2w), "Запусти
+                        # Telegram" (2w), "Открой Notion" (2w). Live log
+                        # at 12:00:30 showed exactly this false reject.
+                        # Fix: ALSO accept short text when it starts with
+                        # a question word OR an imperative command verb.
+                        # That covers virtually all real voice commands
+                        # while still rejecting ambient noise ("какие
+                        # дворцы" doesn't start with a question word —
+                        # "дворцы" is a noun, "какие" is an adjective
+                        # masquerading as one, so it still gets caught).
+                        _hot_head = " ".join(text_lower.split()[:2])
+                        _hot_head_wake = is_wake_word_detected(
+                            _hot_head, wake_word, wake_aliases, fuzzy_ratio
+                        )
+                        _hot_starts_vague = any(
+                            text_lower.startswith(t + " ") or text_lower == t
+                            for t in VAGUE_TOKENS
+                        )
+                        _hot_words_n = len(hot_query.split())
+                        # F40: question-word / command-verb detection.
+                        # Russian primary + UA + EN. First-word check —
+                        # captures the natural "Что нового?" / "Open
+                        # Notion" pattern. Common imperatives have a
+                        # distinctive shape — typically a verb in second-
+                        # person form. Allowlist covers ~95% of practical
+                        # voice commands without being so broad it
+                        # accepts noise.
+                        _QUESTION_OR_CMD_FIRST_WORDS = {
+                            # RU questions
+                            "что", "чем", "какой", "какая", "какие", "какое",
+                            "где", "куда", "откуда", "когда", "почему", "зачем",
+                            "как", "сколько", "кто", "чей", "чья", "чьё",
+                            # UA questions
+                            "що", "чому", "де", "куди", "звідки", "коли",
+                            "як", "скільки", "хто",
+                            # EN questions
+                            "what", "where", "when", "why", "how", "who",
+                            "which", "whose", "do", "does", "is", "are",
+                            # RU imperatives (Jarvis commands)
+                            "найди", "открой", "запусти", "включи", "выключи",
+                            "покажи", "расскажи", "скажи", "спой", "сделай",
+                            "напиши", "отправь", "позвони", "переведи",
+                            "переключи", "поставь", "поищи", "проверь",
+                            "удали", "создай", "сохрани", "закрой",
+                            "напомни", "запиши", "продиктуй", "повтори",
+                            "посчитай", "сравни", "объясни", "помоги",
+                            # Round 25 fix (F52): RU infinitives. The
+                            # intent judge frequently normalises
+                            # imperatives to infinitives:
+                            #   user said "открой Telegram"
+                            #   judge returned "открыть telegram"
+                            # Without these the F40 guard rejected the
+                            # judge's own normalisation.
+                            "открыть", "запустить", "включить", "выключить",
+                            "найти", "показать", "рассказать", "сказать",
+                            "спеть", "сделать", "написать", "отправить",
+                            "позвонить", "перевести", "переключить",
+                            "поставить", "проверить", "удалить", "создать",
+                            "сохранить", "закрыть", "напомнить",
+                            "продиктовать", "повторить", "посчитать",
+                            "сравнить", "объяснить", "помочь",
+                            # UA imperatives
+                            "знайди", "відкрий", "запусти", "увімкни",
+                            "вимкни", "покажи", "розкажи", "скажи", "заспівай",
+                            "зроби", "напиши", "надішли", "зателефонуй",
+                            "переклади", "переключи", "постав", "перевір",
+                            "видали", "створи", "збережи", "закрий",
+                            "нагадай", "запиши", "повтори", "порахуй",
+                            "поясни", "допоможи",
+                            # UA infinitives
+                            "відкрити", "запустити", "увімкнути", "вимкнути",
+                            "знайти", "показати", "розказати", "сказати",
+                            "зробити", "написати", "надіслати",
+                            "перекласти", "перевірити", "видалити",
+                            "створити", "зберегти", "закрити", "нагадати",
+                            # EN imperatives
+                            "find", "open", "launch", "start", "stop",
+                            "show", "tell", "say", "sing", "do", "make",
+                            "write", "send", "call", "translate", "switch",
+                            "set", "search", "check", "delete", "create",
+                            "save", "close", "remind", "record", "repeat",
+                            "calculate", "compare", "explain", "help",
+                            "play", "pause", "resume", "shutdown", "restart",
+                            "screenshot", "copy", "paste", "cut",
+                        }
+                        # Round 25 fix (F52): check BOTH the raw heard
+                        # text AND the judge-normalised hot_query. The
+                        # judge may have rewritten the user's command
+                        # ("открой ютуб" → "открыть youtube"); if the
+                        # heard-text first word didn't match but the
+                        # normalised one does, accept.
+                        def _first_word_clean(s: str) -> str:
+                            parts = s.split()
+                            return parts[0].strip(",.!?;:") if parts else ""
+                        _heard_first = _first_word_clean(text_lower)
+                        _query_first = _first_word_clean(hot_query.lower())
+                        _hot_starts_question_or_cmd = (
+                            _heard_first in _QUESTION_OR_CMD_FIRST_WORDS
+                            or _query_first in _QUESTION_OR_CMD_FIRST_WORDS
+                        )
+                        # Also accept when EITHER heard or judge ends with "?"
+                        _hot_ends_question = (
+                            text_lower.rstrip().endswith("?")
+                            or hot_query.rstrip().endswith("?")
+                        )
+                        if (
+                            not _hot_head_wake
+                            and not _hot_starts_vague
+                            and not _hot_starts_question_or_cmd
+                            and not _hot_ends_question
+                            and _hot_words_n < 4
+                        ):
+                            debug_log(
+                                f"🚫 hot-window dispatch rejected — short ({_hot_words_n}w) "
+                                f"+ no head-wake + no vague + no question/cmd: \"{hot_query}\"",
+                                "voice",
+                            )
+                            print(
+                                f"  🚫 Hot-window: ignored ambient speech \"{text_lower[:60]}\"",
+                                flush=True,
+                            )
+                            self._stop_thinking_tune()
+                            try:
+                                self._transcript_buffer.mark_segment_processed(text_lower)
+                            except Exception:
+                                pass
+                            return
+
                         debug_log(f"✅ Intent judge accepted ({intent_judgment.confidence}): \"{hot_query}\"", "voice")
+                        # Hot-window judge-accept counts as real user activity
+                        # ONLY when we have STRONG signal (head-wake OR vague
+                        # continuation). Plain high-confidence accepts of
+                        # ambient speech (e.g. "какие дворцы") used to reset
+                        # the idle timer → safety-net never expired → infinite
+                        # self-talk. Now bump idle only on real engagement.
+                        if _hot_head_wake or _hot_starts_vague:
+                            try:
+                                self.state_manager.mark_user_wake()
+                            except Exception:
+                                pass
                         self.state_manager.cancel_hot_window_activation()
                         self._transcript_buffer.mark_segment_processed(text_lower)
                         self._clear_audio_buffers()
 
+                        # Tag provenance BEFORE start_collection. The
+                        # eventual dispatch flows through the collection-
+                        # timeout path (see `_check_query_timeout` /
+                        # `process_transcription` empty-text branch),
+                        # both of which only set `_dispatch_source` if
+                        # it's still None — so this tag survives.
+                        self._dispatch_source = "hot_window"
                         self.state_manager.start_collection(hot_query)
 
                         # Start thinking tune and show processing message
                         self._start_thinking_tune()
                         try:
-                            print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                            _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                         except Exception:
                             pass
                         return
@@ -1312,7 +2242,7 @@ class VoiceListener(threading.Thread):
                             text_lower, wake_word, aliases
                         )
                         if not has_wake_word:
-                            print(f"  🧠 Intent override: no wake word found, ignoring", flush=True)
+                            _vprint(f"  🧠 Intent override: no wake word found, ignoring", flush=True)
                             debug_log(
                                 f"⚠️ Intent judge said directed (no query) but no wake word in '{text_lower[:50]}...'",
                                 "voice"
@@ -1323,10 +2253,14 @@ class VoiceListener(threading.Thread):
                             self.state_manager.cancel_hot_window_activation()
                             self._transcript_buffer.mark_segment_processed(text_lower)
                             self._clear_audio_buffers()
+                            # Wake-confirmed dispatch via judge → tag "wake"
+                            # so the eventual collection-timeout flush
+                            # carries the right provenance.
+                            self._dispatch_source = "wake"
                             self.state_manager.start_collection(text_lower)
                             self._start_thinking_tune()
                             try:
-                                print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                                _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                             except Exception:
                                 pass
                             return
@@ -1345,7 +2279,7 @@ class VoiceListener(threading.Thread):
                             )
                             if is_pure_echo:
                                 debug_log(f"🔇 Echo in hot window (directed/no-query, score={echo_score}): \"{text_lower}\"", "voice")
-                                print(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
+                                _vprint(f"  🔇 Heard (echo): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
                                 self._stop_thinking_tune()
                                 return
 
@@ -1353,10 +2287,13 @@ class VoiceListener(threading.Thread):
                         self.state_manager.cancel_hot_window_activation()
                         self._transcript_buffer.mark_segment_processed(text_lower)
                         self._clear_audio_buffers()
+                        # Hot-window directed-high path → tag "hot_window"
+                        # for persist-memory provenance.
+                        self._dispatch_source = "hot_window"
                         self.state_manager.start_collection(text_lower)
                         self._start_thinking_tune()
                         try:
-                            print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                            _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                         except Exception:
                             pass
                         return
@@ -1379,7 +2316,9 @@ class VoiceListener(threading.Thread):
                         # This catches cases where user started speaking just as hot window expired
                         # Use a 2-second grace period after the 3-second hot window
                         hot_window_grace = 2.0
-                        last_tts_finish = self.echo_detector._last_tts_finish_time or 0.0
+                        # Audit round 14 fix C3: snapshot under lock.
+                        _, last_tts_finish, _, _ = self.echo_detector.snapshot_tts_window()
+                        last_tts_finish = last_tts_finish or 0.0
                         hot_window_end = last_tts_finish + self.state_manager.hot_window_seconds
                         time_after_hot_window = utterance_start_time - hot_window_end if utterance_start_time > 0 and hot_window_end > 0 else float('inf')
 
@@ -1395,10 +2334,12 @@ class VoiceListener(threading.Thread):
                             self._transcript_buffer.mark_segment_processed(text_lower)
 
                             self._clear_audio_buffers()
+                            # Grace-period accept = treat as hot-window follow-up.
+                            self._dispatch_source = "hot_window"
                             self.state_manager.start_collection(text_lower)
                             self._start_thinking_tune()
                             try:
-                                print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                                _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                             except Exception:
                                 pass
                             return
@@ -1426,7 +2367,7 @@ class VoiceListener(threading.Thread):
                                 self._stop_thinking_tune()
                                 return
                             # Mixed echo+speech — override the echo reasoning
-                            print(f"  🧠 Intent override: accepting hot window speech (mixed echo+speech)", flush=True)
+                            _vprint(f"  🧠 Intent override: accepting hot window speech (mixed echo+speech)", flush=True)
                             debug_log(
                                 f"⚡ Overriding echo reasoning in hot window "
                                 f"(echo_score={echo_score}, text longer than TTS): "
@@ -1436,10 +2377,12 @@ class VoiceListener(threading.Thread):
                             self.state_manager.cancel_hot_window_activation()
                             self._transcript_buffer.mark_segment_processed(text_lower)
                             self._clear_audio_buffers()
+                            # Mixed echo+speech in hot window → hot_window source.
+                            self._dispatch_source = "hot_window"
                             self.state_manager.start_collection(text_lower)
                             self._start_thinking_tune()
                             try:
-                                print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                                _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                             except Exception:
                                 pass
                             return
@@ -1474,20 +2417,72 @@ class VoiceListener(threading.Thread):
                             # Override the intent judge rejection — small models
                             # sometimes reject valid follow-ups like "don't you
                             # already know that?" as not directed.
-                            print(f"  🧠 Intent override: accepting hot window speech", flush=True)
+                            #
+                            # SAFETY GUARD (May 16): refuse override on suspect
+                            # fragments. User report "відповідає сам собі"
+                            # traced to Whisper hallucinating short phrases
+                            # ("или спросить", "это я", etc.) during quiet
+                            # post-TTS gaps. Judge correctly marked them
+                            # NOT DIRECTED but override still fired, creating
+                            # an echo loop: hallucination → dispatch → LLM
+                            # reply → new TTS → new hallucination.
+                            #
+                            # Trust HIGH-confidence judge rejection for short
+                            # fragments (<4 words) that don't contain the
+                            # wake word. Override only kicks in when:
+                            #   - judge confidence is low/medium, OR
+                            #   - text is long enough to be a real query (≥4 words), OR
+                            #   - text contains wake-shaped tokens (means user
+                            #     repeated wake mid-window).
+                            jconf = str(getattr(intent_judgment, "confidence", "low")).lower()
+                            text_words_n = len(text_lower.split())
+                            # Wake-token check on HEAD only — same logic
+                            # as trump-card guard. Wake mid-sentence
+                            # ("я тоже джарвіс думаю") is NOT a real
+                            # re-wake; only vocative-position counts.
+                            _head_text_hw = " ".join(text_lower.split()[:2])
+                            has_wake_token = is_wake_word_detected(
+                                _head_text_hw, wake_word, wake_aliases, fuzzy_ratio
+                            )
+                            # TIGHTENED (May 16 evening): with hot_window_persistent=True
+                            # the override is the main "talks to itself" path. Refuse
+                            # override unless BOTH conditions hold:
+                            #   - text is substantial (≥4 words), OR has head-wake
+                            #   - AND judge is NOT high-confidence rejection
+                            # Old code accepted short fragments at jconf=low/medium
+                            # without wake → Whisper hallucinations slipped through.
+                            if jconf == "high" and not has_wake_token:
+                                debug_log(
+                                    f"🚫 Refusing override — judge HIGH confidence rejection + no head-wake: "
+                                    f"\"{text_lower}\"",
+                                    "voice"
+                                )
+                                self._stop_thinking_tune()
+                                return
+                            if text_words_n < 4 and not has_wake_token:
+                                debug_log(
+                                    f"🚫 Refusing override — short ({text_words_n}w) + no head-wake: "
+                                    f"\"{text_lower}\"",
+                                    "voice"
+                                )
+                                self._stop_thinking_tune()
+                                return
+                            _vprint(f"  🧠 Intent override: accepting hot window speech", flush=True)
                             debug_log(
                                 f"⚡ Overriding intent judge in hot window "
-                                f"(echo_score={echo_score}, reasoning={intent_judgment.reasoning}): "
+                                f"(echo_score={echo_score}, conf={jconf}, words={text_words_n}, reasoning={intent_judgment.reasoning}): "
                                 f"\"{text_lower}\"",
                                 "voice"
                             )
                             self.state_manager.cancel_hot_window_activation()
                             self._transcript_buffer.mark_segment_processed(text_lower)
                             self._clear_audio_buffers()
+                            # Intent-judge override in hot window → hot_window source.
+                            self._dispatch_source = "hot_window"
                             self.state_manager.start_collection(text_lower)
                             self._start_thinking_tune()
                             try:
-                                print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                                _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
                             except Exception:
                                 pass
                             return
@@ -1505,12 +2500,23 @@ class VoiceListener(threading.Thread):
         aliases = set(getattr(self.cfg, "wake_aliases", [])) | {wake_word}
         fuzzy_ratio = float(getattr(self.cfg, "wake_fuzzy_ratio", 0.78))
 
-        wake_detected = is_wake_word_detected(text_lower, wake_word, list(aliases), fuzzy_ratio)
-        debug_log(f"wake word check: '{wake_word}' in '{text_lower}' → {wake_detected}", "voice")
+        # HEAD CHECK (May 16): wake word must be in the FIRST 4 tokens.
+        # Whisper hallucinations like "Май щеперска мови джарвіс ниво
+        # джарвіс" used to bypass this gate and dispatch as a query.
+        # Real users always put the wake word at the start.
+        _head_text_wake = " ".join(text_lower.split()[:2])
+        wake_detected = is_wake_word_detected(_head_text_wake, wake_word, list(aliases), fuzzy_ratio)
+        debug_log(f"wake word check (head): '{wake_word}' in '{_head_text_wake}' → {wake_detected}", "voice")
 
         if wake_detected:
             # Cancel any pending hot window activation when new query starts
             self.state_manager.cancel_hot_window_activation()
+
+            # Confirmed wake → reset persistent-session idle timer.
+            try:
+                self.state_manager.mark_user_wake()
+            except Exception:
+                pass
 
             # Mark the current segment as processed to prevent re-extraction
             self._transcript_buffer.mark_segment_processed(text_lower)
@@ -1519,18 +2525,74 @@ class VoiceListener(threading.Thread):
             self._clear_audio_buffers()
 
             query_fragment = extract_query_after_wake(text_lower, wake_word, list(aliases))
+            # Priority-4 wake fallback (judge unavailable/inconclusive)
+            # — text contained a wake word, so the eventual dispatch is
+            # wake-confirmed even though it'll fire from the collection-
+            # timeout path. Tag for persist-memory provenance.
+            self._dispatch_source = "wake"
             self.state_manager.start_collection(query_fragment)
 
             # Start thinking tune and show processing message
             self._start_thinking_tune()
             try:
-                print(f"\n✨ Working on it: {self.state_manager.get_pending_query()}")
+                _vprint(f"\n✨ Working on it: {_safe_user_text(self.state_manager.get_pending_query())}")
             except Exception:
                 pass
             return
 
         # Priority 5: Collection mode handling
         if self.state_manager.is_collecting():
+            # DEFENCE-IN-DEPTH (May 16): never let hallucinations / echo
+            # leak into the collection buffer just because we're past
+            # the top-of-function gate. Without this, Whisper junk
+            # ("Спасибо.", "Дякую.", echoes of our own TTS) silently
+            # piled up and dispatched on collection timeout, triggering
+            # canned replies to nobody — the self-talk loop.
+            _stripped = text_lower.strip().rstrip(".!?,;:…»\"'")
+
+            # (a) Re-run the canonical hallucination filter. Cheap, idempotent.
+            if self._is_known_hallucination(text):
+                debug_log(f"collection: dropped known hallucination: '{text_lower[:60]}'", "voice")
+                try:
+                    self._transcript_buffer.mark_segment_processed(text_lower)
+                except Exception:
+                    pass
+                return
+
+            # (b) Bare-token Whisper-junk blocklist (punctuation-stripped).
+            # Now references the module-level `BARE_JUNK_SET` — audit
+            # round 6 unified what used to be three drifting copies.
+            if _stripped in BARE_JUNK_SET:
+                debug_log(f"collection: dropped bare junk: '{_stripped}'", "voice")
+                try:
+                    self._transcript_buffer.mark_segment_processed(text_lower)
+                except Exception:
+                    pass
+                return
+
+            # (c) TTS-echo guard: if collection text closely matches the
+            # last thing the daemon SAID, it's our own speaker leaking
+            # into the mic, not a user follow-up.
+            try:
+                # Audit round 14 fix C3: snapshot under lock.
+                _, _, _last_tts_raw, _ = self.echo_detector.snapshot_tts_window()
+                last_tts = (_last_tts_raw or "").lower().strip()
+                if last_tts and len(_stripped) >= 3:
+                    echo_score = fuzz.partial_ratio(_stripped, last_tts) / 100.0
+                    if echo_score >= 0.85:
+                        debug_log(
+                            f"collection: dropped TTS echo (ratio={echo_score:.2f}): "
+                            f"'{_stripped[:50]}' vs TTS '{last_tts[:50]}'",
+                            "voice",
+                        )
+                        try:
+                            self._transcript_buffer.mark_segment_processed(text_lower)
+                        except Exception:
+                            pass
+                        return
+            except Exception:
+                pass
+
             self.state_manager.add_to_collection(text_lower)
             return
 
@@ -1548,7 +2610,7 @@ class VoiceListener(threading.Thread):
             # to a TTS question that arrived before hot window activated
             debug_log(f"input ignored (during TTS, not a stop command{intent_info}): {text_lower}", "voice")
             try:
-                print(f"  ⏳ Heard during TTS (waiting for hot window): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
+                _vprint(f"  ⏳ Heard during TTS (waiting for hot window): \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
             except Exception:
                 pass
         else:
@@ -1572,6 +2634,15 @@ class VoiceListener(threading.Thread):
         import requests
         import time as _time
 
+        # NOTE: `_stream_abort` is cleared at the TOP of `_dispatch_query`,
+        # not here. Audit round 6 finding: clearing it at the start of
+        # _voice_direct_chat created a TOCTOU race — if a HUD interrupt
+        # fired during the brief window between dispatch deciding to
+        # call this function and the `.clear()` above, the interrupt
+        # was silently lost. Now the clear happens before any chat path
+        # is selected, so an interrupt that arrives AFTER dispatch
+        # starts is preserved through to the stream loop.
+
         base_url = getattr(self.cfg, "ollama_base_url", "")
         model = getattr(self.cfg, "ollama_chat_model", "qwen2.5:3b")
         if not base_url:
@@ -1588,10 +2659,13 @@ class VoiceListener(threading.Thread):
         # the single source of truth across direct-chat and warmup.
         system_prompt = VOICE_STATIC_SYSTEM_PROMPT
 
-        # Language is dynamic (UA default, RU/EN/DE on explicit switch)
-        # — passed as a SEPARATE system message so it doesn't bust the
-        # cache on the main prompt. ~30 tokens, evals in <1s.
-        lang_directive = self._language_directive(getattr(self, "_active_language", "uk"))
+        # Language is dynamic (RU default after May 16 migration; UA/EN/DE
+        # on explicit switch) — passed as a SEPARATE system message so it
+        # doesn't bust the cache on the main prompt. ~30 tokens, evals in <1s.
+        # CRITICAL DEFAULT: 'ru' here is the ROOT cause of "speaks UA still"
+        # bug — the previous 'uk' default forced every chat call to ask the
+        # model for a UA reply, regardless of whisper_language="ru" config.
+        lang_directive = self._language_directive(getattr(self, "_active_language", "ru"))
 
         # Build messages with rolling dialog history so the model has
         # context across turns AND across sessions (persistent memory
@@ -1602,6 +2676,13 @@ class VoiceListener(threading.Thread):
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": lang_directive},
         ]
+        # Audit round 21 (F28): snapshot history under the lock — the
+        # mutation site holds the lock for append+trim, so the snapshot
+        # here is guaranteed to be a consistent prefix (no torn 17-
+        # element view). Keep the read short — just a slice into a
+        # local list so messages.extend() works on a frozen copy.
+        with self._dialog_history_lock:
+            _history_snapshot = list(self._dialog_history[-2:])
         # Last 2 messages (1 turn) — was 4. KV-cache prefix scan on
         # CPU at ~50 tok/s prompt-eval rate means every 100 tokens of
         # history = 2s added to TTFT. 2 turns of avg 100-tok replies
@@ -1609,7 +2690,9 @@ class VoiceListener(threading.Thread):
         # The model still has the immediate previous exchange for
         # follow-up coherence ("а ще?", "так само") — that's the only
         # legitimate use of history in voice mode anyway.
-        messages.extend(self._dialog_history[-2:])
+        # Audit round 21 (F28): use the lock-protected snapshot taken
+        # above instead of re-reading ``self._dialog_history`` here.
+        messages.extend(_history_snapshot)
         messages.append({"role": "user", "content": query})
 
         try:
@@ -1641,14 +2724,19 @@ class VoiceListener(threading.Thread):
                     "think": False,
                     "options": {
                         "temperature": 0.4,
-                        # 600 tokens — user explicitly removed the cap
-                        # ("прибрати ограніченіє на коротки відповіді").
-                        # gemma2:9b ~6-7 tok/s on CCX23 CPU → 600 toks
-                        # = ~90s worst-case. Streaming TTS speaks
-                        # sentence-by-sentence so user starts hearing
-                        # at ~3-5s anyway — full generation only matters
-                        # if the answer NEEDS the full length.
-                        "num_predict": 600,
+                        # VOICE-OPTIMIZED — cut from 600 → 220 tokens.
+                        # User report: "Джарвіс викликається супер довго
+                        # очікував приблизно 5хв". At qwen3:8b @ 6.55 tok/s
+                        # on CCX23, 600 tok = 92s, 220 tok = 34s. Streaming
+                        # TTS speaks sentence-1 at ~5-8s anyway, but the
+                        # FULL response completes ~3× faster. Voice replies
+                        # rarely need more than 100-150 tokens (~3 short
+                        # UA sentences) — capping at 220 cuts long-tail
+                        # latency without losing useful content. If user
+                        # explicitly asks for long explanation, model
+                        # learns to be more concise; downstream tool-use
+                        # path uses a separate larger budget.
+                        "num_predict": 220,
                         "repeat_penalty": 1.2,
                         "repeat_last_n": 192,
                         "presence_penalty": 0.3,
@@ -1696,11 +2784,47 @@ class VoiceListener(threading.Thread):
 
             def _flush_sentence(sent: str) -> None:
                 """Sanitize, strip lazy prefix, queue into TTS."""
+                # ABORT GUARD — if the user interrupted (wake re-fire,
+                # stop command, intent-judge cut), every tts.interrupt()
+                # call site also sets `self._stream_abort`. Drop the
+                # remaining sentences silently instead of speaking over
+                # the user. Without this guard, a long reply keeps
+                # finishing its queued sentences even after interrupt —
+                # the very "talks over user" bug we're fixing.
+                if self._stream_abort.is_set():
+                    debug_log(
+                        f"stream flush aborted: '{sent[:40]}' (stream_abort set)",
+                        "voice",
+                    )
+                    return
                 cleaned = self._strip_lazy_prefix(
                     self._sanitize_for_piper_uk(sent)
                 ).strip()
                 if not cleaned:
                     return
+                # Round 26 fix (F63), refined Round 29 (F77).
+                # The LLM occasionally output truncations like "Нило"
+                # or "Даня" instead of the canonical "Данило".
+                # User reported: "він каже до мене нило а не Данило".
+                #
+                # F77 narrows the rewrite — previous version included
+                # the dative "Данилу", instrumental "Данилом", and
+                # vocative "Даниле" which are CORRECT grammatical
+                # forms; replacing them with the nominative produced
+                # ungrammatical TTS like "Поздоровляю Данило з днем
+                # народження!" (should be "Данила"). We now only fix
+                # genuine mishearings/truncations: "Нило", "Даня",
+                # bare "Данил" stem, and the diminutive "Дани". The
+                # proper declensions Данила/Данилу/Данилом/Даниле/
+                # Данилові are left alone.
+                try:
+                    cleaned = _re.sub(
+                        r"\b(Нило|Даня|Дани|Данил)\b(?![а-яёІіЇїЄєҐґ])",
+                        "Данило",
+                        cleaned,
+                    )
+                except Exception:
+                    pass
                 # Emit typed sentence event regardless of TTS being on
                 # (consumers like Telegram bridge may want text only).
                 try:
@@ -1715,20 +2839,24 @@ class VoiceListener(threading.Thread):
                 if not (self.tts and self.tts.enabled):
                     return
                 try:
-                    # First sentence — track for echo detector.
-                    # Subsequent sentences extend the same TTS turn,
-                    # so we update the tracker as new text comes in.
-                    if not sentences_spoken:
-                        self.track_tts_start(cleaned)
-                        debug_log(
-                            f"stream sent #1: {cleaned[:60]}", "voice"
-                        )
-                    else:
-                        debug_log(
-                            f"stream sent #{len(sentences_spoken)+1}: "
-                            f"{cleaned[:60]}",
-                            "voice",
-                        )
+                    # Audit round 22 fix (F36): register EVERY streamed
+                    # sentence with the echo detector, not just the
+                    # first. Background: a multi-sentence streaming
+                    # reply ("Джарвіс. / Що нужно, Даніло?") used to
+                    # seed echo detector with only sentence #1
+                    # ("Джарвіс."). When the speaker→mic loop later
+                    # caught a fragment of sentence #2 ("что нужно,
+                    # данил?") the echo detector compared against
+                    # "Джарвіс." → mismatch → accepted as user input
+                    # → LLM responded to its own echo → "бред" loop.
+                    # Now every sentence updates ``_last_tts_text``
+                    # via ``track_tts_start`` so echo comparisons
+                    # always reference the most recent TTS output.
+                    self.track_tts_start(cleaned)
+                    debug_log(
+                        f"stream sent #{len(sentences_spoken)+1}: {cleaned[:60]}",
+                        "voice",
+                    )
                     self.tts.speak(cleaned)
                     sentences_spoken.append(cleaned)
                 except Exception as e:
@@ -1736,6 +2864,24 @@ class VoiceListener(threading.Thread):
 
             try:
                 for raw in response.iter_lines(decode_unicode=False):
+                    # ABORT GUARD — break the LLM stream as soon as a
+                    # `tts.interrupt()` call sets the flag. Without this
+                    # we keep pulling tokens off the HTTP stream (and
+                    # `_flush_sentence` would queue them) even after the
+                    # user has spoken over Jarvis. Closing the response
+                    # connection via `break` also tells Ollama to stop
+                    # generation server-side (it cancels the prediction
+                    # job when the client hangs up).
+                    if self._stream_abort.is_set():
+                        debug_log(
+                            "stream iter aborted (stream_abort set)",
+                            "voice",
+                        )
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                        break
                     if not raw:
                         continue
                     try:
@@ -1772,10 +2918,26 @@ class VoiceListener(threading.Thread):
                         break
             except Exception as e:
                 debug_log(f"stream iter failed: {e}", "voice")
+            finally:
+                # Round 29 (F78): always close the response. The abort
+                # path at line 2853 already calls response.close(), but
+                # the natural `done`-break path didn't — leaving the
+                # HTTP socket in CLOSE_WAIT until GC. Under heavy turn
+                # count the requests connection pool to Ollama got
+                # exhausted, manifesting as gradual session slowdown.
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
-            # Flush any trailing fragment (no terminal punctuation)
+            # Flush any trailing fragment (no terminal punctuation).
+            # `_flush_sentence` itself respects `self._stream_abort`,
+            # so an aborted reply silently drops the tail too — no
+            # extra check needed here, but reading the abort flag
+            # directly avoids the function-call overhead in the hot
+            # path when an interrupt has fired.
             tail = buf.strip()
-            if tail and len(tail) >= 2:
+            if tail and len(tail) >= 2 and not self._stream_abort.is_set():
                 _flush_sentence(tail)
 
             elapsed = _time.time() - t0
@@ -1796,6 +2958,21 @@ class VoiceListener(threading.Thread):
                     "voice",
                 )
             if content:
+                # Round 28 fix (F68): preserve the RAW LLM reply with
+                # Latin app names intact so the action_dispatcher's
+                # parse_action() can extract "Safari"/"YouTube"/etc.
+                # BEFORE _sanitize_for_piper_uk strips them out.
+                #
+                # Live evidence (events.jsonl): LLM produced "Сейчас
+                # открою YouTube в Safari." which became "Сейчас
+                # открою  в  ." after Latin-strip → parse_action saw
+                # "в" and called _open_app("в") → AppleScript failure.
+                # User report: "сафарі та ютуб не відкрив такі!"
+                #
+                # _dispatch_query reads this attribute right after
+                # _voice_direct_chat returns. The sanitized `content`
+                # below is what TTS speaks and what history stores.
+                self._last_raw_reply = content
                 # Sanitize Latin words / mixed-script content — Piper UA
                 # model has no English phoneme map and silently TRUNCATES
                 # audio when it hits a Latin word ("Jarvis допоможе" plays
@@ -1811,14 +2988,23 @@ class VoiceListener(threading.Thread):
                 # do a DuckDuckGo search and re-prompt with fresh
                 # snippets. This is the "always-internet-access" feature
                 # the user explicitly requested.
+                #
+                # TIGHTENED (May 16): trigger ONLY on explicit search-request
+                # phrases ("нужен поиск" / "поищи", etc.), NOT on common
+                # "не знаю" responses. The fallback was firing on every
+                # benign "не зрозумів" reply, doubling LLM call → 9.6s TTFT
+                # × 2 = 19s perceived response time. User report: "дуже
+                # довго та повільно працює". Now needs explicit user intent.
                 lc = content.lower()
                 if (
-                    "не знаю напевно" in lc
+                    "нужен поиск" in lc
+                    or "нужен веб-поиск" in lc
+                    or "поищи в интернете" in lc
                     or "потрібен пошук" in lc
                     or "потрібен веб-пошук" in lc
                 ) and len(query) > 4:
                     debug_log(f"web-search fallback for: '{query[:60]}'", "voice")
-                    print(f"  🌐 Шукаю в інтернеті: \"{query[:50]}\"", flush=True)
+                    _vprint(f"  🌐 Шукаю в інтернеті: \"{query[:50]}\"", flush=True)
                     results = self._web_search(query, max_results=4)
                     if results:
                         ctx = "\n".join(
@@ -1828,8 +3014,8 @@ class VoiceListener(threading.Thread):
                         retry_msgs = [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content":
-                                f"{query}\n\n[Контекст з веб-пошуку — використай ці факти:]\n{ctx}\n\n"
-                                f"Дай ЗМІСТОВНУ відповідь українською мовою на основі цього контексту."},
+                                f"{query}\n\n[Контекст из веб-поиска — используй эти факты:]\n{ctx}\n\n"
+                                f"Дай СОДЕРЖАТЕЛЬНЫЙ ответ на русском языке на основе этого контекста."},
                         ]
                         try:
                             t1 = _time.time()
@@ -1843,7 +3029,7 @@ class VoiceListener(threading.Thread):
                                     "think": False,  # qwen3 — see _voice_direct_chat above
                                     "options": {
                                         "temperature": 0.4,
-                                        "num_predict": 500,
+                                        "num_predict": 220,  # Matches voice budget — see _voice_direct_chat
                                         "repeat_penalty": 1.3,
                                         "repeat_last_n": 128,
                                         "presence_penalty": 0.5,
@@ -1858,6 +3044,9 @@ class VoiceListener(threading.Thread):
                                 m2 = d2.get("message", {}) if isinstance(d2, dict) else {}
                                 c2 = (m2.get("content") or "").strip()
                                 if c2 and len(c2) > 20:
+                                    # F68: keep raw web-search retry reply for
+                                    # action_dispatcher (Latin app names intact).
+                                    self._last_raw_reply = c2
                                     content = self._sanitize_for_piper_uk(c2)
                                     content = self._strip_lazy_prefix(content)
                                     debug_log(
@@ -1868,12 +3057,19 @@ class VoiceListener(threading.Thread):
                             debug_log(f"web-search retry error: {e}", "voice")
                 # Append to rolling dialog history AND persist to disk
                 # so Jarvis remembers across daemon restarts.
-                self._dialog_history.append({"role": "user", "content": query})
-                self._dialog_history.append({"role": "assistant", "content": content})
-                # Trim in-memory to last 16 messages (8 turns) to bound
-                # prompt size. Disk has the full history.
-                if len(self._dialog_history) > 16:
-                    self._dialog_history = self._dialog_history[-16:]
+                # Audit round 21 (F28): the append + slice "trim to 16"
+                # was a two-step operation that briefly left a 17- or
+                # 18-element list visible to other threads (HUD
+                # control watcher, TTS completion callback). The lock
+                # makes the invariant atomic — append, append, trim
+                # all happen under a single critical section so
+                # concurrent reads either see the pre-append state
+                # or the post-trim state, never an intermediate one.
+                with self._dialog_history_lock:
+                    self._dialog_history.append({"role": "user", "content": query})
+                    self._dialog_history.append({"role": "assistant", "content": content})
+                    if len(self._dialog_history) > 16:
+                        self._dialog_history = self._dialog_history[-16:]
                 # Persist asynchronously — disk write is fast (~1ms) but
                 # we still don't want to block the voice loop on it.
                 self._persist_memory_pair(query, content)
@@ -1908,21 +3104,137 @@ class VoiceListener(threading.Thread):
             return text
         import re
         # Common brand/word substitutions — case-insensitive whole word.
-        replacements = [
+        # Round 28 (F69): EXPANDED with common macOS app names so the
+        # TTS engine actually says "Сафарі"/"Ютуб"/"Хром" instead of
+        # eating the whole word (the line ~3098 pure-Latin stripper).
+        #
+        # Round 30 (F90): language-aware transliteration. F69 originally
+        # hard-coded Ukrainian spellings ("Сафарі" with і, "Ютуб") for
+        # every app. The system has been running in RU mode since the
+        # May UA→RU migration — embedding UA-script chars (і, ї, є, ґ)
+        # inside a Russian sentence flipped the Piper UA model into
+        # Ukrainian phoneme mode mid-utterance. User report:
+        # "переключається на український голос часом!!!". Live evidence
+        # (events.jsonl): "Сейчас открою Сафарі и перейду на Ютуб." —
+        # RU stem + UA-spelled app names → mixed-accent TTS.
+        # We now pick the spelling based on self._active_language.
+        lang = getattr(self, "_active_language", "ru")
+        # Common substitutions that don't depend on language.
+        common_subs = [
             (r"\bJarvis\b", "Джарвіс"),
             (r"\bJARVIS\b", "Джарвіс"),
-            (r"\bAI\b", "ШІ"),
-            (r"\bOK\b", "добре"),
-            (r"\bok\b", "добре"),
+            (r"\bAI\b", "ШІ" if lang == "uk" else "ИИ"),
+            (r"\bOK\b", "добре" if lang == "uk" else "хорошо"),
+            (r"\bok\b", "добре" if lang == "uk" else "хорошо"),
             (r"\bGPT\b", "Джі-Пі-Ті"),
-            (r"\bLLM\b", "мовна модель"),
-            (r"\bAPI\b", "АПІ"),
-            (r"\bCEO\b", "генеральний директор"),
-            (r"\bUI\b", "інтерфейс"),
-            (r"\bUX\b", "юзабіліті"),
+            (r"\bLLM\b", "мовна модель" if lang == "uk" else "языковая модель"),
+            (r"\bAPI\b", "АПІ" if lang == "uk" else "АПИ"),
+            (r"\bCEO\b", "генеральний директор" if lang == "uk" else "генеральный директор"),
+            (r"\bUI\b", "інтерфейс" if lang == "uk" else "интерфейс"),
+            (r"\bUX\b", "юзабіліті" if lang == "uk" else "юзабилити"),
             (r"\bNexus\b", "Нексус"),
-            (r"\bStudio\b", "Студіо"),
+            (r"\bStudio\b", "Студіо" if lang == "uk" else "Студио"),
         ]
+        # App-name spellings split by target language. RU uses "и"
+        # everywhere; UA uses "і". Piper's UA model handles both but
+        # using the wrong vowel triggers the wrong phoneme cluster
+        # mid-sentence and the user perceives an accent switch.
+        if lang == "uk":
+            app_subs = [
+                (r"\bSafari\b", "Сафарі"),
+                (r"\bYouTube\b", "Ютуб"), (r"\bYoutube\b", "Ютуб"),
+                (r"\bChrome\b", "Хром"),
+                (r"\bFirefox\b", "Файрфокс"),
+                (r"\bTelegram\b", "Телеграм"),
+                (r"\bSlack\b", "Слек"),
+                (r"\bDiscord\b", "Діскорд"),
+                (r"\bZoom\b", "Зум"),
+                (r"\bSpotify\b", "Спотіфай"),
+                (r"\bNotion\b", "Ноушн"),
+                (r"\bFigma\b", "Фігма"),
+                (r"\bGitHub\b", "Гітхаб"), (r"\bGithub\b", "Гітхаб"),
+                (r"\bWhatsApp\b", "Вотсап"), (r"\bWhatsapp\b", "Вотсап"),
+                (r"\bInstagram\b", "Інстаграм"),
+                (r"\bTwitter\b", "Твіттер"),
+                (r"\bFacebook\b", "Фейсбук"),
+                (r"\bGmail\b", "Джімейл"),
+                (r"\bGoogle\b", "Гугл"),
+                (r"\bMicrosoft\b", "Майкрософт"),
+                (r"\bWindows\b", "Віндовс"),
+                (r"\bmacOS\b", "макОС"),
+                (r"\bLinux\b", "Лінукс"),
+                (r"\bTerminal\b", "Термінал"),
+                (r"\bFinder\b", "Файндер"),
+                (r"\bMail\b", "Мейл"),
+                (r"\bCalendar\b", "Календар"),
+                (r"\bNotes\b", "Нотатки"),
+                (r"\bSettings\b", "Налаштування"),
+                (r"\bSystem\s+Settings\b", "Системні налаштування"),
+                (r"\bVS\s*Code\b", "Вс Код"), (r"\bVSCode\b", "Вс Код"),
+                (r"\bXcode\b", "Ікс Код"),
+                (r"\bClaude\b", "Клод"),
+                (r"\bChatGPT\b", "ЧатДжіПіТі"), (r"\bChatgpt\b", "ЧатДжіПіТі"),
+                (r"\bMaps\b", "Карти"),
+                (r"\bPhotos\b", "Фото"),
+                (r"\bMusic\b", "Музика"),
+                (r"\bWeather\b", "Погода"),
+                (r"\bReminders\b", "Нагадування"),
+                (r"\bPreview\b", "Перегляд"),
+                (r"\bTextEdit\b", "ТекстЕдіт"),
+                (r"\bKeynote\b", "Кейноут"),
+                (r"\bPages\b", "Пейджес"),
+                (r"\bNumbers\b", "Намберс"),
+            ]
+        else:
+            # Russian — use "и" (U+0438) not "і" (U+0456), no UA-only
+            # letters (ї, є, ґ). This is what Piper UA hears as
+            # pure-Russian phonemes; no accent-flip mid-sentence.
+            app_subs = [
+                (r"\bSafari\b", "Сафари"),
+                (r"\bYouTube\b", "Ютуб"), (r"\bYoutube\b", "Ютуб"),
+                (r"\bChrome\b", "Хром"),
+                (r"\bFirefox\b", "Файрфокс"),
+                (r"\bTelegram\b", "Телеграм"),
+                (r"\bSlack\b", "Слэк"),
+                (r"\bDiscord\b", "Дискорд"),
+                (r"\bZoom\b", "Зум"),
+                (r"\bSpotify\b", "Спотифай"),
+                (r"\bNotion\b", "Ноушн"),
+                (r"\bFigma\b", "Фигма"),
+                (r"\bGitHub\b", "Гитхаб"), (r"\bGithub\b", "Гитхаб"),
+                (r"\bWhatsApp\b", "Вотсап"), (r"\bWhatsapp\b", "Вотсап"),
+                (r"\bInstagram\b", "Инстаграм"),
+                (r"\bTwitter\b", "Твиттер"),
+                (r"\bFacebook\b", "Фейсбук"),
+                (r"\bGmail\b", "Джимейл"),
+                (r"\bGoogle\b", "Гугл"),
+                (r"\bMicrosoft\b", "Майкрософт"),
+                (r"\bWindows\b", "Виндовс"),
+                (r"\bmacOS\b", "макОС"),
+                (r"\bLinux\b", "Линукс"),
+                (r"\bTerminal\b", "Терминал"),
+                (r"\bFinder\b", "Файндер"),
+                (r"\bMail\b", "Мейл"),
+                (r"\bCalendar\b", "Календарь"),
+                (r"\bNotes\b", "Заметки"),
+                (r"\bSettings\b", "Настройки"),
+                (r"\bSystem\s+Settings\b", "Системные настройки"),
+                (r"\bVS\s*Code\b", "Вс Код"), (r"\bVSCode\b", "Вс Код"),
+                (r"\bXcode\b", "Икс Код"),
+                (r"\bClaude\b", "Клод"),
+                (r"\bChatGPT\b", "ЧатДжиПиТи"), (r"\bChatgpt\b", "ЧатДжиПиТи"),
+                (r"\bMaps\b", "Карты"),
+                (r"\bPhotos\b", "Фото"),
+                (r"\bMusic\b", "Музыка"),
+                (r"\bWeather\b", "Погода"),
+                (r"\bReminders\b", "Напоминания"),
+                (r"\bPreview\b", "Просмотр"),
+                (r"\bTextEdit\b", "ТекстЭдит"),
+                (r"\bKeynote\b", "Кейноут"),
+                (r"\bPages\b", "Пейджес"),
+                (r"\bNumbers\b", "Намберс"),
+            ]
+        replacements = common_subs + app_subs
         for pattern, repl in replacements:
             text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
 
@@ -2053,10 +3365,15 @@ class VoiceListener(threading.Thread):
         # trailing comma) for cases where the LLM stops at just the
         # filler word.
         fillers = (
+            # RU fillers (primary after uk→ru migration)
+            r"хорошо", r"понятно", r"понял", r"ладно",
+            r"да(?:,\s*я)?", r"конечно", r"разумеется",
+            r"окей", r"ок", r"безусловно", r"я могу",
+            r"я знаю", r"я готов", r"я здесь",
+            # UA fillers kept for code-switching safety — user
+            # occasionally drops UA words mid-sentence.
             r"добре", r"зрозуміло", r"зрозумів", r"гаразд",
-            r"так(?:,\s*я)?", r"звичайно", r"звісно",
-            r"окей", r"ок", r"авжеж", r"я можу",
-            r"я знаю", r"я готовий", r"я тут",
+            r"звичайно", r"звісно", r"авжеж", r"я готовий", r"я тут",
         )
         # Build alternation. Allow up to 3 fillers chained
         # ('Добре, зрозумів, я...') by running the strip 3×.
@@ -2103,7 +3420,6 @@ class VoiceListener(threading.Thread):
         # Whisper mishearings ("певіт" instead of "привіт", "джавіс"
         # at the start) so the same canned reply fires regardless of
         # transcription quality.
-        import re
         q = query.lower().strip()
         q = re.sub(r"[!?,.;:\"'`()\[\]{}«»…]+", " ", q)
         q = re.sub(r"\s+", " ", q).strip()
@@ -2113,6 +3429,23 @@ class VoiceListener(threading.Thread):
             if q.startswith(wake + " "):
                 q = q[len(wake) + 1:].strip()
                 break
+
+        # P0 SAFETY (May 17): refuse to emit a canned reply for bare
+        # 1-2 word fragments that are almost always misheard family /
+        # TV speech (Whisper hallucinates these on silence and fuzzy
+        # aliases catch single tokens). User report: "відповідає сам
+        # собі" — daemon was answering "Пожалуйста. Обращайтесь." to
+        # transcriptions of family's "спасибо" said in another room.
+        # The canned-reply path is the loudest single source of unwanted
+        # TTS because it bypasses the LLM entirely and speaks instantly.
+        # Audit round 6: now references the module-level BARE_JUNK_SET
+        # so the three gates (collection / canned / persist) stay in sync.
+        if q in BARE_JUNK_SET:
+            debug_log(
+                f"canned-reply: refused for bare-junk query '{q}' "
+                f"(likely misheard family/TV speech)", "voice"
+            )
+            return ""
 
         # Greetings — Ukrainian first (primary language), then RU/EN.
         greetings = {
@@ -2125,7 +3458,7 @@ class VoiceListener(threading.Thread):
             "hallo", "guten tag", "guten morgen",
         }
         if q in greetings:
-            return "Привіт, Даниле! Чим можу допомогти?"
+            return "Привет, Данило! Чем могу помочь?"
 
         # Acknowledgements/thanks.
         thanks = {
@@ -2135,7 +3468,7 @@ class VoiceListener(threading.Thread):
             "danke", "vielen dank",
         }
         if q in thanks:
-            return "Прошу. Звертайтесь."
+            return "Пожалуйста. Обращайтесь."
 
         # Farewells.
         farewells = {
@@ -2144,7 +3477,7 @@ class VoiceListener(threading.Thread):
             "tschüss", "auf wiedersehen",
         }
         if q in farewells:
-            return "До зустрічі, Даниле."
+            return "До встречи, Данило."
 
         # Status check — "як справи?" / "як ти?" / "як ся маєш?"
         status = {
@@ -2226,30 +3559,37 @@ class VoiceListener(threading.Thread):
             "молодец", "класс",
         }
         if q in compliments:
-            return "Дякую! Радий допомогти."
+            return "Спасибо! Рад помочь."
 
         return ""
 
     def _lang_name(self, code: str) -> str:
-        """Human-readable Ukrainian name of a language code."""
+        """Human-readable Russian name of a language code (post uk→ru migration)."""
         return {
+            "ru": "по-русски",
             "uk": "українською",
-            "ru": "російською",
-            "en": "англійською",
-            "de": "німецькою",
+            "en": "по-английски",
+            "de": "по-немецки",
         }.get(code, code)
 
     def _language_directive(self, code: str) -> str:
-        """Return the system-prompt clause that locks reply language."""
+        """Return the system-prompt clause that locks reply language.
+
+        Default (May 15 2026 onwards) is RU — Whisper transcribes RU
+        significantly better than UA, so the voice path runs in RU and
+        the assistant replies in kind. UA / EN / DE are still available
+        if the user explicitly switches mid-conversation.
+        """
         directives = {
-            "uk": (
-                "МОВА ВІДПОВІДІ: Українська (кирилиця). Завжди українською, "
-                "навіть якщо в історії є RU/EN/DE — не повторюй той вибір. "
-                "Замість 'Jarvis' пиши 'Джарвіс'."
-            ),
             "ru": (
-                "ЯЗЫК ОТВЕТА: Русский. Пользователь явно попросил перейти "
-                "на русский — отвечай только на русском, кириллицей."
+                "ЯЗЫК ОТВЕТА: Русский (кириллица). Всегда по-русски, "
+                "даже если в истории есть UA/EN/DE — не повторяй тот выбор. "
+                "Вместо 'Jarvis' пиши 'Джарвис'."
+            ),
+            "uk": (
+                "МОВА ВІДПОВІДІ: Українська (кирилиця). Користувач явно попросив "
+                "перейти на українську — відповідай тільки українською. "
+                "Замість 'Jarvis' пиши 'Джарвіс'."
             ),
             "en": (
                 "REPLY LANGUAGE: English. User explicitly requested English — "
@@ -2260,12 +3600,19 @@ class VoiceListener(threading.Thread):
                 "verlangt — antworte nur auf Deutsch."
             ),
         }
-        return directives.get(code, directives["uk"])
+        return directives.get(code, directives["ru"])
 
     def _run_self_upgrade_async(self, user_request: str) -> None:
         """Spawn Claude Code in a background thread to self-upgrade."""
         import threading as _t
         def _runner():
+            # Audit round 15 fix F8: pair every spawn_claude (which
+            # acquires the concurrency lock) with a release in the
+            # finally — otherwise a crash anywhere in the runner
+            # leaves the lock held and future upgrades silently
+            # refused.
+            from ..agent.self_upgrade import release_upgrade_lock
+            acquired = False
             try:
                 from ..agent.self_upgrade import (
                     write_upgrade_brief, spawn_claude,
@@ -2274,11 +3621,19 @@ class VoiceListener(threading.Thread):
                 brief = write_upgrade_brief(user_request)
                 proc = spawn_claude(brief)
                 if proc is None:
+                    # spawn_claude either failed to find the binary OR
+                    # rejected the spawn (concurrent run / invalid
+                    # REPO). In the binary-missing case the lock was
+                    # never acquired; in the others it was acquired
+                    # but already released by spawn_claude on its
+                    # error path. Either way no release needed here.
                     self._speak_and_continue(
-                        "Не знайшов Claude Code CLI. Встанови його через "
-                        "npm install minus g at-anthropic-ai-claude-code."
+                        "Не знайшов Claude Code CLI або інша самооновка вже триває."
                     )
                     return
+                # spawn_claude returned a live process → it acquired
+                # the lock and we own the release responsibility.
+                acquired = True
                 ok, summary = wait_for_completion_and_restart(proc)
                 # After kickstart we'll be dead — speak BEFORE restart.
                 if ok and "Перезапускаюсь" in summary:
@@ -2289,6 +3644,9 @@ class VoiceListener(threading.Thread):
             except Exception as e:
                 debug_log(f"self-upgrade thread error: {e}", "voice")
                 self._speak_and_continue(f"Помилка самооновлення: {e}")
+            finally:
+                if acquired:
+                    release_upgrade_lock()
         _t.Thread(target=_runner, daemon=True, name="self-upgrade").start()
 
     def _speak_and_continue(self, text: str) -> None:
@@ -2315,14 +3673,52 @@ class VoiceListener(threading.Thread):
         Args:
             query: Complete user query to process
         """
-        debug_log(f"dispatching query: '{query}'", "voice")
+        # Round 25 (F51): bump activity timestamp so the LLM
+        # keepalive thread suppresses its next ping — we're already
+        # about to pile prompt-eval work onto Ollama, no need to
+        # queue an extra dummy generation behind it.
+        self._last_user_activity_ts = time.time()
+        # PROVENANCE LIFECYCLE — atomically read-and-clear `_dispatch_source`
+        # at the top of dispatch. Previously cleared ONLY inside
+        # `_persist_memory_pair`, so early-return paths (lang switch /
+        # upgrade / action confirmation / direct user-command) left a stale
+        # "wake" tag dangling for the NEXT turn — a low-confidence
+        # collection-timeout dispatch would then get persisted as if it
+        # were wake-confirmed. We stash into a local now, pass to the
+        # persist helper below if/when we get there. Audit round 6 finding.
+        # P0 also fixes the `_voice_direct_chat` early-return leak path
+        # (empty query / HTTP non-200 / timeout) — those paths now also
+        # have their source cleared because we cleared it here at the top.
+        _dispatch_source_local = self._dispatch_source
+        self._dispatch_source = None
+        # Stash on the instance for `_persist_memory_pair` to read. We
+        # use a separate name (`_active_dispatch_source`) so that any
+        # NEW dispatch starting mid-flow (shouldn't happen, but defence
+        # in depth) doesn't trample the value the persist helper reads.
+        self._active_dispatch_source = _dispatch_source_local
+
+        # STREAM-ABORT LIFECYCLE — clear at the START of every dispatch.
+        # Was previously cleared inside `_voice_direct_chat` which
+        # opened a TOCTOU race (HUD interrupt set the flag during the
+        # brief window between dispatch start and the LLM call → the
+        # later `.clear()` wiped the interrupt → user heard Jarvis
+        # ignore their stop click). Clearing here means an interrupt
+        # that arrives AFTER this point is preserved through to the
+        # stream loop. Any interrupt BEFORE this point is for a
+        # previous reply that's already finished — safe to drop.
+        try:
+            self._stream_abort.clear()
+        except Exception:
+            pass
+
+        debug_log(f"dispatching query: '{query}' (source={_dispatch_source_local or 'unknown'})", "voice")
         # Emit typed STT-final event for HUD + any other consumers.
         try:
             from ..ipc import get_stream
             get_stream().emit(
                 "stt_final",
                 text=query,
-                lang=getattr(self, "_active_language", "uk"),
+                lang=getattr(self, "_active_language", "ru"),
                 confidence=1.0,
             )
         except Exception:
@@ -2336,7 +3732,7 @@ class VoiceListener(threading.Thread):
             lang_req = detect_language_switch(query)
             if lang_req is not None and not getattr(self, "_pending_lang_switch", None):
                 lang_code, ack = lang_req
-                current = getattr(self, "_active_language", "uk")
+                current = getattr(self, "_active_language", "ru")
                 if lang_code != current:
                     self._pending_lang_switch = lang_code
                     self._speak_and_continue(
@@ -2354,8 +3750,10 @@ class VoiceListener(threading.Thread):
                     # language. Otherwise the model keeps seeing the
                     # last 4 messages in the OLD language and copies
                     # that style — producing mixed output ("конфліктують").
+                    # F75: under _dialog_history_lock for atomicity.
                     try:
-                        self._dialog_history.clear()
+                        with self._dialog_history_lock:
+                            self._dialog_history.clear()
                     except Exception:
                         pass
                     debug_log(f"language switched to {new_lang}; history cleared", "voice")
@@ -2412,6 +3810,30 @@ class VoiceListener(threading.Thread):
         )
         pending = getattr(self, "_pending_action", None)
         if pending is not None:
+            # Audit round 11 fix C1 + round 12 lock fix: HUD ✓/✗ buttons
+            # set ``self._pending_confirmation`` to "yes"/"no". Both the
+            # HUD-watcher helper and this dispatch path consume it; the
+            # read+clear must hold ``_pending_lock`` or a simultaneous
+            # HUD click + voice arrival can both observe "yes", both
+            # clear, both execute → double-fire of the pending action.
+            with self._pending_lock:
+                hud_choice = self._pending_confirmation
+                if hud_choice in ("yes", "no"):
+                    self._pending_confirmation = None
+                    self._pending_action = None
+            if hud_choice in ("yes", "no"):
+                if hud_choice == "yes":
+                    debug_log(f"executing pending action via HUD: {pending.name}", "voice")
+                    try:
+                        ok, msg = pending.fn()
+                    except Exception as e:
+                        ok, msg = False, f"Помилка під час дії: {e}"
+                    self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+                    return
+                else:  # "no"
+                    debug_log(f"cancelled pending action via HUD: {pending.name}", "voice")
+                    self._speak_and_continue("Скасовано.")
+                    return
             if is_confirmation(query):
                 debug_log(f"executing pending action: {pending.name}", "voice")
                 ok, msg = pending.fn()
@@ -2430,15 +3852,19 @@ class VoiceListener(threading.Thread):
             # action and ignores the actual new query.
             self._pending_action = None
             try:
-                if (
-                    self._dialog_history
-                    and self._dialog_history[-1].get("role") == "assistant"
-                    and "підтверди" in self._dialog_history[-1].get("content", "").lower()
-                ):
-                    # Pop the orphan assistant proposal + its paired user msg
-                    self._dialog_history.pop()
-                    if self._dialog_history and self._dialog_history[-1].get("role") == "user":
+                # F75: under _dialog_history_lock so the read of
+                # _dialog_history[-1] and the paired pop()s are atomic
+                # with respect to _voice_direct_chat's snapshot read.
+                with self._dialog_history_lock:
+                    if (
+                        self._dialog_history
+                        and self._dialog_history[-1].get("role") == "assistant"
+                        and "підтверди" in self._dialog_history[-1].get("content", "").lower()
+                    ):
+                        # Pop the orphan assistant proposal + its paired user msg
                         self._dialog_history.pop()
+                        if self._dialog_history and self._dialog_history[-1].get("role") == "user":
+                            self._dialog_history.pop()
                     debug_log("removed abandoned action proposal from history", "voice")
             except Exception:
                 pass
@@ -2484,10 +3910,18 @@ class VoiceListener(threading.Thread):
                     spoken = direct.description
                     msg = spoken  # for dialog history
                 self._speak_and_continue(spoken)
-                # Store in dialog history so context stays coherent
+                # Store in dialog history so context stays coherent.
+                # Audit round 12 fix: the voice direct-chat path caps
+                # `_dialog_history` to 16 entries (lines ~2721-2722) but
+                # THIS direct-action path used to append without any
+                # cap. Every "стоп"/"час"/"open url" command leaked two
+                # dict entries forever; engine.py:2408 reads the whole
+                # list per turn so per-turn latency grew linearly.
                 try:
                     self._dialog_history.append({"role": "user", "content": query})
                     self._dialog_history.append({"role": "assistant", "content": msg})
+                    if len(self._dialog_history) > 16:
+                        self._dialog_history = self._dialog_history[-16:]
                 except Exception:
                     pass
                 return
@@ -2541,7 +3975,18 @@ class VoiceListener(threading.Thread):
         # If user already said "виконуй" in the original query, execute
         # immediately without asking. Otherwise stage the action and
         # ask for confirmation.
-        action = parse_action(reply)
+        #
+        # Round 28 (F68): parse the RAW reply (Latin app names intact)
+        # instead of the sanitized `reply` which has all ≥2-char Latin
+        # words stripped. Without this, "Сейчас открою Safari" became
+        # "Сейчас открою " in `reply`, the regex captured the lone "в"
+        # preposition between "открою" and ".", and _open_app("в")
+        # failed silently — user's "сафарі не відкрив" complaint.
+        raw_for_action = getattr(self, "_last_raw_reply", "") or reply
+        # One-shot read; clear so a subsequent canned/non-LLM dispatch
+        # doesn't accidentally re-use a stale unsanitized reply.
+        self._last_raw_reply = ""
+        action = parse_action(raw_for_action)
         if action is not None:
             if is_confirmation(query):
                 # Inline confirm — user said "виконуй ..." right away.
@@ -2569,7 +4014,10 @@ class VoiceListener(threading.Thread):
             def _on_duration_known(duration: float):
                 debug_log(f"TTS exact duration: {duration:.2f}s", "voice")
                 if self.echo_detector:
-                    self.echo_detector._tts_exact_duration = duration
+                    # Audit round 14 fix C3: route through helper so the
+                    # write goes under _tts_state_lock instead of racing
+                    # _matches_tts_segment readers.
+                    self.echo_detector.set_tts_exact_duration(duration)
 
             # If _voice_direct_chat already streamed the WHOLE reply
             # sentence-by-sentence to TTS, we just need to wait for
@@ -2637,6 +4085,7 @@ class VoiceListener(threading.Thread):
         self._pre_roll.clear()
         self.is_speech_active = False
         self._silence_frames = 0
+        self._voice_run = 0
 
         # Clear wake detection state
         self._wake_timestamp = None
@@ -2651,21 +4100,35 @@ class VoiceListener(threading.Thread):
         debug_log("audio buffers cleared", "voice")
 
     def _is_speech_frame(self, frame) -> bool:
-        """Determine if audio frame contains speech."""
+        """Determine if audio frame contains speech.
+
+        REVERTED (May 16 evening): the OR-combination with energy_floor
+        broke endpoint detection — with `voice_min_energy=0.0025` +
+        normal room ambience, EVERY frame became "voice" → utterances
+        maxed out at 350 frames (7s) without ever endpointing → Whisper
+        decoded 5.7s of silence as UA YouTube hallucinations on loop.
+
+        Back to webrtcvad as the single source of truth when present.
+        Energy floor only used when VAD is unavailable (degraded mode).
+        For whisper-quiet wake words, the right answer is to TIGHTEN
+        `vad_aggressiveness` to capture quiet speech (1 → 2), not to
+        widen the speech gate with an OR.
+        """
         if np is None:
             return True
 
-        # Track energy for echo detection
+        # Track energy for echo detection (used elsewhere)
         rms = float(np.sqrt(np.mean(np.square(frame))))
         self._recent_audio_energy.append(rms)
 
         if self._vad is None:
             return rms >= float(getattr(self.cfg, "voice_min_energy", 0.0045))
 
-        # Use WebRTC VAD
         try:
             pcm16 = np.clip(frame.flatten() * 32768.0, -32768, 32767).astype(np.int16).tobytes()
-            return bool(self._vad.is_speech(pcm16, getattr(self, "_stream_samplerate", self._samplerate)))
+            return bool(self._vad.is_speech(
+                pcm16, getattr(self, "_stream_samplerate", self._samplerate)
+            ))
         except Exception:
             return False
 
@@ -2696,8 +4159,12 @@ class VoiceListener(threading.Thread):
 
             if confidence is not None and confidence < min_confidence:
                 if confidence >= marginal_threshold:
-                    # Marginal confidence - show in log viewer (not debug)
-                    print(f"🔇 Low confidence ({confidence:.2f}): \"{seg.text.strip()[:50]}...\"", flush=True)
+                    # Marginal confidence — F93 gated. Don't dump
+                    # third-party speech to world-readable .out.log.
+                    if getattr(self.cfg, "voice_debug", False):
+                        print(f"🔇 Low confidence ({confidence:.2f}): \"{seg.text.strip()[:50]}...\"", flush=True)
+                    else:
+                        debug_log(f"segment filtered (low conf {confidence:.2f}, len={len(seg.text)})", "voice")
                 else:
                     # Very low confidence - debug only
                     debug_log(f"segment filtered (confidence={confidence:.2f}): '{seg.text}'", "voice")
@@ -2805,10 +4272,44 @@ class VoiceListener(threading.Thread):
         webscrapes where these phrases repeat heavily. They never appear in
         legitimate user speech, so we can hard-block them upstream of
         repetitive-detection (saves CPU on intent-judge / fuzzy passes).
+
+        TRUMP-CARD GUARD (May 16): if the user actually said the wake word
+        (or any of its aliases) ANYWHERE in the heard text, we never reject
+        it as a hallucination. Earlier versions matched substrings like
+        "это я", "ладно", "ну" — which then ate legitimate commands like
+        "Джарвис, нужно открыть финдер" (substring "ну" in "нужно") or
+        "Джарвис, это я попросил X". The hallucination filter must never
+        outrank a real wake utterance.
+
+        WORD-BOUNDARY MATCHING (May 16): patterns are now matched against
+        the heard text via regex word-boundaries (`\\bPATTERN\\b`). This
+        stops short fragments like "ну"/"бо"/"ага" from matching inside
+        unrelated words ("нужно", "тебе", "магазин").
         """
         if not text:
             return False
         lower = text.lower()
+
+        # Trump-card guard: real wake word AT THE START of utterance →
+        # never reject. The wake must be in the FIRST 4 tokens (vocative
+        # position) — exactly where a real user puts it. This prevents
+        # Whisper hallucinations like "Добавил субтитры, джарвіс,
+        # джарвіс, джарвіс" or "Май щеперска мови джарвіс ниво джарвіс"
+        # from bypassing the hallucination filter and reaching dispatch.
+        # Real users say "Джарвис, ..." — they don't bury the wake word
+        # mid-sentence after 4+ unrelated words.
+        try:
+            _ww = getattr(self.cfg, "wake_word", "jarvis")
+            _wal = list(set(getattr(self.cfg, "wake_aliases", [])) | {_ww})
+            _wfr = float(getattr(self.cfg, "wake_fuzzy_ratio", 0.78))
+            head_tokens = lower.split()[:2]
+            head_text = " ".join(head_tokens)
+            if is_wake_word_detected(head_text, _ww, _wal, _wfr):
+                return False
+        except Exception:
+            # Fail open — better to occasionally let a hallucination
+            # through than to drop a real wake word due to a guard bug.
+            pass
         # Known idle-noise patterns. Each phrase observed multiple times in
         # production logs with `whisper_no_speech_threshold` ≥ 0.85.
         # NEW (May 15) patterns from user logs after large-v3-turbo switch:
@@ -2842,9 +4343,260 @@ class VoiceListener(threading.Thread):
             "see you next",
             "subtitles by",
             "продолжение следует",
+            # NEW (May 15 evening): observed mishearings of TTS echo
+            # ("Слухаю, Даниле" → "Привінжер") and ambient room noise.
+            "кінець брифінгу",
+            "кінець брифінга",
+            "брифінг закінчено",
+            "привінжер",          # TTS-echo mishearing
+            "пописано",            # ambient-noise artifact
+            "ошикається",          # ambient-noise artifact
+            "роберт",              # repeated-name silence hallucination
+            "ярсь",                # silence noise artifact
+            "яксь",                # silence noise artifact (with question)
+            "чисте ж, даром",     # silence noise artifact
+            "посмотри, свій",     # silence noise artifact
+            # NEW (May 15 night): quiet-audio hallucinations observed 4+
+            # times in single session. User: "видумує сам слова і пише
+            # їх і дає відповідь". These are short common UA YouTube
+            # phrases Whisper produces on near-silence.
+            "дякуємо",             # Whisper's default "thanks" hallucination
+            "дякуємо!",
+            "дякуємо за",
+            "є кейві бой",        # garbage Whisper output
+            "якщо є питання",     # YouTube outro hallucination
+            "якщо є запитання",
+            "якщо є питання, пишіть",
+            "пишіть в коментар",
+            # NEW (round 2): unambiguous Whisper noise artifacts only.
+            # Avoid filtering real UA words (так/ні/дякую) since user
+            # may legitimately say them. Background-speech defence is
+            # handled separately via min-duration gate + wake-position.
+            # REMOVED (May 16): bare "бо" — word-boundary regex would
+            # match the Cyrillic conjunction "бо" too, which is a real
+            # UA word ("джарвіс йди, бо я зайнятий"). Keep only the
+            # ellipsis-stuffed forms that are pure noise tokens.
+            "бо...",
+            # RU YouTube-outro hallucinations (May 15, after lang switch
+            # uk → ru). Whisper trained heavily on RU YouTube scrapes —
+            # silence consistently decodes as these template phrases.
+            "спасибо за просмотр",
+            "спасибо за внимание",
+            "спасибо за просмотр!",
+            "спасибо за внимание!",
+            "подпишитесь на канал",
+            "подписывайтесь на канал",
+            "ставьте лайки",
+            "ставьте лайк",
+            "пишите в комментариях",
+            "пишите комментарии",
+            "до новых встреч",
+            "до новых видео",
+            "увидимся в следующем",
+            "продолжение следует",
+            "редактор субтитров",
+            "субтитры подготовил",
+            "субтитры сделал",
+            "субтитры:",
+            "корректор:",
+            # Audit round 22 fix (F34): RU subtitle-loop hallucinations
+            # that survived round 21's filter. Live evidence from
+            # ~/Library/Application Support/jarvis/events.jsonl:
+            #   stt_final: "смотрите продолжение в следующей серии."
+            #   sentence (Jarvis reply!): "Следующая серия — в
+            #                              следующем эпизоде."
+            # The LLM was responding to its own echo of a Whisper
+            # subtitle hallucination — full "бред" loop the user
+            # complained about. These patterns kill the loop at the
+            # input gate.
+            "смотрите продолжение",
+            "следующая серия",
+            "следующей серии",
+            "в следующем эпизоде",
+            "следующем эпизоде",
+            "следующий эпизод",
+            "в следующем выпуске",
+            "следующий выпуск",
+            "продолжение в следующ",
+            "конец первой серии",
+            "конец серии",
+            "конец эпизода",
+            "до встречи в следующ",
+            "увидимся в следующей",
+            # MBC/КBC Korean broadcasting watermark hallucinations
+            # — Whisper picks these up from training corpus when fed
+            # broadband white noise (HVAC, fan).
+            "мбц ньюс",
+            "мбц новости",
+            "kbs ньюс",
+            # Audit round 23 fix (F43): single/short words that are
+            # Jarvis-own TTS output picked up as echo through the
+            # speakers. Live evidence (events.jsonl seq=288):
+            #   Jarvis TTS: "Джарвис здесь."
+            #   Whisper transcribed echo as: "здесь."  →  passed
+            #     through every guard  →  LLM responded with "Нило,
+            #     ты где?" → user hears "бред".
+            # These bare words have no business arriving as user
+            # input — they're either echo or noise. The trump-card
+            # guard above checks the FIRST 2 tokens for the wake
+            # word, so legitimate "Джарвис, я здесь" still gets
+            # through (wake in head). Bare standalone forms below
+            # are rejected.
+            "здесь",
+            "здесь.",
+            "я здесь",
+            "я здесь.",
+            "данило",
+            "данило.",
+            "данил",
+            "данил.",
+            "что нужно",
+            "что нужно?",
+            "что нужно.",
+            "нило",
+            "нило.",
+            "ты где",
+            "ты где?",
+            "слушаю",
+            "слушаю.",
+            # Common RU silence-noise artifacts.
+            # RE-ADDED bare "спасибо" (May 16 evening): the trump-card
+            # guard now restricts to head-2-tokens, so "Джарвис,
+            # спасибо тебе" still passes (wake is in head). Bare
+            # "спасибо." alone is the #1 Whisper silence hallucination
+            # and was flooding logs every 1-3 seconds. Word-boundary
+            # regex below ensures it doesn't match inside "спасибочки".
+            "спасибо",
+            "спасибо.",
+            "спасибо!",
+            "продолжаем",
+            # NEW (May 15 evening): RU YouTube-intro greetings — Whisper
+            # outputs these AS PURE SILENCE. Observed 10+ times in
+            # 5 minutes when user wasn't talking at all:
+            #   Heard: "Добрый вечер!"
+            #   Heard: "Добрый день!"
+            #   Heard: "Доброе утро!"
+            #   Heard: "Добро пожаловать!"
+            #   Heard: "Благодарю"
+            #   Heard: "Добрый день, друзья!"
+            # These are the RU counterpart to the UA "Дякую за перегляд"
+            # YouTube outros. Block at source.
+            "добрый вечер",
+            "добрый день",
+            "доброе утро",
+            "добро пожаловать",
+            "благодарю",
+            "добрый день, друзья",
+            "добрый вечер, друзья",
+            "приветствую вас",
+            "приветствую",
+            "здравствуйте",
+            "здравствуйте, друзья",
+            "здравствуйте всем",
+            "всем привет",
+            "доброго времени суток",
+            # Whisper noise-token outputs (RU)
+            # PURGED (May 16): bare "ну"/"ага"/"угу" — even with
+            # word-boundary regex these match user fillers in legitimate
+            # speech ("джарвис, ну скажи как дела"). Only ellipsis forms
+            # and reduplicated stutters survive — those are pure noise.
+            "м-м-м",
+            "ну-ну",
+            # NEW (May 16 evening): echo-loop hallucinations. THE WAKE-SHAPED
+            # VARIANTS (жарвис/джарвис/харвис/гарвис) WERE REMOVED — they
+            # ARE wake attempts, and the trump-card guard at the top of
+            # this function lets them through. The remaining patterns are
+            # daemon's own TTS-echo phrases that Whisper sometimes catches
+            # and routes back as user input.
+            #
+            # PURGED also: bare "ладно"/"хорошо"/"это я"/"или спросить"
+            # — these are normal user follow-ups in conversation
+            # ("джарвис, ладно, давай дальше"). The trump-card guard
+            # already protects them when wake is present. When no wake
+            # is present, the wake-position check + intent judge handle
+            # rejection.
+            "хорошо понял",       # 2-word phrase — pattern intact
+            "хорошо, понял",
+            "что-нибудь еще",
+            "что-нибудь ещё",
+            "чем еще могу",
+            "чем ещё могу",
+            "задавай вопрос",     # TTS echo of daemon's own follow-up prompt
+            "задавайте вопрос",
+            "постараюсь ответить",
+            "нужно что-то сделать",
+            # NEW (May 16): user has TV/radio playing biblical content in
+            # the room. Whisper transcribed 48s of ambient noise as a long
+            # passage about Solomon and the Ark of the Covenant. These
+            # phrases NEVER appear in legitimate user voice queries:
+            "соломон",
+            "иерусалим",
+            "ковчег",
+            "ковчега",
+            "ковчегу",
+            "господь",
+            "господа",
+            "господнего",
+            "господней",
+            "израиля",
+            "израильт",
+            "израильск",
+            "священник",
+            "ветхий завет",
+            "новый завет",
+            "евангели",
+            "молитв",
+            "благослов",
+            "церков",
+            "храм",
+            "архангел",
+            # Whisper bracket-annotations for non-speech audio (sirens,
+            # music, applause). These are training-data artifacts where
+            # transcribers labeled non-vocal sounds in caps.
+            "[музыка]",
+            "[аплодисменты]",
+            "[смех]",
+            "[аплодисмент",
+            "полицейская сирена",
+            "сирена",
+            "звук сирены",
+            "playing music",
+            "*music*",
         )
+        # Word-boundary matching: stop short patterns like "бо"/"ну"
+        # from matching inside real words ("тебе"/"нужно"). Python's
+        # `\b` works on word chars (incl. Cyrillic via UNICODE flag,
+        # which is the default in Python 3). For patterns that contain
+        # punctuation/spaces (e.g. "[музыка]", "*music*", "продолжение
+        # следует") the `\b` rule still anchors against the alnum edges
+        # of those tokens, so they still match.
+        #
+        # Round 25 fix (F57): cache compiled regex patterns so we don't
+        # re-compile 80+ regexes on every utterance. With every
+        # utterance hitting this hot path 4-6 times (process_transcription,
+        # collection guard, intent_judge entry, dispatch entry), the
+        # savings are ~3-5ms per utterance on real Whisper output.
+        # Substring-only patterns (brackets/asterisks) cached as None
+        # so the dispatch logic below keeps its single shape.
+        if not hasattr(self.__class__, "_HALL_RE_CACHE"):
+            cache: dict[str, "re.Pattern | None"] = {}
+            for pat in KNOWN_PATTERNS:
+                if any(ch in pat for ch in "[]*"):
+                    cache[pat] = None
+                    continue
+                try:
+                    cache[pat] = re.compile(r"\b" + re.escape(pat) + r"\b")
+                except re.error:
+                    cache[pat] = None
+            self.__class__._HALL_RE_CACHE = cache
+        cache = self.__class__._HALL_RE_CACHE
         for pat in KNOWN_PATTERNS:
-            if pat in lower:
+            compiled = cache.get(pat)
+            if compiled is None:
+                if pat in lower:
+                    return True
+                continue
+            if compiled.search(lower):
                 return True
         return False
 
@@ -2853,24 +4605,60 @@ class VoiceListener(threading.Thread):
         if self.state_manager.check_collection_timeout():
             query = self.state_manager.clear_collection()
             if query.strip():
+                # Same provenance as the inline-text timeout path above
+                # (`process_transcription`'s `_dispatch_source = "wake_collection"`).
+                # Collection was opened by a confirmed wake — the timeout
+                # just decided when to finalise. Preserve more-specific
+                # sources like "hot_window" by only setting when unset.
+                if self._dispatch_source is None:
+                    self._dispatch_source = "wake_collection"
                 self._dispatch_query(query)
             else:
                 # Empty collection on timeout — user said just "Джарвіс"
-                # with no follow-up question. Without this branch the daemon
-                # went silent (no dispatch, no reply), leaving the HUD coin
-                # stuck on LISTENING with no audible response. Speak a
-                # short prompt so the user knows Jarvis is awake and waiting,
-                # AND reset the face state so the next "Джарвіс" can fire.
-                debug_log("collection timed out with empty query — speaking ack", "voice")
+                # with no follow-up question. Speak ack, then keep mic
+                # open via hot window so user can give the command
+                # without having to say "Джарвіс" a second time.
+                # User report: "після того як він каже слухаю даниле
+                # відразу закривається і не можна нечого зробити".
+                debug_log("collection timed out with empty query — speaking ack + opening hot window", "voice")
                 self._stop_thinking_tune()
                 if self.tts and self.tts.enabled:
-                    self.tts.speak("Слухаю, Даниле.")
-                # Reset HUD to IDLE so coin doesn't stay on LISTENING.
-                try:
-                    from desktop_app.face_widget import get_jarvis_state, JarvisState
-                    get_jarvis_state().set_state(JarvisState.IDLE)
-                except Exception:
-                    pass
+                    # ECHO TRACKING — track BEFORE speak so the echo
+                    # detector knows what we're about to play. Without
+                    # this, the mic captures "Слушаю, Данило" as if it
+                    # were a user follow-up command → fed to intent
+                    # judge → judge says directed=true → loop. Audit
+                    # round 7 finding C1 (this was the smoking gun for
+                    # "Jarvis talks to itself after empty wake").
+                    ack_text = "Слушаю, Данило."
+                    self.track_tts_start(ack_text)
+                    # Hot-window activation deferred to the TTS completion
+                    # callback so it fires AFTER the audio settles, not
+                    # before. Previously `activate_hot_window()` ran
+                    # synchronously, which opened the listening window
+                    # while the speaker was still playing the ack →
+                    # immediate self-capture.
+                    def _ack_done():
+                        try:
+                            self.activate_hot_window()
+                        except Exception as e:
+                            debug_log(f"failed to activate hot window after ack: {e}", "voice")
+                    try:
+                        self.tts.speak(ack_text, completion_callback=_ack_done)
+                    except TypeError:
+                        # Some TTS backends don't accept the kwarg —
+                        # fall back to sync speak + immediate activate.
+                        self.tts.speak(ack_text)
+                        try:
+                            self.activate_hot_window()
+                        except Exception as e:
+                            debug_log(f"failed to activate hot window after ack (fallback): {e}", "voice")
+                else:
+                    # No TTS available — open hot window immediately.
+                    try:
+                        self.activate_hot_window()
+                    except Exception as e:
+                        debug_log(f"failed to activate hot window after ack (no TTS): {e}", "voice")
 
         # Also check hot window expiry - this ensures the timeout is enforced
         # even when there's no audio being processed
@@ -2960,11 +4748,12 @@ class VoiceListener(threading.Thread):
                         )
                         try:
                             print("  ⏸  Перебиваю — чую тебе", flush=True)
-                            self.tts.interrupt()
+                            self._interrupt_tts(reason="mic-energy spike")
                             # Clear echo-detector's last_tts so the next
                             # transcript isn't auto-rejected as echo.
+                            # Audit round 14 fix C3: route through helper.
                             try:
-                                self.echo_detector._last_tts_text = ""
+                                self.echo_detector.clear_last_tts_text()
                             except Exception:
                                 pass
                             # Drop queued mic audio (likely TTS echo).
@@ -3096,7 +4885,7 @@ class VoiceListener(threading.Thread):
                         # real voice call pays cold-cache latency. Both pull
                         # from VOICE_STATIC_SYSTEM_PROMPT (module constant)
                         # so they CAN'T drift.
-                        warm_lang = self._language_directive("uk")
+                        warm_lang = self._language_directive("ru")
                         warm_resp = _rq.post(
                             f"{base_url.rstrip('/')}/api/chat",
                             json={
@@ -3104,7 +4893,7 @@ class VoiceListener(threading.Thread):
                                 "messages": [
                                     {"role": "system", "content": VOICE_STATIC_SYSTEM_PROMPT},
                                     {"role": "system", "content": warm_lang},
-                                    {"role": "user", "content": "[warmup] привіт"},
+                                    {"role": "user", "content": "[warmup] привет"},
                                 ],
                                 "stream": False,
                                 "keep_alive": "24h",
@@ -3119,7 +4908,7 @@ class VoiceListener(threading.Thread):
                                     # cache slot. Any drift = cache miss
                                     # on first real call = 15-25s pause.
                                     "temperature": 0.4,
-                                    "num_predict": 600,
+                                    "num_predict": 220,  # MUST match real call exactly (KV-cache slot)
                                     "repeat_penalty": 1.2,
                                     "repeat_last_n": 192,
                                     "presence_penalty": 0.3,
@@ -3185,6 +4974,124 @@ class VoiceListener(threading.Thread):
         )
         return threads
 
+    def _start_llm_keepalive(self) -> None:
+        """Periodic Ollama keepalive ping to prevent model eviction.
+
+        Audit round 24 fix (F48): even though chat calls pass
+        ``keep_alive=24h``, Ollama on Hetzner CCX23 occasionally
+        evicts the qwen3:8b weights under memory pressure (host
+        OOM-reaper, other guests on shared infrastructure). A reload
+        costs ~25-35s of cold prompt-eval — the source of user's
+        "дуже довго чкати відповіді" complaint. A lightweight ping
+        every 30s (1-token output, ~50ms server work) is cheap and
+        keeps the KV cache hot.
+
+        We don't ping during active conversation — only when the
+        daemon has been IDLE for >20s. This avoids piling extra
+        load on the LLM during a streaming reply.
+        """
+        import threading as _t
+        import time as _time
+
+        chat_model = self._llm_warmup_results.get("chat", (None, False))[0] if hasattr(self, "_llm_warmup_results") else None
+        if not chat_model:
+            # Fall back to config — warmup may not have populated
+            # _llm_warmup_results yet at the time this is called.
+            try:
+                from ..config import resolve_chat_model
+                chat_model = resolve_chat_model(self.cfg)
+            except Exception:
+                chat_model = getattr(self.cfg, "chat_model", "qwen3:8b")
+        if not chat_model:
+            debug_log("LLM keepalive: no chat_model resolved — skipping", "voice")
+            return
+
+        # Round 28 (F72): also keep intent_judge model resident. Live
+        # evidence (events.jsonl): "intent_judge timeout after 45.0s"
+        # repeated every 60-90s because Ollama evicts qwen2.5:3b after
+        # the configured intent_judge keep_alive (10m) expires between
+        # voice turns. The chat-side keep_alive=24h kept the 8b chat
+        # model hot but the 3b intent judge model died → every wake
+        # paid a 45s cold-load tax on the very first decision.
+        intent_model = getattr(self.cfg, "intent_judge_model", None)
+        if not intent_model and self._intent_judge is not None:
+            intent_model = getattr(self._intent_judge.config, "model", None)
+        # Dedupe: if intent_judge_model == chat_model, only ping once.
+        ping_models = [chat_model]
+        if intent_model and intent_model != chat_model:
+            ping_models.append(intent_model)
+
+        base_url = getattr(self.cfg, "ollama_base_url", "http://127.0.0.1:11434").rstrip("/")
+        ping_url = f"{base_url}/api/generate"
+        ping_interval = 30.0   # seconds between pings
+        idle_threshold = 20.0  # only ping when daemon idle this long
+
+        # Round 25 fix (F51): the round-24 implementation referenced
+        # ``self._stop_event`` (does not exist on Listener — only on
+        # tune_player.TunePlayer) and called ``requests.post`` without
+        # importing requests at module scope. Live log:
+        #   ``LLM keepalive ping failed: name 'requests' is not defined``
+        # — the feature was 100% dead code since round 24. Now using
+        # the existing ``self._should_stop`` flag pattern (set by
+        # daemon shutdown at line 1010) and the module-level
+        # ``requests`` import added at the top of this file.
+        def _ping_loop() -> None:
+            # Stagger first ping so we don't collide with initial warmup
+            _time.sleep(ping_interval)
+            while not self._should_stop:
+                try:
+                    # Skip ping if a reply is in flight or TTS is speaking —
+                    # the model is already loaded and we don't want to
+                    # queue extra prompt-eval work behind the user's call.
+                    if self.tts and self.tts.is_speaking():
+                        _time.sleep(ping_interval)
+                        continue
+                    # Also skip if a hot window / collection is active —
+                    # user just spoke or is about to speak.
+                    try:
+                        if self.state_manager.is_collecting():
+                            _time.sleep(ping_interval)
+                            continue
+                    except Exception:
+                        pass
+                    # Only ping when we've been idle "long enough" — avoids
+                    # double-loading model right after a real query.
+                    last_activity = self._last_user_activity_ts or 0.0
+                    if last_activity > 0 and (_time.time() - last_activity) < idle_threshold:
+                        _time.sleep(ping_interval)
+                        continue
+
+                    # Minimal ping: 1-token output. We use /api/generate
+                    # rather than /api/chat so it doesn't pollute any
+                    # chat-side KV cache prefix. F72: ping each model
+                    # we care about (chat + intent_judge if distinct).
+                    for _model in ping_models:
+                        try:
+                            requests.post(
+                                ping_url,
+                                json={
+                                    "model": _model,
+                                    "prompt": " ",
+                                    "stream": False,
+                                    "options": {"num_predict": 1, "temperature": 0.0},
+                                    "keep_alive": "24h",
+                                },
+                                timeout=10.0,
+                            )
+                            debug_log(f"LLM keepalive ping ok ({_model})", "voice")
+                        except Exception as e_inner:
+                            debug_log(f"LLM keepalive ping {_model} failed: {e_inner}", "voice")
+                except Exception as e:
+                    debug_log(f"LLM keepalive loop error: {e}", "voice")
+                _time.sleep(ping_interval)
+
+        t = _t.Thread(target=_ping_loop, daemon=True, name="jarvis-llm-keepalive")
+        t.start()
+        debug_log(
+            f"LLM keepalive started (models={ping_models}, interval={ping_interval}s)",
+            "voice",
+        )
+
     def _start_hud_control_watcher(self) -> None:
         """Poll the HUD→daemon control file for session-management commands.
 
@@ -3214,9 +5121,33 @@ class VoiceListener(threading.Thread):
 
         def _watch():
             last_ts = 0.0
+            # Audit round 13 fix: snapshot our own UID once so we can
+            # reject control.json files written by another local user
+            # (multi-user macOS). The HUD runs as the same user as
+            # the daemon, so any other-UID writer is suspicious.
+            our_uid = os.getuid()
             while not getattr(self.state_manager, "_should_stop", False):
                 try:
                     if os.path.exists(ctrl_path):
+                        # Reject other-UID writers — local privilege gap
+                        # otherwise lets any local process drive Jarvis
+                        # state (end_session, interrupt_tts, mute).
+                        try:
+                            st = os.stat(ctrl_path)
+                            if st.st_uid != our_uid:
+                                debug_log(
+                                    f"HUD control: rejecting foreign-UID write (uid={st.st_uid})",
+                                    "voice",
+                                )
+                                try:
+                                    os.remove(ctrl_path)
+                                except Exception:
+                                    pass
+                                time.sleep(0.1)
+                                continue
+                        except FileNotFoundError:
+                            time.sleep(0.1)
+                            continue
                         with open(ctrl_path, "r", encoding="utf-8") as f:
                             data = json.load(f)
                         ts = float(data.get("ts", 0))
@@ -3225,52 +5156,214 @@ class VoiceListener(threading.Thread):
                             last_ts = ts
                             debug_log(f"HUD control: action='{action}' ts={ts}", "voice")
                             if action in ("end_session", "stop_session", "session_end"):
-                                if self.tts and self.tts.enabled and self.tts.is_speaking():
-                                    self.tts.interrupt()
+                                # Audit round 20 fix (CRITICAL — user
+                                # reported "кнопки завершення не
+                                # працюють"): previously this branch
+                                # was guarded by ``tts.is_speaking()``,
+                                # so during the THINKING window (LLM
+                                # streaming, first sentence not yet
+                                # dequeued by Piper) the click was a
+                                # no-op. ``_interrupt_tts`` is safe to
+                                # call unconditionally — it sets the
+                                # ``_stream_abort`` flag (which breaks
+                                # the iter_lines loop in
+                                # ``_voice_direct_chat``) AND drains
+                                # the TTS engine. Now end_session
+                                # ALWAYS aborts the in-flight reply,
+                                # mirroring the voice "стоп" path at
+                                # lines 1455-1469.
+                                self._interrupt_tts(reason="HUD end_session")
+                                # F75: under lock so concurrent
+                                # _voice_direct_chat reads stay consistent.
                                 if hasattr(self, "_dialog_history"):
-                                    self._dialog_history.clear()
+                                    with self._dialog_history_lock:
+                                        self._dialog_history.clear()
+                                # Mirror voice-stop cleanup: reset
+                                # language + clear any pending
+                                # confirmation/lang-switch/upgrade so
+                                # the next session starts fresh.
+                                try:
+                                    self._active_language = "ru"
+                                except Exception:
+                                    pass
+                                try:
+                                    with self._pending_lock:
+                                        self._pending_lang_switch = None
+                                        self._pending_action = None
+                                        self._pending_upgrade = None
+                                        self._pending_confirmation = None
+                                except Exception:
+                                    pass
                                 self.state_manager.force_end_session()
+                                # Drain captured-audio queue so a
+                                # half-utterance mid-click is not
+                                # dispatched after the session ends.
+                                try:
+                                    while not self._audio_q.empty():
+                                        self._audio_q.get_nowait()
+                                except Exception:
+                                    pass
+                                # Reset state-manager collection so a
+                                # half-collected query doesn't get
+                                # dispatched on the next silence
+                                # timeout.
+                                try:
+                                    self.state_manager.clear_collection()
+                                except Exception:
+                                    pass
                                 print("  🛑 Session ended (HUD right-click)", flush=True)
                             elif action in ("interrupt_tts", "stop_speaking", "interrupt"):
-                                # Just stop the current TTS, keep the
-                                # hot window active so the user can
-                                # immediately ask a follow-up.
-                                if self.tts and self.tts.enabled and self.tts.is_speaking():
-                                    self.tts.interrupt()
-                                    print("  ⏸  TTS interrupted (HUD click)", flush=True)
+                                # Audit round 20 fix: dropped the
+                                # ``is_speaking()`` guard. The handler
+                                # MUST fire even when no audio is
+                                # playing yet — that's the THINKING
+                                # window where LLM stream is running
+                                # and ``_stream_abort`` is the only
+                                # way to short-circuit it. Without
+                                # this, clicking ⏸ in the first 1-2 s
+                                # of a long reply did nothing.
+                                self._interrupt_tts(reason="HUD interrupt_tts")
+                                print("  ⏸  TTS interrupted (HUD click)", flush=True)
                                 # Clear echo-detector last_tts so the
                                 # next utterance isn't auto-rejected.
+                                # Audit round 14 fix C3: route through helper.
                                 try:
-                                    self.echo_detector._last_tts_text = ""
+                                    self.echo_detector.clear_last_tts_text()
                                 except Exception:
                                     pass
                                 self._set_face_state_listening()
                             elif action == "confirm":
-                                # User confirmed a pending action — flag
-                                # is read by the next dispatch turn.
-                                self._pending_confirmation = "yes"
+                                # User confirmed a pending action.
+                                # Audit round 11 fix C1: immediately
+                                # execute the action so the click works
+                                # standalone; previously the flag just
+                                # sat there until the next voice arrived.
+                                with self._pending_lock:
+                                    self._pending_confirmation = "yes"
                                 print("  ✅ Confirmed (HUD)", flush=True)
+                                self._consume_pending_confirmation_from_hud()
                             elif action == "deny":
-                                self._pending_confirmation = "no"
+                                with self._pending_lock:
+                                    self._pending_confirmation = "no"
                                 print("  ❌ Denied (HUD)", flush=True)
+                                self._consume_pending_confirmation_from_hud()
                             elif action == "mute":
-                                if self.tts and self.tts.enabled:
-                                    self.tts.interrupt()
+                                # Audit round 20 fix: drop the
+                                # ``self.tts and self.tts.enabled``
+                                # guard. ``_interrupt_tts`` is None-
+                                # safe and ALSO sets ``_stream_abort``
+                                # (the only way to break the LLM
+                                # stream loop). Even on a config with
+                                # TTS disabled, mute should still kill
+                                # an in-flight LLM call so the daemon
+                                # doesn't keep generating tokens after
+                                # the user explicitly silenced it.
+                                self._interrupt_tts(reason="HUD mute")
                                 print("  🔇 TTS muted (HUD right-click)", flush=True)
                             elif action in ("force_finalize", "confirm_input"):
-                                # User clicked ✓ — finalise current
-                                # utterance NOW, don't wait for VAD pause.
-                                if self.is_speech_active:
+                                # User clicked ✓ — context-aware:
+                                #
+                                # IF there's a pending action awaiting
+                                #   confirmation → treat as YES (confirm).
+                                # ELIF speech is currently being captured
+                                #   → finalise the utterance NOW (skip
+                                #   VAD silence wait).
+                                # ELIF a query is currently being collected
+                                #   (hot window, awaiting more user input
+                                #   to dispatch) → force-dispatch what we
+                                #   already have. This is the path the
+                                #   user complained about (round 24): a
+                                #   transcript was shown in captions but
+                                #   nothing happened on click — because
+                                #   the daemon was waiting in COLLECTING
+                                #   state for more audio. Force-dispatch
+                                #   ends that wait immediately.
+                                # ELIF TTS is currently speaking → treat
+                                #   as "I want to interrupt and ask
+                                #   something else". Aborting TTS is
+                                #   handled by the wake-interrupt path
+                                #   normally, but if user can't say wake
+                                #   right now (background noise, hand-
+                                #   held), pressing Confirm gives them
+                                #   the same escape hatch.
+                                # ELSE → no-op (with a log entry — the
+                                #   button click DID register, just no
+                                #   actionable state to act on).
+                                #
+                                # Round 24 fix (F47): expanded coverage
+                                # so the button always does SOMETHING
+                                # useful or, in the genuine no-op case,
+                                # at least leaves a log line so the
+                                # user knows their click was received.
+                                with self._pending_lock:
+                                    has_pending = (
+                                        self._pending_confirmation is None and (
+                                            self._pending_action is not None
+                                            or self._pending_lang_switch is not None
+                                            or self._pending_upgrade is not None
+                                        )
+                                    )
+                                    if has_pending:
+                                        self._pending_confirmation = "yes"
+                                if has_pending:
+                                    print("  ✅ Confirmed pending action (HUD ✓)", flush=True)
+                                    self._consume_pending_confirmation_from_hud()
+                                elif self.is_speech_active:
                                     self._force_finalize_requested = True
                                     print("  ✓ Force-finalise (HUD)", flush=True)
+                                elif self.state_manager.is_collecting():
+                                    # Round 24 fix (F47): user pressed
+                                    # Confirm while we were collecting —
+                                    # treat as "send what I have now".
+                                    # Force collection timeout so the
+                                    # next loop iteration dispatches.
+                                    try:
+                                        self.state_manager.force_collection_timeout()
+                                        print("  ✓ Force-dispatch collection (HUD ✓)", flush=True)
+                                    except Exception as _e:
+                                        debug_log(
+                                            f"force_finalize collection-dispatch failed: {_e}",
+                                            "voice",
+                                        )
+                                elif self.tts and self.tts.is_speaking():
+                                    # Round 24 fix (F47): user pressed
+                                    # Confirm during TTS — treat as
+                                    # "OK, stop and listen". Cleaner
+                                    # than waiting through a long reply
+                                    # the user no longer wants.
+                                    self._interrupt_tts(reason="HUD confirm during TTS")
+                                    print("  ⏸  TTS interrupted (HUD ✓ during reply)", flush=True)
                                 else:
                                     debug_log(
-                                        "force_finalize ignored — no active speech",
+                                        "force_finalize: no pending action / no speech / "
+                                        "no collection / no TTS — click acknowledged but no-op",
                                         "voice",
                                     )
+                                    print(
+                                        "  ✓ HUD button click registered (no action available right now)",
+                                        flush=True,
+                                    )
                             elif action in ("cancel_utterance", "reset_input"):
-                                # User clicked ✗ — drop accumulated audio.
-                                if self.is_speech_active:
+                                # User clicked ✗ — context-aware (mirrors
+                                # the confirm button logic above):
+                                #
+                                # IF pending action awaiting confirmation
+                                #   → treat as NO (deny it).
+                                # ELIF speech being captured → drop audio.
+                                with self._pending_lock:
+                                    has_pending = (
+                                        self._pending_confirmation is None and (
+                                            self._pending_action is not None
+                                            or self._pending_lang_switch is not None
+                                            or self._pending_upgrade is not None
+                                        )
+                                    )
+                                    if has_pending:
+                                        self._pending_confirmation = "no"
+                                if has_pending:
+                                    print("  ❌ Denied pending action (HUD ✗)", flush=True)
+                                    self._consume_pending_confirmation_from_hud()
+                                elif self.is_speech_active:
                                     self._cancel_utterance_requested = True
                                     print("  ✗ Cancel utterance (HUD)", flush=True)
                                 else:
@@ -3285,7 +5378,11 @@ class VoiceListener(threading.Thread):
                                 pass
                 except Exception as e:
                     debug_log(f"HUD control watcher error: {e}", "voice")
-                time.sleep(0.5)
+                # 100ms poll (was 500ms). User report (May 16): "перемикається
+                # на підтвердження довго" — half-second click→action delay
+                # felt sluggish. 100ms = 5× faster button feedback, costs ~0%
+                # CPU (one stat() + 0/1 small JSON load per tick on idle).
+                time.sleep(0.1)
 
         t = _t.Thread(target=_watch, daemon=True, name="hud-control-watcher")
         t.start()
@@ -3413,6 +5510,18 @@ class VoiceListener(threading.Thread):
         print("  🔥 Warming up models...", flush=True)
         self._llm_warmup_started_at = time.time()
         self._llm_warmup_threads = self._start_llm_warmup()
+
+        # Audit round 24 fix (F48): periodic keepalive ping. Even
+        # though chat calls pass ``keep_alive=24h``, Ollama on
+        # Hetzner can OOM-evict a model under memory pressure
+        # (other guests on the box, OS reclaim). A reload =
+        # 25-35s cold prompt-eval — the source of the user's
+        # "дуже довго чекати" complaint. A 30s lightweight ping
+        # is cheap (1-token output, ~50ms server work, ~50KB net)
+        # and reliably keeps the model resident even under
+        # transient memory pressure. The thread is daemon=True
+        # so it exits with the process.
+        self._start_llm_keepalive()
 
         # Start HUD control-file watcher — picks up "end_session" / "stop"
         # commands written by the HUD's right-click menu.
@@ -3978,6 +6087,7 @@ class VoiceListener(threading.Thread):
                     # Reset marker
                     self.is_speech_active = False
                     self._silence_frames = 0
+                    self._voice_run = 0
                     self._utterance_frames = []
                     self._pre_roll.clear()
                     continue
@@ -4021,6 +6131,7 @@ class VoiceListener(threading.Thread):
                                 self._utterance_frames.extend(list(self._pre_roll))
                             self._utterance_frames.append(frame.copy())
                             self._silence_frames = 0
+                            self._voice_run = 1  # entering speech-active = one voiced frame so far
                             self._last_partial_ts = time.time()
                             # Emit speech-start so HUD can show "listening" UI
                             try:
@@ -4061,12 +6172,68 @@ class VoiceListener(threading.Thread):
                             continue
                         if is_voice:
                             self._utterance_frames.append(frame.copy())
-                            self._silence_frames = 0
+                            # SILENCE HYSTERESIS (May 16 critical fix):
+                            # The previous logic `self._silence_frames=0`
+                            # reset the counter on EVERY voiced frame.
+                            # In a noisy room (family chatter, TV), a
+                            # single VAD-voiced frame every <500ms kept
+                            # the counter at 0 → endpoint never fired →
+                            # utterance maxed out at 7s → Whisper got
+                            # 5.7s of mixed audio → nonstop UA YT-outro
+                            # hallucinations ("Дякую за перегляд!").
+                            #
+                            # Fix: require 3 consecutive voiced frames
+                            # (60ms) to clear the silence counter. A
+                            # single voiced blip mid-pause decays the
+                            # counter by 1 instead of resetting it.
+                            # Real speech stays voiced 5-50 frames in a
+                            # row, so wake detection is unaffected;
+                            # noise blips no longer extend utterances.
+                            self._voice_run = getattr(self, "_voice_run", 0) + 1
+                            if self._voice_run >= 3:
+                                self._silence_frames = 0
+                            else:
+                                self._silence_frames = max(0, self._silence_frames - 1)
+                            # SAFETY CAP — VAD-stuck-on-noise protection.
+                            # If voice frames never stop (constant TV/HVAC
+                            # noise above voice_min_energy, VAD aggressiveness
+                            # too low), the silence-endpoint never fires and
+                            # max_utt_frames check below is skipped because
+                            # we're in the is_voice branch. Frames accumulate
+                            # → OOM. Force finalize at the hard ceiling.
+                            current_max_frames = tts_max_utt_frames if (self.tts and self.tts.is_speaking()) else normal_max_utt_frames
+                            if len(self._utterance_frames) >= current_max_frames:
+                                debug_log(
+                                    f"max_utterance reached while still voice ({len(self._utterance_frames)} frames) — force-finalize",
+                                    "voice",
+                                )
+                                self._finalize_utterance()
+                                self._pre_roll.clear()
                         else:
                             self._silence_frames += 1
+                            self._voice_run = 0
                             # Use shorter timeout during TTS for quick stop command detection
                             current_max_frames = tts_max_utt_frames if (self.tts and self.tts.is_speaking()) else normal_max_utt_frames
                             if self._silence_frames >= endpoint_silence_frames or len(self._utterance_frames) >= current_max_frames:
+                                # Audit round 22 fix (F33): emit
+                                # ``vad speaking=false`` on natural
+                                # endpoint so the HUD captions panel's
+                                # ``recordingHideTimer`` actually fires.
+                                # Without this, the panel stays in
+                                # ``recording`` class forever after the
+                                # first utterance ends (user complaint:
+                                # "вікно транскрипції не закривається").
+                                # The previous code only emitted
+                                # ``speaking=true`` from the voice
+                                # branch above — never the falling
+                                # edge — so 57k+ ``vad`` events in
+                                # events.jsonl had ``speaking=true``
+                                # and zero had ``speaking=false``.
+                                try:
+                                    from ..ipc import get_stream
+                                    get_stream().emit("vad", speaking=False, level=0.0)
+                                except Exception:
+                                    pass
                                 self._finalize_utterance()
                                 self._pre_roll.clear()
 
@@ -4087,7 +6254,25 @@ class VoiceListener(threading.Thread):
                             except Exception:
                                 pass
                         now_ts = time.time()
-                        if (now_ts - self._last_partial_ts) >= 2.0 and len(self._utterance_frames) > 10:
+                        # Round 27 fix (F65): live-caption regression.
+                        # The old 1.0s gate meant short utterances
+                        # (300-800ms, common for RU commands like "открой
+                        # сафари") ended before the FIRST stt_partial
+                        # ever emitted. User reported: "більше не показує
+                        # транскрипцію мого мовлення в живому форматі".
+                        # Live evidence: only 1 stt_partial out of 1120
+                        # vad events after restart.
+                        #
+                        # New cadence: emit FIRST partial as soon as we
+                        # have ~300ms of audio (15 frames @ 20ms), then
+                        # every 800ms. Captures even short commands
+                        # while keeping server load bounded.
+                        if not getattr(self, "_first_partial_emitted", False):
+                            if len(self._utterance_frames) >= 15:
+                                self._first_partial_emitted = True
+                                self._last_partial_ts = now_ts
+                                self._schedule_partial_transcribe()
+                        elif (now_ts - self._last_partial_ts) >= 0.8 and len(self._utterance_frames) > 10:
                             self._last_partial_ts = now_ts
                             self._schedule_partial_transcribe()
 
@@ -4105,7 +6290,7 @@ class VoiceListener(threading.Thread):
                             except Exception:
                                 break
 
-    def _transcribe_remote(self, audio_np, language: Optional[str] = None) -> dict:
+    def _transcribe_remote(self, audio_np, language: Optional[str] = None, partial: bool = False) -> dict:
         """POST audio to whisper-service on Hetzner, return MLX-shaped result.
 
         Args:
@@ -4155,23 +6340,49 @@ class VoiceListener(threading.Thread):
 
         headers = {"X-Jarvis-Token": self._remote_whisper_token}
         files = {"audio": ("utt.wav", wav_bytes, "audio/wav")}
-        # Pass the domain vocabulary primer with EVERY request. Without
-        # this the server hallucinated "дякую" / "додай нотатку" on all
-        # ambient noise and wake-word "Джарвіс" decoded as "дякую" too.
-        # Server-side fallback (WS_DEFAULT_INITIAL_PROMPT) catches the
-        # Telegram-bot path; this catches our voice path.
-        data = {"initial_prompt": VOICE_WHISPER_INITIAL_PROMPT}
+        # initial_prompt INTENTIONALLY OMITTED.
+        #
+        # Real-world failure (May 15): even the "vocabulary-only" prompt
+        # ("Данило, Джарвіс, Nexus Studio, IBONS, Hydrogen, Shopify,
+        # Cloudflare, Hetzner, ...") was regurgitated VERBATIM by Whisper
+        # on uncertain audio. Heard log line:
+        #   'Данило, Джарвіс, Nexus Studio, IBONS, Hydrogen, Shopify,
+        #    Cloudflare, Hetzner,'
+        # → wake-word fast-path fired → "Слухаю, Даниле" → fixation loop.
+        #
+        # Trade-off accepted: brand names ("Hydrogen", "Cloudflare",
+        # "Hetzner") will revert to garbled Cyrillic transliterations
+        # ("гідроген", "клавдфлеер", "гетцнер") about 20% of the time.
+        # That's strictly better than a daemon that gets stuck in a
+        # phantom-wake loop and won't listen to the user.
+        #
+        # If we want vocabulary priming back, the correct mechanism is
+        # faster-whisper's `hotwords` (probability boost only, no decoder
+        # context injection) — but that requires a server-side change.
+        # Tracked as a follow-up.
+        #
+        # Empty string overrides server's WS_DEFAULT_INITIAL_PROMPT
+        # fallback so we don't get the prompt back via the back door.
+        data = {"initial_prompt": ""}
         if language:
             data["language"] = language
+        if partial:
+            # Server runs beam_size=1 with looser thresholds — ~3x faster
+            # at the cost of slightly lower accuracy. Acceptable for live
+            # caption preview; final pass uses full beam.
+            data["partial"] = "true"
 
         try:
             t0 = time.time()
+            # Timeout 120s — server can take 17-20s for 45s of audio
+            # (medium CPU @ 2.7× realtime). Old 60s cap timed out on
+            # max-length utterances and dropped real wake-word audio.
             r = _rq.post(
                 f"{self._remote_whisper_url}/transcribe",
                 headers=headers,
                 files=files,
                 data=data,
-                timeout=60.0,
+                timeout=(10.0, 120.0),
             )
             elapsed = time.time() - t0
             if r.status_code != 200:
@@ -4204,10 +6415,87 @@ class VoiceListener(threading.Thread):
         """
         if np is None or not self._utterance_frames:
             return
-        # Remote backend doesn't need a local model — different gate.
-        if self._whisper_backend != "remote":
-            if mlx_whisper is None or self._mlx_model_repo is None:
-                return  # only MLX path supports cheap partial right now
+        # Remote-backend partials — single-flight + last 4s only.
+        # User report: "транскрипція не показується відразу під час
+        # того як я говорю". So we DO send partials, but only one at
+        # a time (drop if pending) and only the trailing 4s of audio
+        # (not the whole buffer) so server queue doesn't saturate.
+        if self._whisper_backend == "remote":
+            # Round 27 fix (F67): timeout guard on _partial_in_flight.
+            # If a remote whisper-service call hangs (network blip,
+            # service restart, GPU thrashing), the flag could stay
+            # True for the entire ``requests.post`` timeout (60s),
+            # blocking ALL live captions during that window. Force-
+            # reset after 8s — the partial decoded a stale tail anyway,
+            # better to start a fresh one than wait out the hang.
+            if getattr(self, "_partial_in_flight", False):
+                in_flight_ts = getattr(self, "_partial_in_flight_ts", 0.0)
+                if in_flight_ts > 0 and (time.time() - in_flight_ts) > 8.0:
+                    debug_log(
+                        f"_partial_in_flight stuck for {time.time() - in_flight_ts:.1f}s — force-reset",
+                        "voice",
+                    )
+                    self._partial_in_flight = False
+                else:
+                    return  # previous partial still running, skip this tick
+            # Tighter window — 2.5s of audio decodes in ~0.8-1.2s on
+            # medium-CPU with beam_size=1. User wants live captions, so
+            # latency matters more than long-context accuracy for the
+            # preview (final pass still uses full utterance).
+            tail_seconds = 2.5
+            tail_frames = int(self._samplerate * tail_seconds)
+            # CRITICAL: snapshot frames into a NEW list before iterating —
+            # audio thread mutates self._utterance_frames concurrently and
+            # `list(live)` is the only safe atomic-copy. Previously this
+            # iterated the live list (assigned to `all_frames`) and could
+            # race on `[i].shape[0]` if the audio thread appended/sliced.
+            tail_audio = list(self._utterance_frames)
+            total_samples = sum(arr.shape[0] for arr in tail_audio if hasattr(arr, "shape"))
+            if total_samples > tail_frames:
+                # Walk back from the end until we have tail_seconds of audio
+                acc = 0
+                start_idx = len(tail_audio)
+                for i in range(len(tail_audio) - 1, -1, -1):
+                    acc += tail_audio[i].shape[0]
+                    if acc >= tail_frames:
+                        start_idx = i
+                        break
+                tail_audio = tail_audio[start_idx:]
+            frames_copy = tail_audio
+            self._partial_in_flight = True
+            self._partial_in_flight_ts = time.time()  # F67: timeout guard
+
+            def _remote_partial_run():
+                try:
+                    audio = np.concatenate(frames_copy, axis=0).flatten()
+                    forced_lang = getattr(self.cfg, "whisper_language", None) or None
+                    result = self._transcribe_remote(audio, language=forced_lang, partial=True)
+                    text = (result.get("text") or "").strip()
+                    if text and not self._is_known_hallucination(text):
+                        try:
+                            from ..ipc import get_stream
+                            # Audit round 12 fix: stt_partial payload
+                            # used to be inconsistent across the three
+                            # emit sites — this one shipped without
+                            # `lang`, which made HUD consumers crash
+                            # when they did `payload.lang.startsWith(…)`.
+                            # Always include `lang` (None when unknown).
+                            get_stream().emit(
+                                "stt_partial",
+                                text=text,
+                                lang=getattr(self, "_active_language", None),
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    self._partial_in_flight = False
+
+            threading.Thread(target=_remote_partial_run, daemon=True).start()
+            return
+        if mlx_whisper is None or self._mlx_model_repo is None:
+            return  # only MLX path supports cheap partial right now
         # Copy frames so we don't race with the audio thread mutating
         # _utterance_frames while we're concatenating.
         frames_copy = list(self._utterance_frames)
@@ -4230,11 +6518,9 @@ class VoiceListener(threading.Thread):
                             language=forced_lang,
                             temperature=0.0,
                             condition_on_previous_text=False,
-                            # Prime decoder with UA tech/brand vocabulary
-                            # (see VOICE_WHISPER_INITIAL_PROMPT). Major
-                            # accuracy win on proper nouns like
-                            # Hydrogen/Cloudflare/Hetzner.
-                            initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
+                            # initial_prompt OMITTED — Whisper regurgitates
+                            # it verbatim on uncertain audio (see remote
+                            # path comment above for the full incident).
                         )
                 text = (result.get("text") or "").strip()
                 if not text:
@@ -4260,9 +6546,13 @@ class VoiceListener(threading.Thread):
 
     def _finalize_utterance(self) -> None:
         """Process completed utterance through speech recognition."""
+        # Round 27 (F65): reset first-partial flag per utterance so
+        # the next one also emits its first partial early.
+        self._first_partial_emitted = False
         if np is None or not self._utterance_frames:
             self.is_speech_active = False
             self._silence_frames = 0
+            self._voice_run = 0
             self._utterance_frames = []
             return
 
@@ -4281,6 +6571,31 @@ class VoiceListener(threading.Thread):
             audio = np.concatenate(self._utterance_frames, axis=0).flatten()
         except Exception:
             audio = None
+
+        # PEAK NORMALIZATION (May 16, TIGHTENED rev 2; audit round 7 rev 3):
+        # Original `1e-4 < peak < 0.3` amplified mic NOISE FLOOR
+        # (~0.02-0.04) by 30x → Whisper hallucinated "Спасибо." on
+        # every breath. Rev 2 narrowed to `0.05 < peak < 0.15`.
+        # Rev 3 (round 7): CAP the gain at 4× so borderline-clipping
+        # speech (peak~0.05 → 0.95 = 19× gain) doesn't introduce
+        # clipping artifacts that Whisper still hallucinates on.
+        # Final gain = min(0.95/peak, 4.0) → for peak=0.05 we now
+        # boost to 0.20 not 0.95; for peak=0.10 we boost to 0.40.
+        # Quieter speech is preserved but no longer pushed into
+        # saturation territory.
+        if audio is not None and len(audio) > 0:
+            try:
+                peak = float(np.max(np.abs(audio)))
+                if 0.05 < peak < 0.15:
+                    gain = min(0.95 / peak, 4.0)
+                    audio = audio * gain
+                    debug_log(
+                        f"audio peak-normalized: {peak:.4f} × {gain:.2f} "
+                        f"= {peak*gain:.4f} ({len(audio)} samples)",
+                        "voice",
+                    )
+            except Exception:
+                pass
 
         # Calculate energy before clearing frames for transcript processing
         utterance_energy = self._calculate_audio_energy(self._utterance_frames[-10:] if self._utterance_frames else [])
@@ -4315,57 +6630,87 @@ class VoiceListener(threading.Thread):
 
         # Speech recognition with appropriate backend
         try:
-            if self._whisper_backend == "mlx":
-                # MLX Whisper transcription
-                # Forced language hint — Whisper auto-detect on short
-                # wake-word audio routinely guesses English (training
-                # imbalance) and hallucinates "Thank you" / "Charlie's"
-                # over real Ukrainian. Forcing 'uk' keeps it on the
-                # right phonetic map and still transcribes RU and most
-                # EN wake-word mishearings acceptably.
-                forced_lang = getattr(self.cfg, "whisper_language", None) or None
+            # Forced language hint — Whisper auto-detect on short wake-word
+            # audio routinely guesses English (training imbalance) and
+            # hallucinates "Thank you" / "Charlie's" over real Ukrainian.
+            # Forcing 'uk' keeps it on the right phonetic map and still
+            # transcribes RU and most EN wake-word mishearings acceptably.
+            forced_lang = getattr(self.cfg, "whisper_language", None) or None
 
-                if self._whisper_backend == "remote":
-                    # Server-side STT — single HTTP POST. We lose the
-                    # temperature-fallback / compression-threshold knobs
-                    # (server uses its own faster-whisper defaults) but
-                    # we get zero local RAM and the option to run
-                    # large-v3-turbo there for better accuracy.
-                    result = self._transcribe_remote(audio, language=forced_lang)
+            if self._whisper_backend == "remote":
+                # Server-side STT via whisper-service on Hetzner. We lose
+                # the local temperature-fallback / compression-threshold
+                # knobs (server uses its own faster-whisper defaults) but
+                # get zero local RAM use and the ability to run
+                # large-v3-turbo on the server for better accuracy.
+                # MUST be checked FIRST — previously this was nested
+                # inside `if backend == "mlx":` and was unreachable, so
+                # remote backend fell into the faster-whisper else and
+                # crashed on self.model.transcribe (model was None).
+                result = self._transcribe_remote(audio, language=forced_lang)
+                # Capture detected language (matches MLX behaviour).
+                detected = result.get("language")
+                if isinstance(detected, str) and detected:
+                    self._last_detected_language = detected
+                # Build text from segments to mirror MLX confidence-filter
+                # path; remote service applies its own VAD/no-speech
+                # filtering server-side, so segments are already clean.
+                segs = result.get("segments") or []
+                if segs:
+                    text = " ".join(s.get("text", "") for s in segs).strip()
                 else:
-                    with self.transcribe_lock:
-                        # Better recognition: temperature fallback
-                        # (default only [0.0] — adding fallbacks lets
-                        # Whisper retry when confidence drops), wider
-                        # beam search for tricky accents/dialects.
-                        # Cost: ~30% slower on marginal audio, but
-                        # user explicitly asked "краще навчити джарвіса
-                        # розуміти мене".
-                        result = mlx_whisper.transcribe(
-                            audio,
-                            path_or_hf_repo=self._mlx_model_repo,
-                            language=forced_lang,
-                            temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
-                            # condition_on_previous_text=False prevents
-                            # Whisper from "remembering" the previous
-                            # utterance and bleeding into the next —
-                            # common cause of "repeated phrase"
-                            # hallucinations in back-to-back queries.
-                            condition_on_previous_text=False,
-                            # Compression ratio threshold: if output
-                            # is too repetitive (signs of decoding
-                            # collapse), reject and retry with higher temp.
-                            compression_ratio_threshold=2.4,
-                            # If logprob drops below this, retry. Default
-                            # -1.0; -1.2 is more permissive — keeps hard
-                            # accents from being dropped.
-                            logprob_threshold=-1.2,
-                            # Domain vocabulary primer — see VOICE_WHISPER_-
-                            # INITIAL_PROMPT for full rationale. Fixes 80%+
-                            # of brand/tech-term misrecognitions ("Hydrogen"
-                            # not "гідроген", "Cloudflare" not "клавдфлеер").
-                            initial_prompt=VOICE_WHISPER_INITIAL_PROMPT,
-                        )
+                    text = (result.get("text") or "").strip()
+            elif self._whisper_backend == "mlx":
+                # MLX Whisper transcription — local Apple Silicon path.
+                with self.transcribe_lock:
+                    # Better recognition: temperature fallback (default
+                    # only [0.0] — adding fallbacks lets Whisper retry
+                    # when confidence drops), wider beam search for
+                    # tricky accents/dialects. Cost: ~30% slower on
+                    # marginal audio, but user explicitly asked
+                    # "краще навчити джарвіса розуміти мене".
+                    # TIGHTENED (May 16): user reports daemon hears family
+                    # chatter as gibberish ("Я Никита Утар", "Семьи кудри",
+                    # "Слышь, слой тебя") and NEVER as "Джарвис". Audit
+                    # traced this to the temperature fallback ladder
+                    # producing fabricated grammar-coherent RU phrases on
+                    # weak audio (T=0.4-0.8 = canonical hallucination
+                    # recipe). Restore Whisper defaults for thresholds
+                    # and drop the ladder; on hard accents we lose a
+                    # little recovery, but with `language="ru"` + MLX
+                    # large-v3-turbo we get cleaner output and the wake
+                    # word actually surfaces.
+                    #
+                    # initial_prompt OMITTED — REVERTED (May 16 evening):
+                    # Even a tiny 3-word wake-word prompt caused full
+                    # regurgitation: Whisper output "Добавил субтитры,
+                    # джарвіс, джарвіс, джарвіс." over and over on
+                    # silence. Original code comment was right —
+                    # ANY initial_prompt is poison on uncertain audio.
+                    # TIGHTENED (May 16 evening): compression_ratio_threshold
+                    # 2.4 → 1.8 to reject repetitive hallucinations.
+                    # "джарвіс, джарвіс, джарвіс" and "Духову не ет? Духову
+                    # не ет? Духову не ет?" have very high compression
+                    # ratios (repeated tokens). 1.8 is aggressive enough
+                    # to catch these without dropping legit RU speech
+                    # which sits around 1.3-1.7.
+                    # TIGHTENED (May 16 rev 2): logprob_threshold -1.0 → -0.7.
+                    # Amplified-noise hallucinations like "Спасибо." typically
+                    # log at avg_logprob ≈ -0.6 to -0.9. -0.7 catches the
+                    # worst offenders without dropping legit speech (which
+                    # sits at -0.1 to -0.5).
+                    result = mlx_whisper.transcribe(
+                        audio,
+                        path_or_hf_repo=self._mlx_model_repo,
+                        language=forced_lang,
+                        temperature=(0.0, 0.2),
+                        condition_on_previous_text=False,
+                        compression_ratio_threshold=1.8,
+                        logprob_threshold=-0.7,
+                        no_speech_threshold=float(getattr(
+                            self.cfg, "whisper_no_speech_threshold", 0.6
+                        )),
+                    )
 
                 # Capture Whisper's auto-detected language (ISO-639-1) so
                 # downstream tools can pick locale-appropriate resources.
@@ -4396,8 +6741,11 @@ class VoiceListener(threading.Thread):
 
                         if confidence < min_confidence:
                             if confidence >= marginal_threshold:
-                                # Marginal confidence - show in log viewer (not debug)
-                                print(f"🔇 Low confidence ({confidence:.2f}): \"{seg_text[:50]}...\"", flush=True)
+                                # F93 — gated print, see line ~4136.
+                                if getattr(self.cfg, "voice_debug", False):
+                                    print(f"🔇 Low confidence ({confidence:.2f}): \"{seg_text[:50]}...\"", flush=True)
+                                else:
+                                    debug_log(f"MLX segment filtered (low conf {confidence:.2f}, len={len(seg_text)})", "voice")
                             else:
                                 # Very low confidence - debug only
                                 debug_log(f"MLX segment filtered (confidence={confidence:.2f}): '{seg_text[:50]}'", "voice")
@@ -4413,22 +6761,36 @@ class VoiceListener(threading.Thread):
                 # faster-whisper transcription
                 # CPU mode: skip timestamps and disable context carry-over for speed
                 cpu_mode = self._whisper_device == "cpu"
-                with self.transcribe_lock:
-                    try:
-                        segments, _info = self.model.transcribe(
-                            audio, language=None, vad_filter=False,
-                            condition_on_previous_text=not cpu_mode,
-                            without_timestamps=cpu_mode,
-                        )
-                    except TypeError:
-                        segments, _info = self.model.transcribe(audio, language=None)
-                    segments_list = list(segments)
+                # GUARD: if backend is "remote", self.model is None — skip
+                # this path entirely. Prevented hundreds of NoneType.transcribe
+                # errors in production logs when remote backend was active
+                # but a code path fell through to the local branch.
+                if self.model is None:
+                    debug_log(
+                        "local whisper model is None (backend=remote?) — skipping faster-whisper branch",
+                        "voice",
+                    )
+                    text = ""
+                    segments_list = []
+                else:
+                    with self.transcribe_lock:
+                        try:
+                            segments, _info = self.model.transcribe(
+                                audio, language=None, vad_filter=False,
+                                condition_on_previous_text=not cpu_mode,
+                                without_timestamps=cpu_mode,
+                            )
+                        except TypeError:
+                            segments, _info = self.model.transcribe(audio, language=None)
+                        segments_list = list(segments)
                 # Capture the detected language (faster-whisper exposes it
                 # on the info object). Guard against older API variants
-                # where the attribute may be absent.
-                detected = getattr(_info, "language", None)
-                if isinstance(detected, str) and detected:
-                    self._last_detected_language = detected
+                # where the attribute may be absent. _info only exists
+                # when we actually ran the model — guard accordingly.
+                if self.model is not None and segments_list:
+                    detected = getattr(_info, "language", None)
+                    if isinstance(detected, str) and detected:
+                        self._last_detected_language = detected
                 filtered_segments = self._filter_noisy_segments(segments_list)
                 text = " ".join(seg.text for seg in filtered_segments).strip()
         except Exception as e:
@@ -4443,9 +6805,21 @@ class VoiceListener(threading.Thread):
 
         # Log successful transcription — separator omitted on the first utterance since
         # there is no prior turn to visually separate from.
-        separator = "" if self._first_utterance else f"\n{'─' * 50}"
+        # Round 30 (F93 — privacy): print every `📝 Heard` line ONLY if
+        # voice_debug is on. Live finding: jarvis-assistant.out.log
+        # contained full third-party speech transcripts captured by the
+        # mic ("📝 Heard: ...family conversation..."). The plist no
+        # longer sets JARVIS_VOICE_DEBUG=1 (F73), but these prints
+        # weren't gated — they fired unconditionally and launchd routes
+        # stdout to the world-readable .out.log. We now gate every
+        # PII-bearing print on the same flag and additionally truncate
+        # to a hashable digest when verbose is off.
         self._first_utterance = False
-        print(f"{separator}\n📝 Heard: \"{text}\"", flush=True)
+        if getattr(self.cfg, "voice_debug", False):
+            separator = "" if self._first_utterance else f"\n{'─' * 50}"
+            print(f"{separator}\n📝 Heard: \"{text}\"", flush=True)
+        # Always emit a typed STT event via IPC so the HUD can render —
+        # that file is 0600-locked, not the broad .out.log.
 
         # Filter out known-bad Whisper hallucination outputs on silence
         # (these appear repeatedly with `whisper_no_speech_threshold` permissive
@@ -4467,7 +6841,9 @@ class VoiceListener(threading.Thread):
         if self.tts is not None and self.tts.is_speaking():
             is_during_tts = True
         else:
-            tts_finish_time = self.echo_detector._last_tts_finish_time
+            # Audit round 14 fix C3: snapshot under lock.
+            _, tts_finish_time, _, _ = self.echo_detector.snapshot_tts_window()
+            tts_finish_time = tts_finish_time or 0.0
             echo_tolerance = self.echo_detector.echo_tolerance
             is_during_tts = (tts_finish_time > 0 and utterance_start_time > 0 and utterance_start_time < tts_finish_time + echo_tolerance)
         self._transcript_buffer.add(
