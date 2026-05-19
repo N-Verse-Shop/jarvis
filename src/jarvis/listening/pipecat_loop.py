@@ -56,7 +56,7 @@ from ..debug import debug_log
 # if it cannot satisfy the minimum stage required for a working voice
 # loop (currently 5 = core + adapters + tools + wake/echo).
 _MIN_STAGE_FOR_RUN = 5
-_CURRENT_STAGE = 3  # Stage 3: HUD adapters (events.jsonl + state.json)
+_CURRENT_STAGE = 4  # Stage 4: fast-path + mac_control function calling
 
 
 # ──────────────────────── F94 Russian system prompt ────────────────────
@@ -601,6 +601,422 @@ def _make_state_processor():
     return JarvisStateProcessor
 
 
+# ──────────────────────── Stage-4 fast-path filter ───────────────────────
+#
+# The legacy listener used a ~50ms regex-only fast path that fired
+# direct user commands without involving the LLM at all
+# (``parse_user_command`` in ``action_dispatcher.py``). That path
+# handled ~80% of voice commands ("відкрий Safari", "play music",
+# "set volume 50") with near-zero latency.
+#
+# Stage 4 ports that to a Pipecat ``FrameProcessor`` that intercepts
+# ``TranscriptionFrame`` between STT and the user-aggregator. On a
+# match it:
+#
+#   1. Suppresses the transcript so the LLM never sees it.
+#   2. Runs the action in a thread (synchronous ``subprocess.run``).
+#   3. Emits ``tool_call`` events (starting → completed/failed).
+#   4. Pushes a synthetic ``TTSSpeakFrame`` downstream so TTS speaks
+#      the action's confirmation phrase ("Зараз відкрию Safari").
+#
+# On no match the frame is passed through unchanged — the LLM gets
+# its normal chance to respond.
+
+
+def _make_fast_path_processor():
+    """Build the regex fast-path FrameProcessor.
+
+    Wraps ``action_dispatcher.parse_user_command`` in a frame-aware
+    filter. Action execution happens in the default thread executor
+    because the underlying ops use blocking ``subprocess.run``
+    (AppleScript / ``open -a``) that would stall the asyncio loop
+    and disrupt audio frame timing.
+    """
+    import asyncio as _asyncio
+
+    from pipecat.frames.frames import (
+        Frame,
+        TextFrame,
+        TranscriptionFrame,
+        TTSSpeakFrame,
+    )
+    from pipecat.processors.frame_processor import (
+        FrameDirection,
+        FrameProcessor,
+    )
+
+    from ..ipc import get_stream
+    from .action_dispatcher import Action, parse_user_command
+
+    class JarvisFastPathProcessor(FrameProcessor):
+        """Direct-execution path for matched regex user commands."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._stream = get_stream()
+
+        async def process_frame(
+            self, frame: "Frame", direction: "FrameDirection"
+        ) -> None:
+            await super().process_frame(frame, direction)
+
+            # We only care about user-direction final transcripts.
+            if not isinstance(frame, TranscriptionFrame):
+                await self.push_frame(frame, direction)
+                return
+            text = (frame.text or "").strip()
+            if not text:
+                await self.push_frame(frame, direction)
+                return
+
+            try:
+                action = parse_user_command(text)
+            except Exception as exc:
+                # Regex failure must never break the pipeline — fall
+                # through to the LLM path so the user still gets a
+                # response.
+                try:
+                    from ..debug import debug_log
+                    debug_log(
+                        f"fast-path parse_user_command crashed: {exc!r}",
+                        "pipecat",
+                    )
+                except Exception:
+                    pass
+                await self.push_frame(frame, direction)
+                return
+
+            if action is None:
+                # No fast-path match → normal LLM flow.
+                await self.push_frame(frame, direction)
+                return
+
+            # ── MATCH ─────────────────────────────────────────────
+            # Suppress the original transcript (do not call push_frame
+            # for it). Run the action in a worker thread so blocking
+            # subprocess calls don't stall the event loop. Speak the
+            # acknowledgement via a TTSSpeakFrame so the user hears
+            # immediate feedback.
+            self._stream.emit(
+                "tool_call",
+                tool=action.name,
+                args={},
+                status="starting",
+            )
+            try:
+                ok, msg = await _asyncio.to_thread(action.fn)
+            except Exception as exc:
+                ok, msg = False, f"fast-path exec error: {exc!r}"
+            self._stream.emit(
+                "tool_call",
+                tool=action.name,
+                args={},
+                status="completed" if ok else "failed",
+                result=msg if ok else None,
+                error=None if ok else msg,
+            )
+
+            # Speak the human-friendly description ("Зараз відкрию
+            # Safari") regardless of success — the user still wants
+            # confirmation that the daemon heard them. We pass it
+            # downstream so the assistant-aggregator + TTS both see
+            # it: ``append_to_context=True`` (default) means it ends
+            # up in dialog history as if the LLM had said it.
+            ack = action.description or ("Готово." if ok else "Не вдалося.")
+            await self.push_frame(
+                TTSSpeakFrame(text=ack),
+                direction,
+            )
+            # DO NOT push the original TranscriptionFrame — that's
+            # the whole point of the fast path.
+
+    return JarvisFastPathProcessor
+
+
+# ─────────────────── Stage-4 mac_control LLM tool bridge ─────────────────
+#
+# A curated subset of ``mac_control._OPS`` exposed to the LLM as
+# OpenAI-compatible function-calls. We deliberately do NOT register
+# all 25 ops — too many tools confuse a small 8B model. The fast-path
+# above already covers the high-frequency commands; the LLM tools
+# below are for compositional / context-sensitive cases the regex
+# can't match (e.g. "remind me to call mom tomorrow at 4pm" — needs
+# free-form text arg).
+
+
+def _mac_control_tools_schema():
+    """Return a :class:`ToolsSchema` for the curated mac_control ops."""
+    from pipecat.adapters.schemas.function_schema import FunctionSchema
+    from pipecat.adapters.schemas.tools_schema import ToolsSchema
+
+    # Keep this list small + well-described. The LLM picks by name +
+    # description; a vague description gets the wrong tool picked.
+    schemas = [
+        FunctionSchema(
+            name="focus_app",
+            description=(
+                "Bring a macOS application to the foreground. Use the "
+                "canonical English app name (e.g. 'Safari', 'Mail', "
+                "'Calendar'). For a known app the user named in a "
+                "non-English language, translate first."
+            ),
+            properties={
+                "app": {
+                    "type": "string",
+                    "description": "Canonical app name, e.g. 'Safari'",
+                },
+            },
+            required=["app"],
+        ),
+        FunctionSchema(
+            name="open_url",
+            description=(
+                "Open a URL in the user's default browser. Always "
+                "include the scheme (https://...)."
+            ),
+            properties={
+                "url": {
+                    "type": "string",
+                    "description": "Full URL with scheme",
+                },
+            },
+            required=["url"],
+        ),
+        FunctionSchema(
+            name="new_note",
+            description=(
+                "Create a new Note in Apple Notes with the given "
+                "title and body. Use for free-form text the user "
+                "wants saved (e.g. 'note: meeting agenda ...')."
+            ),
+            properties={
+                "title": {"type": "string", "description": "Note title"},
+                "body": {"type": "string", "description": "Note body text"},
+            },
+            required=["title"],
+        ),
+        FunctionSchema(
+            name="new_reminder",
+            description=(
+                "Create a reminder in Apple Reminders. The text is "
+                "what the user wants to be reminded of. Specifying a "
+                "list_name is optional — defaults to the main list."
+            ),
+            properties={
+                "text": {"type": "string", "description": "Reminder body"},
+                "list_name": {
+                    "type": "string",
+                    "description": "Optional: target list name",
+                },
+            },
+            required=["text"],
+        ),
+        FunctionSchema(
+            name="query_calendar",
+            description=(
+                "List the user's upcoming calendar events for the "
+                "next N days. Use when the user asks 'what's on my "
+                "calendar' / 'what's my next meeting'."
+            ),
+            properties={
+                "days": {
+                    "type": "integer",
+                    "description": "Look-ahead window, days (default 7)",
+                },
+            },
+            required=[],
+        ),
+        FunctionSchema(
+            name="send_message",
+            description=(
+                "Send an iMessage / SMS via Messages.app. ``to`` is "
+                "a phone number or contact name."
+            ),
+            properties={
+                "to": {
+                    "type": "string",
+                    "description": "Phone number or contact name",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Message body",
+                },
+            },
+            required=["to", "body"],
+        ),
+        FunctionSchema(
+            name="run_shortcut",
+            description=(
+                "Run a macOS Shortcut by name. Use when the user "
+                "asks 'run the X shortcut' or refers to an automation "
+                "they've set up in Shortcuts.app."
+            ),
+            properties={
+                "name": {
+                    "type": "string",
+                    "description": "Exact shortcut name",
+                },
+                "input_text": {
+                    "type": "string",
+                    "description": "Optional text input passed to the shortcut",
+                },
+            },
+            required=["name"],
+        ),
+        FunctionSchema(
+            name="list_shortcuts",
+            description=(
+                "List the names of all macOS Shortcuts available on "
+                "this Mac. Use when the user asks 'what shortcuts do "
+                "I have' / 'which shortcuts can you run'."
+            ),
+            properties={},
+            required=[],
+        ),
+        FunctionSchema(
+            name="system_info",
+            description=(
+                "Return a single piece of system information. ``field`` "
+                "is one of: ``battery``, ``volume``, ``focus_mode``, "
+                "``uptime``, ``all``."
+            ),
+            properties={
+                "field": {
+                    "type": "string",
+                    "description": "battery | volume | focus_mode | uptime | all",
+                },
+            },
+            required=["field"],
+        ),
+        FunctionSchema(
+            name="set_volume",
+            description=(
+                "Set the macOS output volume. ``level`` is 0-100."
+            ),
+            properties={
+                "level": {
+                    "type": "integer",
+                    "description": "0-100",
+                },
+            },
+            required=["level"],
+        ),
+        FunctionSchema(
+            name="set_mute",
+            description=(
+                "Mute or unmute the macOS output. ``state`` is "
+                "'on' (mute) or 'off' (unmute)."
+            ),
+            properties={
+                "state": {
+                    "type": "string",
+                    "description": "on | off",
+                },
+            },
+            required=["state"],
+        ),
+        FunctionSchema(
+            name="clipboard_set",
+            description=(
+                "Replace the macOS clipboard contents with the given "
+                "text. Use when the user asks to 'copy X to the "
+                "clipboard'."
+            ),
+            properties={
+                "text": {
+                    "type": "string",
+                    "description": "Text to place on the clipboard",
+                },
+            },
+            required=["text"],
+        ),
+    ]
+    return ToolsSchema(standard_tools=schemas)
+
+
+def _register_mac_control_handlers(llm):
+    """Register one async handler per curated tool on the LLM service.
+
+    Each handler bridges to :func:`mac_control._dispatch_op` and
+    pipes the result through the function-call ``result_callback``.
+    Execution runs in a thread because the ops are synchronous
+    blocking subprocess calls — same reason as the fast path.
+
+    Also emits ``tool_call`` events for HUD observability so the
+    user can see which tool the LLM chose and whether it worked.
+    """
+    import asyncio as _asyncio
+
+    from ..ipc import get_stream
+    from ..tools.builtin.mac_control import _dispatch_op, _OPS
+
+    stream = get_stream()
+
+    # The names we expose — must match the schemas above. Restrict to
+    # the curated set + sanity-check against the underlying op
+    # registry so a typo in the schema (or a removed op in
+    # mac_control) fails loudly at registration time.
+    exposed = [
+        "focus_app", "open_url", "new_note", "new_reminder",
+        "query_calendar", "send_message", "run_shortcut",
+        "list_shortcuts", "system_info", "set_volume",
+        "set_mute", "clipboard_set",
+    ]
+    for op_name in exposed:
+        if op_name not in _OPS:
+            # Don't silently skip — surface the misconfiguration so
+            # the dev sees it the first time the loop is built.
+            raise RuntimeError(
+                f"Cannot register Pipecat function {op_name!r}: not in "
+                f"mac_control._OPS (registry has {len(_OPS)} ops). "
+                "Update _mac_control_tools_schema or fix mac_control."
+            )
+
+    def _make_handler(op_name: str):
+        async def _handler(params) -> None:
+            args = dict(params.arguments or {})
+            stream.emit(
+                "tool_call",
+                tool=op_name,
+                args=args,
+                status="starting",
+            )
+            try:
+                ok, msg = await _asyncio.to_thread(
+                    _dispatch_op, op_name, args
+                )
+            except Exception as exc:
+                ok, msg = False, f"dispatch error: {exc!r}"
+            stream.emit(
+                "tool_call",
+                tool=op_name,
+                args=args,
+                status="completed" if ok else "failed",
+                result=msg if ok else None,
+                error=None if ok else msg,
+            )
+            # Pipecat callback delivers the result back to the LLM
+            # so it can continue the response ("Зробив. Що далі?").
+            try:
+                await params.result_callback(
+                    {"ok": ok, "message": msg}
+                )
+            except Exception as exc:
+                try:
+                    from ..debug import debug_log
+                    debug_log(
+                        f"result_callback failed for {op_name}: {exc!r}",
+                        "pipecat",
+                    )
+                except Exception:
+                    pass
+
+        return _handler
+
+    for op_name in exposed:
+        llm.register_function(op_name, _make_handler(op_name))
+
+
 # ─────────────────────────── pipeline factory ────────────────────────────
 
 
@@ -723,10 +1139,18 @@ def _build_pipeline(cfg: PipecatLoopConfig):
         download_dir=piper_dir,
     )
 
+    # ── Stage-4 tool schema + function-call registration ────────────
+    # Build the tools schema BEFORE the LLMContext so we can pass it
+    # into the context (the LLM reads tools from the context at every
+    # turn). Register handlers on the LLM service itself.
+    tools_schema = _mac_control_tools_schema()
+    _register_mac_control_handlers(llm)
+
     # ── context aggregators ────────────────────────────────────────
     system_prompt = _system_prompt_for(cfg.active_language)
     context = LLMContext(
         messages=[{"role": "system", "content": system_prompt}],
+        tools=tools_schema,
     )
     aggregators = LLMContextAggregatorPair(context)
 
@@ -740,14 +1164,16 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     # that just want to introspect the loop without booting it.
     EventStreamProc = _make_event_stream_processor()
     StateProc = _make_state_processor()
+    FastPathProc = _make_fast_path_processor()
     events_user = EventStreamProc()        # observes STT side
     events_assistant = EventStreamProc()   # observes LLM/TTS side
+    fast_path = FastPathProc()             # regex shortcut, pre-LLM
     state_proc = StateProc()               # tail — last word on state
 
     # ── pipeline ───────────────────────────────────────────────────
     # Topology:
-    #   transport.input → STT → events_user → user-aggregator → LLM
-    #     → assistant-aggregator → events_assistant → TTS
+    #   transport.input → STT → events_user → fast_path → user-aggregator
+    #     → LLM → assistant-aggregator → events_assistant → TTS
     #     → state_proc → transport.output
     #
     # Why this ordering:
@@ -755,6 +1181,13 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     # * ``events_user`` sits right after STT so we capture
     #   InterimTranscriptionFrame / TranscriptionFrame at the point
     #   they are emitted — before the LLM consumes/transforms them.
+    #
+    # * ``fast_path`` sits between events_user and the user-aggregator
+    #   so it can intercept ``TranscriptionFrame`` and short-circuit
+    #   the LLM path entirely on regex match (~50ms latency vs
+    #   ~500ms LLM round-trip). The events_user observer ABOVE has
+    #   already emitted stt_final for the HUD, so the user sees the
+    #   transcript even though the LLM never gets it.
     #
     # * ``events_assistant`` sits between the assistant-aggregator and
     #   TTS so we see LLMTextFrame chunks AND the TTSStarted/Stopped
@@ -771,6 +1204,7 @@ def _build_pipeline(cfg: PipecatLoopConfig):
             transport.input(),
             stt,
             events_user,
+            fast_path,
             aggregators.user(),
             llm,
             aggregators.assistant(),
