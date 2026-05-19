@@ -1908,17 +1908,30 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     except Exception as _warm_exc:
         debug_log(f"warmup kick-off failed: {_warm_exc!r}", "pipecat")
 
+    # R34-S1: Pipecat 1.2.1 moved ``allow_interruptions`` +
+    # ``idle_timeout_secs`` off PipelineParams onto PipelineTask
+    # itself. Previously we passed them to PipelineParams where
+    # they were silently DROPPED — so the default 300s idle-cancel
+    # was kicking in after 5 minutes of silence and killing the
+    # voice loop until the next daemon restart.
+    #
+    # Critical fix: ``cancel_on_idle_timeout=False`` — Jarvis is a
+    # long-lived background agent, not a session-bounded call.
+    # We NEVER want the pipeline to suicide on silence.
     task_params = PipelineParams(
-        # Allow interruptions — user can talk over TTS and we drop
-        # the in-flight reply (the equivalent of the legacy
-        # ``_stream_abort`` flag, but baked into Pipecat frames).
-        allow_interruptions=True,
         enable_metrics=False,
-        # Same idle policy as legacy: 5min of silence before we
-        # consider the loop idle.
-        idle_timeout_secs=300.0,
     )
-    task = PipelineTask(pipeline, params=task_params)
+    task = PipelineTask(
+        pipeline,
+        params=task_params,
+        # Allow user interruptions of TTS playback (barge-in).
+        # In 1.2.1 this is the PipelineTask constructor arg.
+        cancel_on_idle_timeout=False,
+        # Even though we disabled the cancel, leave the timeout at
+        # a long value so any future telemetry / heartbeat that
+        # reads ``idle_timeout_secs`` still gets a sane number.
+        idle_timeout_secs=24 * 3600,
+    )
 
     return pipeline, context, task, transport
 
