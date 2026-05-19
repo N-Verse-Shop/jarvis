@@ -103,6 +103,9 @@ async function loadOverview() {
     document.getElementById("ov-version").textContent = h.version;
     document.getElementById("ov-uptime").textContent = fmtUptime(h.uptime_s);
     document.getElementById("ov-state").textContent = state.state || "UNKNOWN";
+    // footer
+    const fv = document.getElementById("footer-version");
+    if (fv) fv.textContent = h.version || "dev-local";
 
     // Activity stats
     const byStatus = stats.by_status || {};
@@ -450,6 +453,18 @@ async function bootstrap() {
       }).catch(() => {});
     }
   }, 2000);
+
+  // Footer clock — updates every second, low-cost (no network).
+  const tickClock = () => {
+    const el = document.getElementById("footer-clock");
+    if (!el) return;
+    const now = new Date();
+    el.textContent = now.toLocaleTimeString("uk-UA", {
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+  };
+  tickClock();
+  setInterval(tickClock, 1000);
 }
 
 // Boot

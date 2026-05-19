@@ -3,15 +3,25 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Jarvis Control Room</title>
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#6C63FF" />
+    <meta name="description" content="Jarvis Control Room · Powered by Nexus Studio" />
+    <title>Jarvis · Nexus Studio</title>
     <link rel="stylesheet" href="/dashboard/styles.css" />
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='40' fill='%2300d4ff'/%3E%3Ccircle cx='50' cy='50' r='30' fill='%23000'/%3E%3Ctext x='50' y='62' text-anchor='middle' fill='%2300d4ff' font-family='monospace' font-size='32' font-weight='bold'%3EJ%3C/text%3E%3C/svg%3E" />
+    <!-- favicon: Nexus indigo→cyan gradient with stylised J -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236C63FF'/%3E%3Cstop offset='1' stop-color='%2300D4FF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='8' y='8' width='84' height='84' rx='20' fill='url(%23g)'/%3E%3Cpath d='M52 28 L52 62 Q52 74 40 74 Q28 74 28 62' stroke='%23fff' stroke-width='8' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
   </head>
   <body>
     <!-- ─── auth gate ─── -->
     <div id="auth-screen" class="auth">
       <div class="auth-card glass">
-        <h1>Jarvis Control Room</h1>
+        <div class="auth-brand">
+          <div class="brand-mark" aria-hidden="true">J</div>
+          <div>
+            <div class="auth-title">Jarvis</div>
+            <div class="auth-tagline">Control Room · Nexus Studio</div>
+          </div>
+        </div>
         <p class="subtle">Local-only dashboard. Paste the token from
           <code>~/Library/Application&nbsp;Support/jarvis/dashboard-token</code>.</p>
         <input id="auth-token" type="password" autocomplete="off"
@@ -26,11 +36,13 @@
       <!-- header: state indicator + nav -->
       <header class="app-header">
         <div class="brand">
-          <div id="state-orb" class="orb"></div>
-          <div class="brand-text">
+          <div class="brand-mark" aria-hidden="true">J</div>
+          <div class="brand-stack">
             <div class="brand-title">Jarvis</div>
-            <div class="brand-state" id="brand-state">connecting…</div>
+            <div class="brand-tagline">Nexus&nbsp;Studio · Control&nbsp;Room</div>
           </div>
+          <div id="state-orb" class="orb" title="agent state"></div>
+          <div class="brand-state" id="brand-state">connecting…</div>
         </div>
         <nav class="app-nav">
           <button class="nav-tab active" data-view="overview">Overview</button>
@@ -209,6 +221,23 @@
         </div>
         <ul class="event-feed" id="live-feed"></ul>
       </section>
+
+      <!-- footer: Nexus Studio mark -->
+      <footer class="app-footer">
+        <div class="footer-left">
+          <span class="footer-mono">jarvis</span>
+          <span class="footer-sep">·</span>
+          <span class="footer-mono" id="footer-version">dev-local</span>
+        </div>
+        <div class="footer-center">
+          <a href="https://www.nexus-studio.de" target="_blank" rel="noopener noreferrer"
+             class="nexus-mark" title="Built by Nexus Studio">
+            <span class="nexus-dot"></span>
+            <span>Powered by <strong>Nexus Studio</strong></span>
+          </a>
+        </div>
+        <div class="footer-right footer-mono" id="footer-clock">—</div>
+      </footer>
     </div>
 
     <script type="module" src="/dashboard/app.js"></script>

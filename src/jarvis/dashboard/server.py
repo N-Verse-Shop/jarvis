@@ -316,7 +316,8 @@ class DashboardServer:
                     if self._started_at else 0
                 ),
                 "pid": os.getpid(),
-                "version": "R33",
+                "version": "R34",
+                "brand": "Nexus Studio",
             }
         )
 
