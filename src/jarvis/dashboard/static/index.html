@@ -38,6 +38,7 @@
           <button class="nav-tab" data-view="audit">Audit</button>
           <button class="nav-tab" data-view="persona">Persona</button>
           <button class="nav-tab" data-view="capabilities">Capabilities</button>
+          <button class="nav-tab" data-view="facts">Facts</button>
           <button class="nav-tab" data-view="live">Live</button>
         </nav>
         <div class="header-meta">
@@ -158,6 +159,43 @@
           Toggle via env vars (<code>JARVIS_ENABLE_&lt;NAME&gt;</code>,
           <code>JARVIS_DISABLE_&lt;NAME&gt;</code>) and restart the daemon.</p>
         <div id="capabilities-list" class="cap-grid"></div>
+      </section>
+
+      <!-- view: facts -->
+      <section class="view" id="view-facts">
+        <div class="view-toolbar">
+          <h2>Persistent Facts</h2>
+          <div class="filters">
+            <span class="subtle">Active: <span id="facts-count">—</span></span>
+            <span class="subtle">Tombstoned: <span id="facts-tomb">—</span></span>
+            <button id="facts-refresh" class="ghost">Refresh</button>
+            <button id="facts-prune" class="ghost" title="Run decay-prune now">Prune</button>
+          </div>
+        </div>
+        <p class="subtle">Atomic statements Jarvis remembers about you.
+          Top-ranked facts (decay-weighted) get injected into the chat
+          system prompt. Old, unused facts naturally fade away.</p>
+
+        <div class="card glass" style="margin-bottom:1rem">
+          <h3 style="margin-top:0">Add a fact</h3>
+          <div class="facts-add-grid">
+            <input id="facts-new-key" class="text-input" placeholder="user.preference" />
+            <input id="facts-new-value" class="text-input" placeholder="drinks black coffee, no sugar" />
+            <button id="facts-add" class="primary">Add</button>
+          </div>
+          <div id="facts-new-error" class="error subtle"></div>
+        </div>
+
+        <div class="filters" style="margin-bottom:1rem">
+          <input id="facts-q" class="text-input" placeholder="search…" style="flex:1" />
+          <select id="facts-prefix" class="text-input">
+            <option value="">all keys</option>
+            <option value="user.">user.*</option>
+            <option value="system.">system.*</option>
+            <option value="skill.">skill.*</option>
+          </select>
+        </div>
+        <div id="facts-list" class="facts-list"></div>
       </section>
 
       <!-- view: live -->

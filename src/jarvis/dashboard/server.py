@@ -16,6 +16,11 @@ Routing surface (all JSON):
   GET  /api/audit            — query audit events (?limit, ?kind, ?tool, ?since)
   GET  /api/audit/stats      — aggregate counts
   GET  /api/capabilities     — gate state snapshot
+  GET  /api/facts            — list / FTS search persistent facts
+  POST /api/facts            — add new fact {key, value, source?, confidence?}
+  DEL  /api/facts/{id}       — soft-delete (tombstone) a fact
+  POST /api/facts/prune      — run decay-based prune now
+  GET  /api/facts/stats      — counts + top keys
   GET  /api/events           — tail of events.jsonl (N most recent lines)
   WS   /ws/events            — live event stream (line-delimited JSON)
 
@@ -267,6 +272,11 @@ class DashboardServer:
         app.router.add_get("/api/audit", self._h_audit)
         app.router.add_get("/api/audit/stats", self._h_audit_stats)
         app.router.add_get("/api/capabilities", self._h_capabilities)
+        app.router.add_get("/api/facts", self._h_facts)
+        app.router.add_post("/api/facts", self._h_facts_add)
+        app.router.add_delete("/api/facts/{fact_id}", self._h_facts_delete)
+        app.router.add_post("/api/facts/prune", self._h_facts_prune)
+        app.router.add_get("/api/facts/stats", self._h_facts_stats)
         app.router.add_get("/api/events", self._h_events_tail)
         app.router.add_get("/ws/events", self._h_ws_events)
         # OPTIONS fallback for every route (CORS preflight)
@@ -449,6 +459,106 @@ class DashboardServer:
         from aiohttp import web
         from ..capabilities import gate_summary
         return web.json_response({"gates": gate_summary()})
+
+    async def _h_facts(self, req):
+        """List or search persistent facts.
+
+        Query params:
+          q          — FTS5 search query (optional)
+          key_prefix — filter by key prefix (e.g. "user.")
+          limit      — max rows (default 50, cap 500)
+        """
+        from aiohttp import web
+        from ..memory.facts import get_facts_store
+        q = req.query.get("q", "").strip()
+        prefix = req.query.get("key_prefix", "").strip() or None
+        try:
+            limit = int(req.query.get("limit", "50"))
+        except ValueError:
+            limit = 50
+        limit = min(max(1, limit), 500)
+        store = get_facts_store()
+        if q:
+            facts = await asyncio.to_thread(
+                lambda: store.search(q, limit=limit, key_prefix=prefix)
+            )
+        else:
+            facts = await asyncio.to_thread(
+                lambda: store.by_key(prefix or "", limit=limit)
+            )
+        import time as _time
+        now = _time.time()
+        return web.json_response({
+            "facts": [
+                {
+                    "id": f.id,
+                    "key": f.key,
+                    "value": f.value,
+                    "source": f.source,
+                    "confidence": f.confidence,
+                    "ts_utc": f.ts_utc,
+                    "last_used": f.last_used,
+                    "hits": f.hits,
+                    "score": f.score(now=now),
+                }
+                for f in facts
+            ]
+        })
+
+    async def _h_facts_add(self, req):
+        """Add a new fact. Body: {key, value, source?, confidence?}."""
+        from aiohttp import web
+        from ..memory.facts import get_facts_store
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        key = (body.get("key") or "").strip()
+        value = (body.get("value") or "").strip()
+        if not key or not value:
+            return web.json_response(
+                {"error": "key and value required"}, status=400
+            )
+        source = body.get("source") or "dashboard"
+        try:
+            confidence = float(body.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        store = get_facts_store()
+        try:
+            fid = await asyncio.to_thread(
+                lambda: store.add(
+                    key, value, source=source, confidence=confidence,
+                )
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"id": fid, "ok": True})
+
+    async def _h_facts_delete(self, req):
+        from aiohttp import web
+        from ..memory.facts import get_facts_store
+        try:
+            fid = int(req.match_info["fact_id"])
+        except (KeyError, ValueError):
+            return web.json_response({"error": "bad id"}, status=400)
+        store = get_facts_store()
+        removed = await asyncio.to_thread(lambda: store.delete(fid))
+        return web.json_response({"removed": bool(removed)})
+
+    async def _h_facts_prune(self, req):
+        from aiohttp import web
+        from ..memory.facts import get_facts_store
+        store = get_facts_store()
+        n = await asyncio.to_thread(lambda: store.prune())
+        return web.json_response({"pruned": n})
+
+    async def _h_facts_stats(self, req):
+        from aiohttp import web
+        from ..memory.facts import get_facts_store
+        store = get_facts_store()
+        stats = await asyncio.to_thread(lambda: store.stats())
+        return web.json_response(stats)
 
     async def _h_events_tail(self, req):
         from aiohttp import web

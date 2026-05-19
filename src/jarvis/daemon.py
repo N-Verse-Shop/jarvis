@@ -623,6 +623,32 @@ def main() -> None:
                 flush=True,
             )
 
+    # R33-S2: nightly facts-prune. Decay-based pruning is cheap (~ms for
+    # ~10k rows) so we just run it once every 6 h in a daemon thread.
+    # Disable with JARVIS_FACTS_DISABLE=true.
+    if os.environ.get("JARVIS_FACTS_DISABLE", "").lower() not in (
+        "1", "true", "yes", "on"
+    ):
+        def _facts_prune_loop():
+            import time as _t
+            from .memory.facts import get_facts_store
+            _t.sleep(60)  # let startup finish before first sweep
+            while True:
+                try:
+                    store = get_facts_store()
+                    n = store.prune()
+                    if n:
+                        print(f"facts: pruned {n} stale row(s)", flush=True)
+                except Exception as exc:
+                    print(f"facts prune failed: {exc!r}", flush=True)
+                _t.sleep(6 * 3600)  # every 6 hours
+
+        threading.Thread(
+            target=_facts_prune_loop,
+            name="facts-prune",
+            daemon=True,
+        ).start()
+
     # Initialize dictation engine (hold-to-dictate)
     dictation = None
     if bool(getattr(cfg, "dictation_enabled", True)):

@@ -62,6 +62,7 @@ function setView(name) {
   if (name === "audit") loadAudit();
   if (name === "persona") loadPersona();
   if (name === "capabilities") loadCapabilities();
+  if (name === "facts") loadFacts();
   if (name === "live") startLiveStream();
 }
 tabs.forEach(t => t.addEventListener("click", () => setView(t.dataset.view)));
@@ -273,6 +274,93 @@ async function loadCapabilities() {
     `).join("");
   } catch (e) { console.warn("capabilities load:", e); }
 }
+
+// ─── facts ───────────────────────────────────────────────────────
+function fmtRelTime(ts) {
+  const d = (Date.now() / 1000) - ts;
+  if (d < 60) return `${Math.floor(d)}s ago`;
+  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
+  return `${Math.floor(d / 86400)}d ago`;
+}
+
+async function loadFacts() {
+  const q = document.getElementById("facts-q")?.value.trim() || "";
+  const prefix = document.getElementById("facts-prefix")?.value.trim() || "";
+  try {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (prefix) params.set("key_prefix", prefix);
+    params.set("limit", "100");
+    const { facts } = await api(`/api/facts?${params}`);
+    const stats = await api("/api/facts/stats");
+    document.getElementById("facts-count").textContent = stats.active;
+    document.getElementById("facts-tomb").textContent = stats.tombstoned;
+    const list = document.getElementById("facts-list");
+    if (!facts.length) {
+      list.innerHTML = `<div class="subtle" style="padding:1rem">No facts. Add one above ↑</div>`;
+      return;
+    }
+    list.innerHTML = facts.map(f => `
+      <div class="card glass fact-card" data-id="${f.id}">
+        <div class="fact-head">
+          <span class="fact-key">${escapeHtml(f.key)}</span>
+          <span class="fact-score" title="decay-weighted score">${f.score.toFixed(2)}</span>
+        </div>
+        <div class="fact-value">${escapeHtml(f.value)}</div>
+        <div class="fact-meta">
+          <span>${escapeHtml(f.source)}</span>
+          <span>conf ${f.confidence.toFixed(2)}</span>
+          <span>hits ${f.hits}</span>
+          <span>${fmtRelTime(f.last_used)}</span>
+          <button class="fact-del" data-id="${f.id}">forget</button>
+        </div>
+      </div>
+    `).join("");
+    list.querySelectorAll(".fact-del").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const id = e.target.dataset.id;
+        if (!confirm(`Forget fact #${id}?`)) return;
+        await api(`/api/facts/${id}`, { method: "DELETE" });
+        loadFacts();
+      });
+    });
+  } catch (e) { console.warn("facts load:", e); }
+}
+
+document.getElementById("facts-add")?.addEventListener("click", async () => {
+  const key = document.getElementById("facts-new-key").value.trim();
+  const value = document.getElementById("facts-new-value").value.trim();
+  if (!key || !value) {
+    document.getElementById("facts-new-error").textContent = "Both key and value required.";
+    return;
+  }
+  try {
+    await api("/api/facts", {
+      method: "POST",
+      body: JSON.stringify({ key, value, source: "dashboard" }),
+    });
+    document.getElementById("facts-new-key").value = "";
+    document.getElementById("facts-new-value").value = "";
+    document.getElementById("facts-new-error").textContent = "";
+    loadFacts();
+  } catch (e) {
+    document.getElementById("facts-new-error").textContent = e.message;
+  }
+});
+
+document.getElementById("facts-refresh")?.addEventListener("click", loadFacts);
+document.getElementById("facts-q")?.addEventListener("input", () => {
+  clearTimeout(window._factsDebounce);
+  window._factsDebounce = setTimeout(loadFacts, 200);
+});
+document.getElementById("facts-prefix")?.addEventListener("change", loadFacts);
+document.getElementById("facts-prune")?.addEventListener("click", async () => {
+  if (!confirm("Run decay-prune now? Old, low-score facts will be tombstoned.")) return;
+  const r = await api("/api/facts/prune", { method: "POST" });
+  alert(`Pruned ${r.pruned} fact(s).`);
+  loadFacts();
+});
 
 // ─── live events stream ──────────────────────────────────────────
 let liveSocket = null;

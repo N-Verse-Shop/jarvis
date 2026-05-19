@@ -179,19 +179,22 @@ def _system_prompt_for(lang: str) -> str:
     Composition (in order, each section optional + best-effort):
 
       1. Persona block from ~/.config/jarvis/persona.md (R33-S1)
-      2. Base voice prompt (RU or UK, hard-coded fallback)
-      3. L1 skill catalog from ~/.config/jarvis/skills/ (R32-1)
+      2. Facts block — top decay-ranked user traits (R33-S2)
+      3. Base voice prompt (RU or UK, hard-coded fallback)
+      4. L1 skill catalog from ~/.config/jarvis/skills/ (R32-1)
 
     The persona section comes FIRST because it shapes the model's
-    voice for the whole turn; the base prompt + skill catalog are
-    operational instructions that follow.
+    voice for the whole turn; facts come second because they're
+    user-specific context the model should weave into responses;
+    base prompt + skill catalog are operational instructions.
 
-    Total budget: ~300 tokens. Persona ~120, base ~130, catalog ~50
-    at 5 skills. Cold-cache eval on qwen3:8b stays under ~250 ms.
+    Total budget: ~350 tokens. Persona ~120, facts ~80 (cap 600
+    chars), base ~130, catalog ~50 at 5 skills. Cold-cache eval on
+    qwen3:8b stays under ~250 ms.
 
-    Lazy-imports are intentional: ``skills`` and ``persona`` are
-    optional modules and must NEVER break the voice loop on import
-    failure.
+    Lazy-imports are intentional: ``skills``, ``persona``, ``facts``
+    are optional modules and must NEVER break the voice loop on
+    import failure.
     """
     base = _VOICE_SYSTEM_PROMPT_UK if lang == "uk" else _VOICE_SYSTEM_PROMPT_RU
     parts: list[str] = []
@@ -205,10 +208,19 @@ def _system_prompt_for(lang: str) -> str:
     except Exception as exc:
         debug_log(f"persona block unavailable: {exc!r}", "pipecat")
 
-    # 2. Base voice prompt
+    # 2. Facts (R33-S2)
+    try:
+        from ..memory.facts import render_facts_for_prompt
+        facts_block = render_facts_for_prompt(key_prefix="user.", limit=8, max_chars=400)
+        if facts_block:
+            parts.append(facts_block)
+    except Exception as exc:
+        debug_log(f"facts block unavailable: {exc!r}", "pipecat")
+
+    # 3. Base voice prompt
     parts.append(base)
 
-    # 3. L1 skill catalog (R32-1)
+    # 4. L1 skill catalog (R32-1)
     try:
         from ..skills import get_skill_store
         catalog = get_skill_store().catalog_block(active_locale=lang)
