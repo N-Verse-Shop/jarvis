@@ -705,6 +705,10 @@ def _make_fast_path_processor():
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self._stream = get_stream()
+            # R33-S3 audit — lazy import so the legacy listener path
+            # doesn't pay audit init cost when only Pipecat uses it.
+            from ..audit import get_audit_store
+            self._audit = get_audit_store()
 
         async def process_frame(
             self, frame: "Frame", direction: "FrameDirection"
@@ -754,10 +758,19 @@ def _make_fast_path_processor():
                 args={},
                 status="starting",
             )
+            self._audit.emit(
+                kind="fast_path",
+                tool=action.name,
+                status="starting",
+                args={"text": text},
+            )
+            import time as _time
+            t0 = _time.monotonic()
             try:
                 ok, msg = await _asyncio.to_thread(action.fn)
             except Exception as exc:
                 ok, msg = False, f"fast-path exec error: {exc!r}"
+            duration_ms = int((_time.monotonic() - t0) * 1000)
             self._stream.emit(
                 "tool_call",
                 tool=action.name,
@@ -765,6 +778,15 @@ def _make_fast_path_processor():
                 status="completed" if ok else "failed",
                 result=msg if ok else None,
                 error=None if ok else msg,
+            )
+            self._audit.emit(
+                kind="fast_path",
+                tool=action.name,
+                status="completed" if ok else "failed",
+                args={"text": text},
+                result=msg if ok else None,
+                error=None if ok else msg,
+                duration_ms=duration_ms,
             )
 
             # Speak the human-friendly description ("Зараз відкрию
@@ -1057,6 +1079,7 @@ def _register_mac_control_handlers(llm):
     user can see which tool the LLM chose and whether it worked.
     """
     import asyncio as _asyncio
+    import time as _time
 
     from ..ipc import get_stream
     from ..tools.builtin.mac_control import _dispatch_op, _OPS
@@ -1083,6 +1106,11 @@ def _register_mac_control_handlers(llm):
                 "Update _mac_control_tools_schema or fix mac_control."
             )
 
+    # R33-S3: audit store also receives each tool_call so the
+    # dashboard can query "failed focus_app in last 24h" etc.
+    from ..audit import get_audit_store
+    audit = get_audit_store()
+
     def _make_handler(op_name: str):
         async def _handler(params) -> None:
             args = dict(params.arguments or {})
@@ -1092,12 +1120,20 @@ def _register_mac_control_handlers(llm):
                 args=args,
                 status="starting",
             )
+            audit.emit(
+                kind="tool_call",
+                tool=op_name,
+                status="starting",
+                args=args,
+            )
+            t0 = _time.monotonic()
             try:
                 ok, msg = await _asyncio.to_thread(
                     _dispatch_op, op_name, args
                 )
             except Exception as exc:
                 ok, msg = False, f"dispatch error: {exc!r}"
+            duration_ms = int((_time.monotonic() - t0) * 1000)
             stream.emit(
                 "tool_call",
                 tool=op_name,
@@ -1105,6 +1141,15 @@ def _register_mac_control_handlers(llm):
                 status="completed" if ok else "failed",
                 result=msg if ok else None,
                 error=None if ok else msg,
+            )
+            audit.emit(
+                kind="tool_call",
+                tool=op_name,
+                status="completed" if ok else "failed",
+                args=args,
+                result=msg if ok else None,
+                error=None if ok else msg,
+                duration_ms=duration_ms,
             )
             # Pipecat callback delivers the result back to the LLM
             # so it can continue the response ("Зробив. Що далі?").
