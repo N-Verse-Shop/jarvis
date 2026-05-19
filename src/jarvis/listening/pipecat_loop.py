@@ -1643,6 +1643,14 @@ class PipecatVoiceThread:
         self._loop_cfg = from_settings(cfg)
         self._loop = PipecatLoop(self._loop_cfg)
         import threading as _threading
+        # DictationEngine wants a shared ``transcribe_lock`` so its
+        # MLX transcribe call serialises against the voice listener's.
+        # Pipecat owns its own internal WhisperSTTServiceMLX instance
+        # which doesn't actually share state with mlx_whisper.transcribe
+        # used by dictation, BUT exposing the same attribute keeps
+        # ``daemon.py`` engine-agnostic — and a process-wide lock costs
+        # nothing in the common case where dictation isn't recording.
+        self.transcribe_lock = _threading.Lock()
         self._thread = _threading.Thread(
             target=self._run_thread,
             name="PipecatVoiceThread",
