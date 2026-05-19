@@ -594,6 +594,35 @@ def main() -> None:
         flush=True,
     )
 
+    # R33-S5: optional local-only dashboard control room. Enabled by
+    # default (gated env var) so the user gets the dashboard on
+    # first daemon restart after this commit. Set
+    # ``JARVIS_DASHBOARD_DISABLE=true`` to turn it off entirely.
+    if os.environ.get("JARVIS_DASHBOARD_DISABLE", "").lower() not in (
+        "1", "true", "yes", "on"
+    ):
+        try:
+            from .dashboard import start_dashboard, get_dashboard_token
+            dashboard = start_dashboard()
+            token = get_dashboard_token()
+            host = os.environ.get("JARVIS_DASHBOARD_HOST", "127.0.0.1")
+            port = int(os.environ.get("JARVIS_DASHBOARD_PORT", "8789"))
+            print(
+                f"✓ Dashboard ready on http://{host}:{port}",
+                flush=True,
+            )
+            print(
+                "    token (first 12 chars): "
+                f"{token[:12]}…  — full token at "
+                f"~/Library/Application\\ Support/jarvis/dashboard-token",
+                flush=True,
+            )
+        except Exception as _dash_exc:
+            print(
+                f"⚠ Dashboard init skipped: {_dash_exc!r}",
+                flush=True,
+            )
+
     # Initialize dictation engine (hold-to-dictate)
     dictation = None
     if bool(getattr(cfg, "dictation_enabled", True)):
