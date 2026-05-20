@@ -207,6 +207,145 @@ document.getElementById("skills-reload").addEventListener("click", async () => {
   loadSkills();
 });
 
+// ─── skill editor (R34-S23) ──────────────────────────────────────
+// Tracks which skill we're editing; null = creating a new one.
+let _editingSkillName = null;
+
+function skillEditorToast(message, level = "ok") {
+  const el = document.getElementById("skill-editor-toast");
+  if (!el) return;
+  el.textContent = message;
+  el.className = `toast toast-${level}`;
+  el.hidden = false;
+  clearTimeout(window._skillEditorToastTimer);
+  window._skillEditorToastTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+function openSkillEditor({ name = null, content = "", description = "",
+                          status = "active", version = "1.0.0",
+                          tags = [], tools = [], risk = "low",
+                          locale = "ru", isNew = false } = {}) {
+  _editingSkillName = isNew ? null : name;
+  document.getElementById("skill-detail").hidden = true;
+  document.getElementById("skill-editor-title").textContent =
+    isNew ? "New skill" : `Edit: ${name}`;
+  const nameInput = document.getElementById("skill-edit-name");
+  nameInput.value = name || "";
+  nameInput.disabled = !isNew;       // immutable after create
+  document.getElementById("skill-edit-desc").value = description;
+  document.getElementById("skill-edit-status").value = status;
+  document.getElementById("skill-edit-risk").value = risk;
+  document.getElementById("skill-edit-locale").value = locale;
+  document.getElementById("skill-edit-version").value = version;
+  document.getElementById("skill-edit-tags").value =
+    Array.isArray(tags) ? tags.join(", ") : (tags || "");
+  document.getElementById("skill-edit-tools").value =
+    Array.isArray(tools) ? tools.join(", ") : (tools || "");
+  document.getElementById("skill-edit-content").value = content || "";
+  document.getElementById("skill-editor-toast").hidden = true;
+  document.getElementById("skill-editor").hidden = false;
+}
+
+async function saveSkillEditor() {
+  const csv = id => (document.getElementById(id)?.value || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  const body = {
+    description: document.getElementById("skill-edit-desc").value.trim(),
+    status: document.getElementById("skill-edit-status").value,
+    version: document.getElementById("skill-edit-version").value.trim() || "1.0.0",
+    tags: csv("skill-edit-tags"),
+    tools: csv("skill-edit-tools"),
+    risk: document.getElementById("skill-edit-risk").value,
+    locale: document.getElementById("skill-edit-locale").value,
+    content: document.getElementById("skill-edit-content").value,
+  };
+  if (!body.description) {
+    skillEditorToast("Description обов'язковий", "error");
+    return;
+  }
+  if (!body.content.trim()) {
+    skillEditorToast("Body не може бути пустим", "error");
+    return;
+  }
+  try {
+    let res;
+    if (_editingSkillName === null) {
+      body.name = document.getElementById("skill-edit-name").value.trim();
+      if (!body.name) {
+        skillEditorToast("Name обов'язковий", "error");
+        return;
+      }
+      res = await api("/api/skills", { method: "POST", body });
+    } else {
+      res = await api(`/api/skills/${encodeURIComponent(_editingSkillName)}`,
+                      { method: "PUT", body });
+    }
+    if (res.ok) {
+      skillEditorToast(`✓ Збережено: ${res.name}`, "ok");
+      setTimeout(() => {
+        document.getElementById("skill-editor").hidden = true;
+        loadSkills();
+      }, 600);
+    } else {
+      skillEditorToast(`✗ ${res.error || "невідома помилка"}`, "error");
+    }
+  } catch (exc) {
+    skillEditorToast(`✗ ${exc.message || exc}`, "error");
+  }
+}
+
+async function deleteCurrentSkill() {
+  const name = document.getElementById("skill-detail-name").textContent.trim();
+  if (!name) return;
+  if (!confirm(`Видалити скіл «${name}»? Файл буде переміщено в __trash__/ — можна відновити вручну.`)) return;
+  try {
+    const res = await api(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" });
+    if (res.ok) {
+      document.getElementById("skill-detail").hidden = true;
+      loadSkills();
+    } else {
+      alert(`Не вдалось видалити: ${res.error || "невідома помилка"}`);
+    }
+  } catch (exc) {
+    alert(`Помилка видалення: ${exc.message || exc}`);
+  }
+}
+
+async function editCurrentSkill() {
+  const name = document.getElementById("skill-detail-name").textContent.trim();
+  if (!name) return;
+  try {
+    const s = await api(`/api/skills/${encodeURIComponent(name)}`);
+    openSkillEditor({
+      name: s.name,
+      content: s.content,
+      description: s.description,
+      status: s.status || "active",
+      version: s.version,
+      tags: s.tags,
+      tools: s.tools,
+      risk: s.risk,
+      locale: s.locale,
+      isNew: false,
+    });
+  } catch (exc) {
+    alert(`Не вдалось завантажити для редагування: ${exc.message || exc}`);
+  }
+}
+
+document.getElementById("skills-new")?.addEventListener("click", () => {
+  openSkillEditor({ isNew: true });
+});
+document.getElementById("skill-edit-save")?.addEventListener("click", saveSkillEditor);
+document.getElementById("skill-edit-cancel")?.addEventListener("click", () => {
+  document.getElementById("skill-editor").hidden = true;
+});
+document.getElementById("skill-editor-close")?.addEventListener("click", () => {
+  document.getElementById("skill-editor").hidden = true;
+});
+document.getElementById("skill-edit-btn")?.addEventListener("click", editCurrentSkill);
+document.getElementById("skill-delete-btn")?.addEventListener("click", deleteCurrentSkill);
+
 // ─── audit ───────────────────────────────────────────────────────
 async function loadAudit() {
   try {
@@ -261,6 +400,100 @@ async function loadPersona() {
 document.getElementById("persona-reload").addEventListener("click", async () => {
   await api("/api/persona/reload", { method: "POST" });
   loadPersona();
+});
+
+// ─── persona editor (R34-S23) ────────────────────────────────────
+function personaToast(message, level = "ok") {
+  const el = document.getElementById("persona-toast");
+  if (!el) return;
+  el.textContent = message;
+  el.className = `toast toast-${level}`;
+  el.hidden = false;
+  clearTimeout(window._personaToastTimer);
+  window._personaToastTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+async function openPersonaEditor() {
+  // Pull RAW file content (persona endpoint returns parsed, not raw).
+  // The cleanest path is to extract identity/boundaries/shortcuts and
+  // hand-roll a serialized form — but for full fidelity (incl. our
+  // R34-S19 "Style" section), fetch /api/persona/raw if available, else
+  // synthesize from parsed fields. We don't have a raw endpoint, so use
+  // a one-off fetch helper.
+  try {
+    const r = await fetch("/api/persona/raw", { headers: authHeaders() });
+    if (r.ok) {
+      const j = await r.json();
+      document.getElementById("persona-edit-content").value = j.content || "";
+    } else {
+      // Synthesize from parsed (rare — endpoint should exist post-S23).
+      const p = await api("/api/persona");
+      document.getElementById("persona-edit-content").value = _personaSynthesize(p);
+    }
+  } catch {
+    const p = await api("/api/persona");
+    document.getElementById("persona-edit-content").value = _personaSynthesize(p);
+  }
+  document.getElementById("persona-card").hidden = true;
+  document.getElementById("persona-editor").hidden = false;
+}
+
+function _personaSynthesize(p) {
+  // Best-effort serializer if raw isn't available.
+  return [
+    "---",
+    `name: ${p.name || "Jarvis"}`,
+    `owner: ${p.owner || ""}`,
+    `language_preference: ${p.language_preference || "ru"}`,
+    "---",
+    "",
+    "# Jarvis Persona",
+    "",
+    "## Identity",
+    "",
+    p.identity || "",
+    "",
+    "## Boundaries",
+    "",
+    ...(p.boundaries || []).map(b => `- ${b}`),
+    "",
+    "## Shortcuts",
+    "",
+    ...(p.shortcuts || []).map(s => `- ${s}`),
+    "",
+  ].join("\n");
+}
+
+async function savePersonaEditor() {
+  const content = document.getElementById("persona-edit-content").value;
+  if (!content.trim()) {
+    personaToast("Файл не може бути пустим", "error");
+    return;
+  }
+  if (!content.trimStart().startsWith("---")) {
+    personaToast("persona.md повинна починатись з ---", "error");
+    return;
+  }
+  try {
+    const res = await api("/api/persona", { method: "PUT", body: { content } });
+    if (res.ok) {
+      personaToast("✓ Збережено + перезавантажено", "ok");
+      document.getElementById("persona-editor").hidden = true;
+      document.getElementById("persona-card").hidden = false;
+      loadPersona();
+    } else {
+      personaToast(`✗ ${res.error || "невідома помилка"}`, "error");
+    }
+  } catch (exc) {
+    personaToast(`✗ ${exc.message || exc}`, "error");
+  }
+}
+
+document.getElementById("persona-edit-toggle")?.addEventListener("click", openPersonaEditor);
+document.getElementById("persona-save")?.addEventListener("click", savePersonaEditor);
+document.getElementById("persona-cancel")?.addEventListener("click", () => {
+  document.getElementById("persona-editor").hidden = true;
+  document.getElementById("persona-card").hidden = false;
 });
 
 // ─── capabilities ────────────────────────────────────────────────
@@ -565,15 +798,54 @@ async function saveSettings() {
 }
 
 async function restartDaemon() {
-  if (!confirm("Перезапустити Jarvis daemon? Сесія дашборду залишиться відкритою, але новий PID підніметься за ~30s.")) return;
+  if (!confirm("Перезапустити Jarvis daemon? Сесія дашборду залишиться відкритою, але новий PID підніметься за ~10-15s.")) return;
+  // R34-S20: fetch() to /api/restart is RACING the daemon's own
+  // SIGTERM — the response is written then the process dies. Even
+  // with Connection: close + a 1.2s flush window, the browser
+  // sometimes still surfaces `TypeError: Failed to fetch`. That's
+  // EXPECTED during restart, not a real failure, so we treat the
+  // network error the same as a 200 and poll /api/health until the
+  // daemon comes back to confirm.
+  settingsToast("⟳ Перезапуск… новий PID за ~10-15s.", "ok");
   try {
     await api("/api/restart", { method: "POST" });
-    settingsToast("⟳ Перезапуск… дашборд автоматично перепідключиться через ~30s.", "ok");
-    // Force a settings reload after the daemon comes back.
-    setTimeout(() => loadSettings(), 35_000);
   } catch (exc) {
-    settingsToast(`Не вдалося перезапустити: ${exc.message || exc}`, "error");
+    // Network failure mid-restart is fine — we expected it. Anything
+    // else (e.g. 401 token rejection) bubbles back up to the user.
+    const msg = String(exc.message || exc);
+    if (msg.includes("Failed to fetch") || msg.includes("NetworkError") ||
+        msg.includes("network") || msg.includes("aborted")) {
+      // expected — keep going
+    } else if (msg.startsWith("HTTP 5") || msg.startsWith("HTTP 4")) {
+      settingsToast(`Restart відмова: ${msg}`, "error");
+      return;
+    }
+    // else: treat as expected disconnect
   }
+  // Poll /api/health until we see a NEW pid + uptime resetting.
+  const startedAt = Date.now();
+  let oldPid = null;
+  try {
+    const h0 = await fetch("/api/health").then(r => r.json()).catch(() => null);
+    if (h0 && h0.pid) oldPid = h0.pid;
+  } catch {}
+  const poll = async () => {
+    while (Date.now() - startedAt < 60_000) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const r = await fetch("/api/health", { cache: "no-store" });
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (j && j.pid && (!oldPid || j.pid !== oldPid) && j.uptime_s < 30) {
+          settingsToast(`✓ Jarvis перезапущено (PID ${j.pid}).`, "ok");
+          await loadSettings().catch(() => {});
+          return;
+        }
+      } catch { /* daemon still down, keep polling */ }
+    }
+    settingsToast("⚠ Перезапуск зайняв більше 60s — перевір логи.", "warn");
+  };
+  poll();
 }
 
 // Wire up controls + live readouts

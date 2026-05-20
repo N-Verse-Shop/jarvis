@@ -1007,6 +1007,47 @@ button.ghost.danger:hover {
   to   { opacity: 1; transform: none; }
 }
 
+/* ── skill / persona editor (R34-S23) ───────────────────────────── */
+.skill-detail-actions {
+  display: flex;
+  gap: 10px;
+  margin: 6px 0 18px;
+  flex-wrap: wrap;
+}
+.skill-editor-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 6px;
+}
+.skill-editor-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+.skill-edit-textarea {
+  width: 100%;
+  min-height: 240px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: vertical;
+  white-space: pre;
+  tab-size: 2;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+#skill-editor, #persona-editor {
+  margin-top: 16px;
+}
+#persona-editor .skill-edit-textarea {
+  min-height: 360px;
+}
+#skill-edit-name:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* ── footer / nexus brand mark ─────────────────────────────────── */
 .app-footer {
   margin-top: 60px;

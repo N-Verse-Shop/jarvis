@@ -265,12 +265,18 @@ class DashboardServer:
         app.router.add_get("/api/state", self._h_state)
         app.router.add_get("/api/persona", self._h_persona)
         app.router.add_post("/api/persona/reload", self._h_persona_reload)
+        app.router.add_get("/api/persona/raw", self._h_persona_raw)
         app.router.add_get("/api/skills", self._h_skills)
         app.router.add_get("/api/skills/{name}", self._h_skill_one)
         app.router.add_get(
             "/api/skills/{name}/refs/{ref}", self._h_skill_ref
         )
         app.router.add_post("/api/skills/reload", self._h_skills_reload)
+        # R34-S23: skill + persona CRUD via dashboard
+        app.router.add_post("/api/skills", self._h_skill_create)
+        app.router.add_put("/api/skills/{name}", self._h_skill_update)
+        app.router.add_delete("/api/skills/{name}", self._h_skill_delete)
+        app.router.add_put("/api/persona", self._h_persona_update)
         app.router.add_get("/api/audit", self._h_audit)
         app.router.add_get("/api/audit/stats", self._h_audit_stats)
         app.router.add_get("/api/capabilities", self._h_capabilities)
@@ -350,6 +356,27 @@ class DashboardServer:
             {"ok": True, "persona": p.to_dict()}
         )
 
+    async def _h_persona_raw(self, req):
+        """GET /api/persona/raw — raw persona.md text for the editor.
+
+        Read-only; the parsed view at /api/persona keeps the chat-side
+        consumers happy, but the dashboard editor needs full fidelity
+        so it can preserve our `## Style` section + comments that
+        the parser doesn't surface."""
+        from aiohttp import web
+        from ..persona import get_persona_store
+        store = get_persona_store()
+        path = store.path
+        if not path.exists():
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+        try:
+            content = await asyncio.to_thread(
+                lambda: path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        return web.json_response({"ok": True, "path": str(path), "content": content})
+
     async def _h_skills(self, req):
         from aiohttp import web
         from ..skills import get_skill_store
@@ -416,6 +443,317 @@ class DashboardServer:
         from ..skills import get_skill_store
         await asyncio.to_thread(get_skill_store().reload)
         return web.json_response({"ok": True})
+
+    # ────────────────────────────────────────────────────────────
+    # R34-S23: skill CRUD via dashboard
+    # ────────────────────────────────────────────────────────────
+    _SKILL_NAME_RE = __import__("re").compile(r"^[a-z][a-z0-9-]{1,38}[a-z0-9]$")
+    _SKILL_BODY_MAX = 200_000      # 200 KB cap
+    _PERSONA_BODY_MAX = 200_000    # same for persona.md
+
+    @classmethod
+    def _validate_skill_name(cls, name: str) -> str:
+        """Lowercase kebab-case 3-40 chars. Rejects path traversal."""
+        if not isinstance(name, str):
+            raise ValueError("name must be a string")
+        n = name.strip().lower()
+        if not cls._SKILL_NAME_RE.fullmatch(n):
+            raise ValueError(
+                "name must be lowercase kebab-case (a-z, 0-9, '-'), "
+                "3..40 chars, no edge dashes"
+            )
+        # belt-and-braces: forbid anything that looks like a path segment
+        if "/" in n or ".." in n or n.startswith("."):
+            raise ValueError("invalid characters in name")
+        return n
+
+    def _skill_dir(self, name: str) -> "Path":
+        """Resolve a skill directory under the user skills root, with a
+        post-resolution sandbox check to defend against traversal even
+        if the validator above is bypassed in some future refactor."""
+        from ..skills import get_skill_store
+        root = get_skill_store().skills_dir.resolve()
+        target = (root / name).resolve()
+        # Must be a direct child of `root`. .parents[0] catches that.
+        if target.parent != root:
+            raise ValueError("skill path escapes the skills directory")
+        return target
+
+    @staticmethod
+    def _compose_skill_md(meta: dict, body: str) -> str:
+        """Render frontmatter + body into a SKILL.md string."""
+        lines = ["---"]
+        # Ordered keys for stable, human-readable output.
+        ordered = [
+            "name", "description", "status", "version", "author",
+            "upstream", "license", "tags", "tools", "risk", "locale",
+        ]
+        seen = set()
+        for k in ordered:
+            if k in meta and meta[k] not in (None, "", []):
+                v = meta[k]
+                if isinstance(v, list):
+                    lines.append(f"{k}: [{', '.join(str(x) for x in v)}]")
+                else:
+                    lines.append(f"{k}: {v}")
+                seen.add(k)
+        for k, v in meta.items():
+            if k in seen or v in (None, "", []):
+                continue
+            if isinstance(v, list):
+                lines.append(f"{k}: [{', '.join(str(x) for x in v)}]")
+            else:
+                lines.append(f"{k}: {v}")
+        lines.append("---")
+        lines.append("")
+        lines.append(body.rstrip() + "\n")
+        return "\n".join(lines)
+
+    async def _h_skill_create(self, req):
+        """POST /api/skills — create a new skill folder + SKILL.md."""
+        from aiohttp import web
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid JSON body"}, status=400
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be an object"}, status=400
+            )
+        try:
+            name = self._validate_skill_name(body.get("name", ""))
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        content = body.get("content", "")
+        description = (body.get("description") or "").strip()
+        if not description:
+            return web.json_response(
+                {"ok": False, "error": "description is required"}, status=400
+            )
+        if not isinstance(content, str) or len(content) > self._SKILL_BODY_MAX:
+            return web.json_response(
+                {"ok": False, "error": f"content must be ≤{self._SKILL_BODY_MAX} bytes"},
+                status=400,
+            )
+
+        try:
+            skill_dir = self._skill_dir(name)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        if skill_dir.exists():
+            return web.json_response(
+                {"ok": False, "error": f"skill '{name}' already exists"},
+                status=409,
+            )
+
+        meta = {
+            "name": name,
+            "description": description,
+            "status": (body.get("status") or "active").strip().lower(),
+            "version": (body.get("version") or "1.0.0").strip(),
+            "author": (body.get("author") or "").strip(),
+            "tags": body.get("tags") or [],
+            "tools": body.get("tools") or [],
+            "risk": (body.get("risk") or "low").strip().lower(),
+            "locale": (body.get("locale") or "ru").strip().lower(),
+        }
+        md = self._compose_skill_md(meta, content)
+
+        def _write():
+            skill_dir.mkdir(parents=True, exist_ok=False)
+            (skill_dir / "SKILL.md").write_text(md, encoding="utf-8")
+            try:
+                (skill_dir / "SKILL.md").chmod(0o644)
+            except OSError:
+                pass
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as exc:
+            log.warning("skill create failed: %s", exc)
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+        # Hot-reload the store so the new skill appears immediately.
+        from ..skills import get_skill_store
+        await asyncio.to_thread(get_skill_store().reload)
+        return web.json_response({"ok": True, "name": name})
+
+    async def _h_skill_update(self, req):
+        """PUT /api/skills/{name} — overwrite SKILL.md."""
+        from aiohttp import web
+        try:
+            name = self._validate_skill_name(req.match_info["name"])
+            skill_dir = self._skill_dir(name)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        if not skill_dir.is_dir():
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid JSON body"}, status=400
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be an object"}, status=400
+            )
+        content = body.get("content", "")
+        description = (body.get("description") or "").strip()
+        if not description:
+            return web.json_response(
+                {"ok": False, "error": "description is required"}, status=400
+            )
+        if not isinstance(content, str) or len(content) > self._SKILL_BODY_MAX:
+            return web.json_response(
+                {"ok": False, "error": f"content must be ≤{self._SKILL_BODY_MAX} bytes"},
+                status=400,
+            )
+
+        # Merge with existing metadata so callers don't have to send everything.
+        from ..skills import get_skill_store
+        existing = get_skill_store().get_skill(name)
+        if existing:
+            meta = {
+                "name": name,
+                "description": description,
+                "status": (body.get("status") or existing.status or "active").strip().lower(),
+                "version": (body.get("version") or existing.version or "1.0.0").strip(),
+                "author": (body.get("author") or existing.author or "").strip(),
+                "tags": body.get("tags") if body.get("tags") is not None else existing.tags,
+                "tools": body.get("tools") if body.get("tools") is not None else existing.tools,
+                "risk": (body.get("risk") or existing.risk or "low").strip().lower(),
+                "locale": (body.get("locale") or existing.locale or "ru").strip().lower(),
+            }
+        else:
+            meta = {
+                "name": name,
+                "description": description,
+                "status": (body.get("status") or "active").strip().lower(),
+                "version": (body.get("version") or "1.0.0").strip(),
+                "author": (body.get("author") or "").strip(),
+                "tags": body.get("tags") or [],
+                "tools": body.get("tools") or [],
+                "risk": (body.get("risk") or "low").strip().lower(),
+                "locale": (body.get("locale") or "ru").strip().lower(),
+            }
+        md = self._compose_skill_md(meta, content)
+
+        target = skill_dir / "SKILL.md"
+        tmp = target.with_suffix(".md.tmp")
+
+        def _write():
+            tmp.write_text(md, encoding="utf-8")
+            try:
+                tmp.chmod(0o644)
+            except OSError:
+                pass
+            os.replace(tmp, target)
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as exc:
+            log.warning("skill update failed: %s", exc)
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+        await asyncio.to_thread(get_skill_store().reload)
+        return web.json_response({"ok": True, "name": name})
+
+    async def _h_skill_delete(self, req):
+        """DELETE /api/skills/{name} — remove the skill directory.
+
+        Two-phase: actual move to a `__trash__/` subdir under the skills
+        root, NOT rm -rf. Lets the user recover by hand if they regret
+        it, and keeps us inside the user's own data dir at all times."""
+        from aiohttp import web
+        try:
+            name = self._validate_skill_name(req.match_info["name"])
+            skill_dir = self._skill_dir(name)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        if not skill_dir.is_dir():
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+
+        from ..skills import get_skill_store
+        root = get_skill_store().skills_dir
+        trash = root / "__trash__"
+
+        def _move():
+            trash.mkdir(parents=True, exist_ok=True)
+            import datetime as _dt
+            stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            dest = trash / f"{name}.{stamp}"
+            os.rename(skill_dir, dest)
+            return str(dest)
+
+        try:
+            trashed = await asyncio.to_thread(_move)
+        except Exception as exc:
+            log.warning("skill delete failed: %s", exc)
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        await asyncio.to_thread(get_skill_store().reload)
+        return web.json_response({"ok": True, "name": name, "moved_to": trashed})
+
+    async def _h_persona_update(self, req):
+        """PUT /api/persona — overwrite persona.md raw text."""
+        from aiohttp import web
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid JSON body"}, status=400
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be an object"}, status=400
+            )
+        content = body.get("content", "")
+        if not isinstance(content, str):
+            return web.json_response(
+                {"ok": False, "error": "content must be a string"}, status=400
+            )
+        if not content.strip():
+            return web.json_response(
+                {"ok": False, "error": "content cannot be empty"}, status=400
+            )
+        if len(content) > self._PERSONA_BODY_MAX:
+            return web.json_response(
+                {"ok": False, "error": f"content must be ≤{self._PERSONA_BODY_MAX} bytes"},
+                status=400,
+            )
+        # Defence in depth: persona.md MUST start with YAML frontmatter
+        # so the loader doesn't crash on malformed input. The very
+        # first chars need to be `---\n` or `---\r\n`.
+        if not content.lstrip().startswith("---"):
+            return web.json_response(
+                {"ok": False, "error": "persona.md must start with YAML frontmatter (---)"},
+                status=400,
+            )
+
+        from ..persona import get_persona_store
+        store = get_persona_store()
+        target = store.path
+        tmp = target.with_suffix(".md.tmp")
+
+        def _write():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(content, encoding="utf-8")
+            try:
+                tmp.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(tmp, target)
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as exc:
+            log.warning("persona update failed: %s", exc)
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+        await asyncio.to_thread(store.reload)
+        return web.json_response({"ok": True, "path": str(target)})
 
     async def _h_audit(self, req):
         from aiohttp import web
@@ -797,30 +1135,51 @@ class DashboardServer:
         )
 
     async def _h_restart(self, req):
-        """Trigger a daemon restart via launchctl (macOS launchd)."""
+        """Trigger a daemon restart via launchctl (macOS launchd).
+
+        R34-S20: was racing the SIGTERM against the HTTP response
+        flush — browsers saw `TypeError: Failed to fetch` because the
+        socket closed mid-response. Two fixes layered together:
+
+        1. Explicit Connection: close + Content-Length so the browser
+           treats one full read as the complete response (no chunked
+           transfer that can be truncated).
+        2. Bumped the pre-kill sleep from 0.3s → 1.2s. aiohttp writes
+           into kernel buffers then yields; the kernel still needs a
+           round-trip to actually ship them to localhost before
+           launchctl unloads us.
+
+        We also delegate the kill to a subprocess that survives our
+        own SIGTERM — `nohup launchctl ... &` — so the load step still
+        runs even after the unload kills us.
+        """
         from aiohttp import web
         import subprocess as _sp
 
+        plist = Path.home() / "Library/LaunchAgents/com.jarvis.assistant.plist"
+        plist_path = str(plist) if plist.exists() else None
+
         async def _do_restart():
-            # Give the HTTP response time to flush before we kill our
-            # own process.
-            await asyncio.sleep(0.3)
-            plist = Path.home() / "Library/LaunchAgents/com.jarvis.assistant.plist"
-            if plist.exists():
-                # Stop + re-load (launchd RunAtLoad will respawn us).
-                try:
-                    await asyncio.to_thread(
-                        _sp.run,
-                        ["launchctl", "unload", str(plist)],
-                        check=False, capture_output=True, timeout=10,
-                    )
-                    await asyncio.to_thread(
-                        _sp.run,
-                        ["launchctl", "load", str(plist)],
-                        check=False, capture_output=True, timeout=10,
-                    )
-                except Exception as exc:
-                    log.error("restart via launchctl failed: %s", exc)
+            # Long enough for the response above to fully flush, even
+            # under load. 1.2s is well under the user-visible feedback
+            # window (we show a toast immediately).
+            await asyncio.sleep(1.2)
+            if plist_path:
+                # Spawn a detached shell that survives our own death:
+                # unload → small wait → load. We never await it; we're
+                # about to be killed by the first unload anyway.
+                _sp.Popen(
+                    [
+                        "/bin/sh", "-c",
+                        f'launchctl unload "{plist_path}" >/dev/null 2>&1; '
+                        f'sleep 2; '
+                        f'launchctl load "{plist_path}" >/dev/null 2>&1',
+                    ],
+                    start_new_session=True,
+                    stdin=_sp.DEVNULL,
+                    stdout=_sp.DEVNULL,
+                    stderr=_sp.DEVNULL,
+                )
             else:
                 # No plist → fall back to graceful exit; user's
                 # supervisor/shell can re-spawn.
@@ -828,7 +1187,19 @@ class DashboardServer:
                 _os.kill(_os.getpid(), _sig.SIGTERM)
 
         asyncio.create_task(_do_restart())
-        return web.json_response({"ok": True, "restarting": True})
+        # Force HTTP/1.1 Connection: close so the browser treats the
+        # response as complete on socket close. Pin Content-Length to
+        # avoid any chunked-transfer ambiguity.
+        body = json.dumps({"ok": True, "restarting": True}).encode("utf-8")
+        return web.Response(
+            body=body,
+            content_type="application/json",
+            headers={
+                "Connection": "close",
+                "Cache-Control": "no-store",
+                "Content-Length": str(len(body)),
+            },
+        )
 
     async def _h_ws_events(self, req):
         from aiohttp import web, WSMsgType
