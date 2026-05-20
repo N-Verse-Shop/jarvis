@@ -182,6 +182,64 @@ class TestSkillStore:
         assert store.load_reference("x", "missing") is None
         assert store.load_reference("missing-skill", "anything") is None
 
+    def test_symlink_traversal_rejected(self, tmp_path):
+        """A malicious skill can't read files outside skills_dir via
+        a symlink in its references directory."""
+        import os
+        # Put the skills dir in a CHILD of tmp_path and the sensitive
+        # file as a SIBLING — that way the symlink genuinely escapes
+        # the sandbox.
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        sensitive = tmp_path / "outside.txt"
+        sensitive.write_text("SECRET TOKEN")
+
+        # Create a skill whose references/ contains a symlink to that file.
+        _seed_skill(skills_dir, "evil")
+        refs_dir = skills_dir / "evil" / "references"
+        refs_dir.mkdir(parents=True, exist_ok=True)
+        link = refs_dir / "STEAL.md"
+        os.symlink(str(sensitive), str(link))
+
+        store = SkillStore(skills_dir=skills_dir)
+        skill = store.get_skill("evil")
+        assert skill is not None
+        assert "STEAL" in skill.references
+        # The actual read must be blocked because the target escapes
+        # the sandbox root.
+        result = store.load_reference("evil", "STEAL")
+        assert result is None, (
+            f"path-traversal load should return None, got {result!r}"
+        )
+
+    def test_in_sandbox_symlink_still_allowed(self, tmp_path):
+        """A symlink pointing INSIDE skills_dir should still work
+        (some users legitimately symlink shared docs between skills)."""
+        import os
+        _seed_skill(tmp_path, "host", references={"REAL": "# real body"})
+        _seed_skill(tmp_path, "client")
+        # Create a symlink in client's refs that points to host's real ref.
+        client_refs = tmp_path / "client" / "references"
+        client_refs.mkdir(parents=True, exist_ok=True)
+        target = tmp_path / "host" / "references" / "REAL.md"
+        link = client_refs / "SHARED.md"
+        os.symlink(str(target), str(link))
+
+        store = SkillStore(skills_dir=tmp_path)
+        result = store.load_reference("client", "SHARED")
+        assert result is not None
+        assert "real body" in result
+
+    def test_large_reference_is_capped(self, tmp_path):
+        big = "x" * (300 * 1024)
+        _seed_skill(tmp_path, "big", references={"HUGE": big})
+        store = SkillStore(skills_dir=tmp_path)
+        text = store.load_reference("big", "HUGE")
+        assert text is not None
+        # 256 KB cap + truncation marker
+        assert len(text) <= 256 * 1024 + 200
+        assert "truncated" in text
+
     def test_get_skill_unknown_returns_none(self, tmp_path):
         _seed_skill(tmp_path, "x")
         store = SkillStore(skills_dir=tmp_path)

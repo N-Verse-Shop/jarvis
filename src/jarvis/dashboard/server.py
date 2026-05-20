@@ -237,8 +237,10 @@ class DashboardServer:
             if origin.startswith(("http://127.0.0.1", "http://localhost", "file://")):
                 resp.headers["Access-Control-Allow-Origin"] = origin
                 resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,PUT,PATCH,OPTIONS"
             resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
+            resp.headers["X-Content-Type-Options"] = "nosniff"
+            resp.headers["Referrer-Policy"] = "no-referrer"
             return resp
         return _mw
 

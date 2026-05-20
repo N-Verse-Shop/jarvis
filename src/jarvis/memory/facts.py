@@ -133,7 +133,8 @@ END;
 # ---- redaction (same pattern as audit.py) ----
 
 _REDACT_KEY_RE = re.compile(
-    r"(password|passwd|pwd|secret|token|apikey|api_key|bearer|cookie|authorization)",
+    r"(password|passwd|pwd|secret|token|apikey|api[_\-]?key|bearer|"
+    r"cookie|authorization|credential|private[_\-]?key|ssh[_\-]?key)",
     re.IGNORECASE,
 )
 _REDACT_VALUE_RE = re.compile(
@@ -146,14 +147,22 @@ _REDACT_VALUE_RE = re.compile(
 )
 
 
-def _redact(text: str) -> str:
+def _redact(text: str, key: str = "") -> str:
     """Best-effort secret scrubbing for fact values.
 
     1. If the *key* mentions a credential field, redact the whole value.
-       (The caller is doing ``add_fact("user.api_key", "sk-...")`` —
-        the whole value is sensitive.)
+       (The caller is doing ``add_fact("user.api_key", "abc")`` — the
+        whole value is sensitive regardless of its shape.)
     2. Otherwise pattern-match known credential shapes inside the value.
+
+    Always returns a string, never raises.
     """
+    if not text:
+        return text
+    # Key-driven hard redact.
+    if key and _REDACT_KEY_RE.search(key):
+        return "<redacted>"
+    # Value-shape based.
     return _REDACT_VALUE_RE.sub("<redacted>", text)
 
 
@@ -263,7 +272,7 @@ class FactStore:
         BLACK coffee!").
         """
         key = (key or "").strip()
-        value = _redact((value or "").strip())
+        value = _redact((value or "").strip(), key=key)
         if not key or not value:
             raise ValueError("key and value must be non-empty")
         confidence = max(0.0, min(1.0, float(confidence)))

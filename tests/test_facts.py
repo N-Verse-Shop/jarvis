@@ -309,6 +309,28 @@ class TestRedaction:
         store.add("user.auth", "Bearer abcdef1234567890")
         assert "<redacted>" in store.all()[0].value
 
+    def test_sensitive_key_redacts_whole_value(self, store: FactStore):
+        # When the KEY says it's a secret, the entire value gets
+        # redacted even if the value itself doesn't match a regex.
+        store.add("user.api_key", "abc123xyz")
+        store.add("user.password", "qwerty")
+        store.add("user.ssh_key", "anything at all")
+        store.add("user.credentials.aws", "literal-text")
+        for f in store.all():
+            assert f.value == "<redacted>", (
+                f"sensitive key '{f.key}' should redact value, got {f.value!r}"
+            )
+
+    def test_normal_key_keeps_normal_value(self, store: FactStore):
+        store.add("user.likes", "coffee in the morning")
+        assert store.all()[0].value == "coffee in the morning"
+
+    def test_redact_handles_empty_safely(self, store: FactStore):
+        from jarvis.memory.facts import _redact
+        assert _redact("") == ""
+        assert _redact("safe text") == "safe text"
+        assert _redact("safe", key="user.password") == "<redacted>"
+
 
 class TestThreadSafety:
     def test_concurrent_adds_do_not_corrupt(self, store: FactStore):

@@ -58,6 +58,29 @@ class TestRedact:
     def test_short_string_unchanged(self):
         assert _redact("hello") == "hello"
 
+    def test_scrubs_inline_api_key_in_value(self):
+        # An OpenAI-style key inside a free-text field should redact
+        # even though the key field name is innocuous.
+        out = _redact({"notes": "my key is sk-proj-aaaaaaaaaaaaaaaa"})
+        assert "<redacted>" in out["notes"]
+        assert "sk-proj" not in out["notes"]
+
+    def test_scrubs_inline_bearer_token(self):
+        out = _redact({"header": "Bearer abcdef1234567890"})
+        assert "<redacted>" in out["header"]
+
+    def test_scrubs_inline_jwt(self):
+        jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        out = _redact({"msg": f"token={jwt}"})
+        assert "<redacted>" in out["msg"]
+        assert "eyJhbGciOiJIUzI1NiIs" not in out["msg"]
+
+    def test_normal_string_with_sk_substring_not_eaten(self):
+        # A regular sentence that happens to contain "sk-" but no
+        # actual key shape must NOT be redacted.
+        out = _redact("we ask-people questions")  # no sk- here
+        assert out == "we ask-people questions"
+
     def test_depth_limit(self):
         deep = {}
         d = deep

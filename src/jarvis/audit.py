@@ -79,6 +79,20 @@ _SENSITIVE_KEY_PATTERNS = (
     "cookie",
     "authorization",
     "bearer",
+    "credential",
+    "private_key",
+    "ssh_key",
+)
+
+
+# Value-shape patterns — catch credentials embedded in free-text
+# fields (e.g. ``"notes": "the key is sk-proj-..."``). The same set
+# as ``memory.facts._REDACT_VALUE_RE`` so behaviour is consistent.
+import re as _re  # noqa: E402
+_VALUE_REDACT_RE = _re.compile(
+    r"(?:sk-[A-Za-z0-9_\-]{12,}|ghp_[A-Za-z0-9]{20,}|"
+    r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}|"
+    r"Bearer\s+[A-Za-z0-9_\-\.]{8,})",
 )
 
 
@@ -86,7 +100,12 @@ def _redact(obj: Any, _depth: int = 0) -> Any:
     """Deep-walk a JSON-able value, redacting sensitive keys.
 
     Caps depth at 16 levels (defends against cyclic refs in custom
-    objects that managed to serialise).
+    objects that managed to serialise). Two redaction passes:
+
+      1. Key-driven: any dict key matching :data:`_SENSITIVE_KEY_PATTERNS`
+         (substring match, case-insensitive) → value becomes ``"<redacted>"``.
+      2. Value-shape: known credential token shapes inside any string
+         (API keys, JWTs, bearer headers) collapse to ``"<redacted>"``.
     """
     if _depth > 16:
         return "<redacted: too deep>"
@@ -101,10 +120,16 @@ def _redact(obj: Any, _depth: int = 0) -> Any:
         return out
     if isinstance(obj, (list, tuple)):
         return [_redact(v, _depth + 1) for v in obj]
-    # Cap raw strings at 4 KB so a giant tool result doesn't blow
-    # up the DB. Anything longer is informational only.
-    if isinstance(obj, str) and len(obj) > 4096:
-        return obj[:4096] + f"…<+{len(obj) - 4096} chars truncated>"
+    if isinstance(obj, str):
+        s = obj
+        # Pattern scrub — cheap regex, runs even on short strings.
+        if "sk-" in s or "ghp_" in s or "eyJ" in s or "Bearer" in s:
+            s = _VALUE_REDACT_RE.sub("<redacted>", s)
+        # Cap raw strings at 4 KB so a giant tool result doesn't blow
+        # up the DB. Anything longer is informational only.
+        if len(s) > 4096:
+            return s[:4096] + f"…<+{len(s) - 4096} chars truncated>"
+        return s
     return obj
 
 

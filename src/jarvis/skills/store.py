@@ -287,9 +287,21 @@ class SkillStore:
             return []
         return sorted(skill.references.keys())
 
+    # Hard cap for reference files. Skills are user-authored markdown;
+    # anything >256 KB is almost certainly accidental (or malicious).
+    _MAX_REF_BYTES: int = 256 * 1024
+
     def load_reference(
         self, skill_name: str, ref_name: str
     ) -> Optional[str]:
+        """Read a single L3 reference file.
+
+        Security: skills are user-authored, and a malicious skill could
+        contain a symlink (or absolute-path entry the loader missed)
+        pointing to ``/etc/passwd`` or ``~/.ssh/id_rsa``. We resolve
+        the target and verify it stays under ``self._dir`` before any
+        read. Size-capped at :data:`_MAX_REF_BYTES`.
+        """
         skill = self.get_skill(skill_name)
         if skill is None:
             return None
@@ -297,13 +309,49 @@ class SkillStore:
         if ref_path is None:
             return None
         try:
-            return ref_path.read_text(encoding="utf-8")
+            # ``resolve(strict=True)`` follows symlinks AND raises if
+            # the target doesn't exist — exactly what we want.
+            resolved = ref_path.resolve(strict=True)
+            skills_root = self._dir.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            log.warning(
+                "Reference %s/%s unresolvable: %s",
+                skill_name, ref_name, exc,
+            )
+            return None
+        # Sandbox check: the resolved target MUST be inside skills_dir.
+        try:
+            resolved.relative_to(skills_root)
+        except ValueError:
+            log.warning(
+                "Refusing to read out-of-sandbox reference %s/%s "
+                "(target %s escapes %s)",
+                skill_name, ref_name, resolved, skills_root,
+            )
+            return None
+        # Size cap — never load more than _MAX_REF_BYTES into memory.
+        try:
+            size = resolved.stat().st_size
+        except OSError:
+            size = 0
+        if size > self._MAX_REF_BYTES:
+            log.warning(
+                "Reference %s/%s too large (%d bytes > cap %d) — truncating",
+                skill_name, ref_name, size, self._MAX_REF_BYTES,
+            )
+        try:
+            with open(resolved, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(self._MAX_REF_BYTES)
+            if size > self._MAX_REF_BYTES:
+                text += (
+                    f"\n\n<!-- truncated at {self._MAX_REF_BYTES} bytes; "
+                    f"original was {size} bytes -->"
+                )
+            return text
         except OSError as exc:
             log.warning(
                 "Failed to read reference %s/%s: %s",
-                skill_name,
-                ref_name,
-                exc,
+                skill_name, ref_name, exc,
             )
             return None
 
