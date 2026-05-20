@@ -169,9 +169,32 @@ class DashboardServer:
         runner = web.AppRunner(app)
         await runner.setup()
         self._runner = runner
-        site = web.TCPSite(runner, self._host, self._port)
-        await site.start()
-        self._site = site
+        # R34-S24: JARVIS_DASHBOARD_HOST can be a comma-separated list
+        # of bind targets so the same dashboard answers both the local
+        # 127.0.0.1 client AND the Tailscale-side reverse proxy without
+        # going through 0.0.0.0 (which would also accept LAN traffic).
+        # Example: "127.0.0.1,100.90.14.99"
+        hosts = [h.strip() for h in str(self._host).split(",") if h.strip()]
+        if not hosts:
+            hosts = ["127.0.0.1"]
+        sites = []
+        for h in hosts:
+            site = web.TCPSite(runner, h, self._port)
+            try:
+                await site.start()
+                sites.append(site)
+                log.info("Dashboard bound on %s:%d", h, self._port)
+            except OSError as exc:
+                log.warning(
+                    "Dashboard could not bind %s:%d — %s. Continuing on remaining hosts.",
+                    h, self._port, exc,
+                )
+        if not sites:
+            raise RuntimeError(
+                f"Dashboard failed to bind any of {hosts!r} on port {self._port}"
+            )
+        # _site kept for back-compat (status endpoint may read it).
+        self._site = sites[0]
         self._started_at = time.time()
         ready.set()
         # Keep the loop alive
@@ -210,6 +233,11 @@ class DashboardServer:
             return True
         if path.startswith("/dashboard"):
             return True
+        # R34-S24: public deploy surfaces — robots.txt and favicon
+        # need to respond without auth so crawlers (which we block)
+        # and browser-chrome can probe without 401 spam.
+        if path in ("/robots.txt", "/favicon.ico"):
+            return True
         return False
 
     async def _auth_mw(self, app, handler):
@@ -225,6 +253,15 @@ class DashboardServer:
             return await handler(req)
         return _mw
 
+    # R34-S24: extra origins for the public deployment behind
+    # Cloudflare Tunnel + Hetzner Caddy. Comma-separated env var so
+    # ops can add more without a code change.
+    @staticmethod
+    def _public_origin_allowlist() -> tuple[str, ...]:
+        default = "https://jarvis.nexus-studio-innovation.com"
+        raw = os.environ.get("JARVIS_DASHBOARD_ORIGINS", default)
+        return tuple(o.strip() for o in raw.split(",") if o.strip())
+
     async def _cors_mw(self, app, handler):
         async def _mw(req):
             from aiohttp import web as _w
@@ -232,15 +269,48 @@ class DashboardServer:
                 resp = _w.Response(status=204)
             else:
                 resp = await handler(req)
-            # CORS for the Electron app + a local dev server.
+            # CORS allowlist:
+            #   • local dev (127.0.0.1 / localhost / file://)
+            #   • the public CF-tunnelled origin(s) from env
             origin = req.headers.get("Origin", "")
-            if origin.startswith(("http://127.0.0.1", "http://localhost", "file://")):
+            ok = origin.startswith(("http://127.0.0.1", "http://localhost", "file://"))
+            if not ok and origin:
+                ok = origin in self._public_origin_allowlist()
+            if ok:
                 resp.headers["Access-Control-Allow-Origin"] = origin
                 resp.headers["Access-Control-Allow-Credentials"] = "true"
+                resp.headers["Vary"] = "Origin"
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,PUT,PATCH,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
+            resp.headers["Access-Control-Allow-Headers"] = (
+                "Authorization,Content-Type,"
+                # Cloudflare Access headers (so the browser keeps them
+                # on retried preflights).
+                "Cf-Access-Jwt-Assertion,Cf-Access-Authenticated-User-Email"
+            )
+            # Hardening headers — same for local AND public routes.
             resp.headers["X-Content-Type-Options"] = "nosniff"
             resp.headers["Referrer-Policy"] = "no-referrer"
+            # noindex everywhere — R34-S24 user req: «без налаштування
+            # сео, щоб пошукові системи його не шукали».
+            resp.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive, nosnippet"
+            # Frame deny so the panel can't be embedded in another site.
+            resp.headers["X-Frame-Options"] = "DENY"
+            # Tight CSP for the SPA — only loads its own static assets,
+            # talks to its own origin for XHR/WS, plus Cloudflare's
+            # Access JS if it's served alongside (we don't load any
+            # external JS but allow self-only just in case).
+            if req.path.startswith("/dashboard") or req.path == "/":
+                resp.headers["Content-Security-Policy"] = (
+                    "default-src 'self'; "
+                    "img-src 'self' data:; "
+                    "style-src 'self' 'unsafe-inline'; "
+                    "script-src 'self'; "
+                    "connect-src 'self' ws: wss:; "
+                    "font-src 'self' data:; "
+                    "frame-ancestors 'none'; "
+                    "base-uri 'self'; "
+                    "form-action 'self'"
+                )
             return resp
         return _mw
 
@@ -260,6 +330,11 @@ class DashboardServer:
             app.router.add_static(
                 "/dashboard/", static_dir, name="dashboard-static"
             )
+        # R34-S24: robots.txt blocking all crawlers. User: «без
+        # налаштування сео, щоб пошукові системи його не шукали».
+        app.router.add_get("/robots.txt", self._h_robots_txt)
+        # Don't expose a favicon.ico crawlable trail.
+        app.router.add_get("/favicon.ico", self._h_favicon_204)
 
         app.router.add_get("/api/health", self._h_health)
         app.router.add_get("/api/state", self._h_state)
@@ -315,6 +390,20 @@ class DashboardServer:
             content_type="text/html",
             charset="utf-8",
         )
+
+    @staticmethod
+    async def _h_robots_txt(req):
+        """Block every crawler — this UI is private."""
+        from aiohttp import web
+        body = "User-agent: *\nDisallow: /\n"
+        return web.Response(text=body, content_type="text/plain")
+
+    @staticmethod
+    async def _h_favicon_204(req):
+        # 204 No Content keeps the browser quiet without leaking
+        # a discoverable static asset URL.
+        from aiohttp import web
+        return web.Response(status=204)
 
     # ----- handlers -----------------------------------------------
     async def _h_health(self, req):
