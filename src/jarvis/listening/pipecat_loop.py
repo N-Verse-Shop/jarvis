@@ -121,13 +121,15 @@ class PipecatLoopConfig:
 
     # Wake-word / VAD ----------------------------------------------------------
     wake_words: tuple[str, ...] = ("jarvis", "джарвіс", "джарвис")
-    # Silero VAD confidence cutoff. 0.5 = library default but in a noisy
-    # room (TV, family chatter, fan hum) Silero flags every chunk as
-    # speaking=True → endpoint never fires → Whisper never runs → wake
-    # word never lands. R34-S11: 0.62 is the empirically-stable point on
-    # M1 Pro w/ MacBook Pro mic at 30-50cm. Lift via vad_aggressiveness
-    # bridge in :func:`from_settings`.
-    vad_threshold: float = 0.62
+    # Silero VAD confidence cutoff. R34-S14: recalibrated to 0.42 after
+    # live probe on Danylo's MBP M1 mic showed real speech only peaks
+    # at ~0.73 and lives in 0.40-0.55 range — not the 0.99+ that wider
+    # benchmark recordings would suggest. 0.62 (R34-S11) was caught
+    # only 1 % of speech frames; 0.42 catches the meaty middle of real
+    # utterances and leaves Whisper-side hallucination filtering to
+    # drop the false-positives that slip through. Lift via
+    # vad_aggressiveness bridge in :func:`from_settings`.
+    vad_threshold: float = 0.42
     vad_min_silence_ms: int = 700
 
     # Behaviour ----------------------------------------------------------------
@@ -147,28 +149,39 @@ def _vad_threshold_from_legacy(
     The legacy WebRTC VAD took an integer 0-3 (lenient → aggressive).
     Silero takes a float confidence cutoff. The user-tuned config.json
     still carries the legacy integer; without translation Pipecat
-    sees the default 0.5 → flags everything as speech in normal indoor
-    noise → endpoint never reached → STT never runs.
+    sees a default that's wildly inappropriate for the user's mic.
 
-    Mapping (verified on M1 Pro + MacBook Pro internal mic):
-      0 → 0.45  (lenient, low-volume whispers; picks up some HVAC hum)
-      1 → 0.55  (default-ish)
-      2 → 0.62  (R34-S11 default — passes normal speech, drops fan/typing)
-      3 → 0.72  (aggressive — requires raised voice in noisy rooms)
+    Mapping (R34-S14 — RECALIBRATED on Danylo's MBP M1 mic @ 30-50 cm):
 
-    An explicit ``silero_vad_threshold`` config key overrides everything
-    so power users can dial it precisely.
+    Probe data (10 s of real Ukrainian speech via Daria TTS + room
+    ambient) showed:
+      * max Silero confidence on speech segments: ~0.73
+      * ambient floor (HVAC + room): conf < 0.25
+      * speech mean confidence: 0.40-0.55 (NOT the 0.99+ I expected;
+        Silero is more conservative on close-mic ASMR-style audio
+        than on far-field demo recordings)
+
+    The R34-S11 mapping (0.45/0.55/0.62/0.72) only passed 1 % of real
+    speech frames. Recalibrated to be realistic for the actual mic:
+      0 → 0.30  (whispers, far-field)
+      1 → 0.35  (lenient)
+      2 → 0.42  (R34-S14 default — passes normal speech, drops fan/typing)
+      3 → 0.55  (aggressive — for noisy environments only)
+
+    An explicit ``silero_vad_threshold`` config key overrides everything.
+    Whisper-side hallucination filtering (see ``_HALLUCINATION_PHRASES``)
+    catches the false-positives that the looser threshold lets through.
     """
     if explicit is not None:
         try:
             return max(0.10, min(0.95, float(explicit)))
         except (TypeError, ValueError):
             pass
-    table = {0: 0.45, 1: 0.55, 2: 0.62, 3: 0.72}
+    table = {0: 0.30, 1: 0.35, 2: 0.42, 3: 0.55}
     try:
-        return table.get(int(aggressiveness), 0.62)
+        return table.get(int(aggressiveness), 0.42)
     except (TypeError, ValueError):
-        return 0.62
+        return 0.42
 
 
 def from_settings(cfg) -> PipecatLoopConfig:
@@ -1638,16 +1651,36 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
 
 
 def _make_echo_filter_processor():
-    """Build the echo-filter FrameProcessor.
+    """Build the echo-filter + Whisper-hallucination FrameProcessor.
 
-    Tracks ``BotStartedSpeakingFrame``/``BotStoppedSpeakingFrame``
-    boundaries (and ``TTSStartedFrame``/``TTSStoppedFrame`` as
-    secondary signals). A ``TranscriptionFrame`` that arrives while
-    the bot is speaking is treated as echo and dropped. We also keep
-    a small tail (``_TAIL_SEC``) after TTS stops because hardware
-    audio latency means the speaker is still outputting samples for
-    ~200-500 ms after the frame finishes.
+    Two passes on every ``TranscriptionFrame``:
+
+    1. ECHO — tracks ``BotStartedSpeakingFrame``/``BotStoppedSpeaking
+       Frame`` boundaries (and ``TTSStartedFrame``/``TTSStoppedFrame``
+       as secondary signals). A transcript that arrives while the bot
+       is speaking is dropped. We also keep a small tail
+       (``_TAIL_SEC``) after TTS stops because hardware audio latency
+       means the speaker is still outputting samples for ~200-500 ms
+       after the frame finishes.
+
+    2. HALLUCINATION — Whisper large-v3-turbo's well-known artefact
+       set: when fed near-silence or low-volume noise it produces a
+       confident-but-meaningless phrase from its training tail
+       ("Thank you for watching", "what time is it", "[Music]",
+       "Дякую за перегляд", "Подписывайтесь на канал" …). R34-S14
+       lowered the Silero threshold to 0.42 so real speech actually
+       gets transcribed; the trade-off is that occasional ambient
+       noise crosses the gate and Whisper hallucinates on it. Catching
+       the hallucinations HERE (before the wake-word gate) means the
+       LLM never sees them and the user never gets fake responses.
+
+    The hallucination list is intentionally conservative — only
+    phrases observed multiple times in production logs, never matching
+    a real user command (you don't say "Thank you for watching" at
+    your voice assistant). Case + whitespace are normalised before
+    comparison.
     """
+    import re as _re
     import time as _time
 
     from pipecat.frames.frames import (
@@ -1671,8 +1704,78 @@ def _make_echo_filter_processor():
     # through, lower if the user feels they can't interrupt.
     _TAIL_SEC = 0.5
 
+    # Whisper large-v3-turbo hallucination corpus. Sourced from the
+    # legacy listener's ``KNOWN_HALLUCINATIONS`` set + new entries
+    # observed in R34 production logs (RU/UK/EN). Each entry is the
+    # normalised (lower, stripped of trailing punctuation) form;
+    # matching is "exact equality after normalisation" so we never
+    # eat a real command that happens to *contain* one of these.
+    _HALLUCINATION_PHRASES = frozenset({
+        # English — YouTube tail
+        "thank you for watching",
+        "thanks for watching",
+        "thank you",
+        "thanks",
+        "please subscribe",
+        "subscribe to my channel",
+        # English — model "filler"
+        "what time is it",
+        "is a cool name",
+        "will it rain today",
+        "you",
+        "bye",
+        "okay",
+        "ok",
+        "uh",
+        "um",
+        "hmm",
+        # English — music/sound tags
+        "[music]",
+        "[applause]",
+        "[laughter]",
+        "(music)",
+        "(applause)",
+        # Ukrainian
+        "дякую за перегляд",
+        "дякую",
+        "підпишіться на канал",
+        "продовження буде",
+        # Russian
+        "спасибо за просмотр",
+        "спасибо",
+        "подписывайтесь на канал",
+        "подписывайтесь",
+        "продолжение следует",
+        # Misc Whisper-isms
+        ".",
+        "-",
+        "—",
+    })
+
+    # Strip surrounding punctuation/whitespace for normalised match.
+    _NORMALISE_RE = _re.compile(r"^[\s\.\!\?,\-—…\"']+|[\s\.\!\?,\-—…\"']+$")
+
+    def _is_hallucination(text: str) -> bool:
+        # Empty / whitespace-only input → drop. The outer process_frame
+        # already filters frame.text.strip() == '' but we keep the
+        # belt-and-braces check here so the helper is safe to unit
+        # test in isolation.
+        if not text or not text.strip():
+            return True
+        normalised = _NORMALISE_RE.sub("", text).lower().strip()
+        if not normalised:
+            return True  # punctuation-only = drop
+        if normalised in _HALLUCINATION_PHRASES:
+            return True
+        # Whisper sometimes repeats a single token N times — "ого ого ого ого".
+        # Drop if every word equals every other word AND there's >= 3 of them.
+        words = normalised.split()
+        if len(words) >= 3 and len(set(words)) == 1:
+            return True
+        return False
+
     class JarvisEchoFilterProcessor(FrameProcessor):
-        """Drop transcripts that arrive during bot's own speech."""
+        """Drop transcripts that are TTS echo OR Whisper hallucinations."""
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
@@ -1700,6 +1803,7 @@ def _make_echo_filter_processor():
                 self._speak_end_ts = _time.time() + _TAIL_SEC
 
             if isinstance(frame, TranscriptionFrame):
+                # 1. Echo gate
                 if self._is_blocking_window():
                     try:
                         self._stream.emit(
@@ -1715,9 +1819,23 @@ def _make_echo_filter_processor():
                     except Exception:
                         pass
                     return  # drop
+                # 2. Hallucination gate
+                if _is_hallucination(frame.text or ""):
+                    try:
+                        self._stream.emit(
+                            "log",
+                            level="DEBUG",
+                            component="hallucination-filter",
+                            message=f"dropped Whisper hallucination: {frame.text!r}",
+                        )
+                    except Exception:
+                        pass
+                    return  # drop
 
             await self.push_frame(frame, direction)
 
+    # Expose for unit testing.
+    JarvisEchoFilterProcessor._is_hallucination = staticmethod(_is_hallucination)  # type: ignore[attr-defined]
     return JarvisEchoFilterProcessor
 
 

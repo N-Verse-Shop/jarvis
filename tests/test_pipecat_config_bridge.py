@@ -40,15 +40,18 @@ def _make_cfg(**overrides):
 @pytest.mark.parametrize(
     "aggr, expected",
     [
-        (0, 0.45),
-        (1, 0.55),
-        (2, 0.62),
-        (3, 0.72),
-        # Out-of-range / wrong type → safe default (0.62).
-        (None, 0.62),
-        ("garbage", 0.62),
-        (-1, 0.62),
-        (99, 0.62),
+        # R34-S14 recalibrated mapping (was 0.45/0.55/0.62/0.72 before
+        # live mic probe showed real speech peaks at ~0.73, so 0.62
+        # caught only 1 % of frames).
+        (0, 0.30),
+        (1, 0.35),
+        (2, 0.42),
+        (3, 0.55),
+        # Out-of-range / wrong type → safe default (0.42).
+        (None, 0.42),
+        ("garbage", 0.42),
+        (-1, 0.42),
+        (99, 0.42),
     ],
 )
 def test_vad_threshold_from_aggressiveness(aggr, expected):
@@ -70,7 +73,7 @@ def test_explicit_silero_threshold_is_clamped():
 def test_explicit_threshold_bad_value_falls_back():
     # If the explicit knob is unparseable, fall back to the
     # aggressiveness table instead of crashing.
-    assert _vad_threshold_from_legacy(2, "not a float") == pytest.approx(0.62)
+    assert _vad_threshold_from_legacy(2, "not a float") == pytest.approx(0.42)
 
 
 # ─── full from_settings() bridge ─────────────────────────────────────
@@ -78,7 +81,7 @@ def test_explicit_threshold_bad_value_falls_back():
 
 def test_from_settings_translates_aggressiveness():
     loop = from_settings(_make_cfg(vad_aggressiveness=3))
-    assert loop.vad_threshold == pytest.approx(0.72)
+    assert loop.vad_threshold == pytest.approx(0.55)
 
 
 def test_from_settings_respects_explicit_silero():
@@ -141,10 +144,96 @@ def test_extras_use_defaults_on_missing():
     assert loop.extra["max_utterance_ms"] == 7000
 
 
-def test_pipecat_loop_config_default_threshold_is_aggressive_enough():
-    # Sanity check: PipecatLoopConfig() with NO settings (no config.json
-    # at all) still uses 0.62 — not the old Pipecat default of 0.5,
-    # which produced the 9-hour silent-pipeline regression.
+def test_pipecat_loop_config_default_threshold_is_realistic():
+    # R34-S14: default must be reachable by real speech on a typical
+    # consumer mic. Live probe on MBP M1 showed real-speech peaks at
+    # ~0.73 → default must be well under that. 0.42 catches the meaty
+    # middle of normal utterances.
     cfg = PipecatLoopConfig()
-    assert cfg.vad_threshold >= 0.6
-    assert cfg.vad_threshold <= 0.7
+    assert cfg.vad_threshold >= 0.35
+    assert cfg.vad_threshold <= 0.50
+
+
+# ─── Whisper hallucination filter (R34-S14) ──────────────────────────
+
+
+def _get_hallucination_fn():
+    """Pull the inner ``_is_hallucination`` out of the factory so we
+    can test it without standing up Pipecat. The factory exposes it as
+    a staticmethod on the produced class for exactly this purpose.
+    """
+    # We avoid importing pipecat at module top so this test module
+    # stays loadable on CI runners without ML extras.
+    from jarvis.listening.pipecat_loop import _make_echo_filter_processor
+
+    cls = _make_echo_filter_processor()
+    return cls._is_hallucination
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # English Whisper tail
+        "Thank you for watching",
+        "thanks for watching",
+        "Thank you.",
+        "Thanks!",
+        "what time is it",
+        "Will it rain today?",
+        "is a cool name",
+        "[Music]",
+        "(Applause)",
+        "Bye",
+        "okay.",
+        "Um",
+        # Ukrainian
+        "Дякую за перегляд",
+        "Дякую!",
+        "Підпишіться на канал",
+        # Russian
+        "Спасибо за просмотр",
+        "Подписывайтесь на канал!",
+        # Punctuation-only
+        ".",
+        "—",
+        " ... ",
+        # Repetition artifact
+        "ого ого ого ого",
+        "yes yes yes",
+    ],
+)
+def test_hallucination_phrases_are_dropped(text):
+    is_hallucination = _get_hallucination_fn()
+    assert is_hallucination(text) is True, f"should drop {text!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Real wake-word + command — never confuse for hallucination.
+        "Джарвіс відкрий браузер",
+        "Jarvis what time is it actually",  # contains hallucinated phrase
+        "thanks for watching the demo with me",  # contains "thanks for watching"
+        "Привіт як справи",
+        "ого як круто це працює",  # 4 words but not all identical
+        "тест тест",  # 2-word repetition is too short to flag
+        "open Safari please",
+    ],
+)
+def test_real_commands_are_preserved(text):
+    is_hallucination = _get_hallucination_fn()
+    assert is_hallucination(text) is False, f"must NOT drop {text!r}"
+
+
+def test_empty_text_is_dropped():
+    is_hallucination = _get_hallucination_fn()
+    assert is_hallucination("") is True
+    assert is_hallucination("   ") is True
+
+
+def test_hallucination_matching_is_case_insensitive():
+    is_hallucination = _get_hallucination_fn()
+    assert is_hallucination("THANK YOU FOR WATCHING") is True
+    assert is_hallucination("Thank You For Watching") is True
+    assert is_hallucination("дякую за перегляд") is True
+    assert is_hallucination("ДЯКУЮ ЗА ПЕРЕГЛЯД") is True
