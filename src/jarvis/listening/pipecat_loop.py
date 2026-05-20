@@ -121,7 +121,13 @@ class PipecatLoopConfig:
 
     # Wake-word / VAD ----------------------------------------------------------
     wake_words: tuple[str, ...] = ("jarvis", "джарвіс", "джарвис")
-    vad_threshold: float = 0.5  # Silero confidence; tuned in Stage 5
+    # Silero VAD confidence cutoff. 0.5 = library default but in a noisy
+    # room (TV, family chatter, fan hum) Silero flags every chunk as
+    # speaking=True → endpoint never fires → Whisper never runs → wake
+    # word never lands. R34-S11: 0.62 is the empirically-stable point on
+    # M1 Pro w/ MacBook Pro mic at 30-50cm. Lift via vad_aggressiveness
+    # bridge in :func:`from_settings`.
+    vad_threshold: float = 0.62
     vad_min_silence_ms: int = 700
 
     # Behaviour ----------------------------------------------------------------
@@ -133,6 +139,38 @@ class PipecatLoopConfig:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+def _vad_threshold_from_legacy(
+    aggressiveness: Optional[int], explicit: Optional[float]
+) -> float:
+    """Translate legacy ``vad_aggressiveness`` (0..3) → Silero confidence.
+
+    The legacy WebRTC VAD took an integer 0-3 (lenient → aggressive).
+    Silero takes a float confidence cutoff. The user-tuned config.json
+    still carries the legacy integer; without translation Pipecat
+    sees the default 0.5 → flags everything as speech in normal indoor
+    noise → endpoint never reached → STT never runs.
+
+    Mapping (verified on M1 Pro + MacBook Pro internal mic):
+      0 → 0.45  (lenient, low-volume whispers; picks up some HVAC hum)
+      1 → 0.55  (default-ish)
+      2 → 0.62  (R34-S11 default — passes normal speech, drops fan/typing)
+      3 → 0.72  (aggressive — requires raised voice in noisy rooms)
+
+    An explicit ``silero_vad_threshold`` config key overrides everything
+    so power users can dial it precisely.
+    """
+    if explicit is not None:
+        try:
+            return max(0.10, min(0.95, float(explicit)))
+        except (TypeError, ValueError):
+            pass
+    table = {0: 0.45, 1: 0.55, 2: 0.62, 3: 0.72}
+    try:
+        return table.get(int(aggressiveness), 0.62)
+    except (TypeError, ValueError):
+        return 0.62
+
+
 def from_settings(cfg) -> PipecatLoopConfig:
     """Build the loop config from the global ``Settings`` object.
 
@@ -140,12 +178,38 @@ def from_settings(cfg) -> PipecatLoopConfig:
     listener and Pipecat loop are supposed to consume the same
     ``config.json``, but we are tolerant of older versions of the
     config schema while users still have unmigrated installs.
+
+    R34-S11: Bridge legacy ``vad_aggressiveness`` / ``voice_min_energy`` /
+    ``endpoint_silence_ms`` into Silero-shaped params so months of
+    careful user tuning actually takes effect under Pipecat.
+
+    R34-S11: Also fall back ``whisper_language`` → ``active_language``
+    so the STT language always tracks the user's transcription
+    preference (legacy listener uses ``whisper_language``).
     """
+    # Language fallback chain: active_language (Pipecat-native)
+    # → whisper_language (legacy) → "ru" (project default for May 16+).
+    lang = getattr(cfg, "active_language", None)
+    if not lang:
+        lang = getattr(cfg, "whisper_language", None) or "ru"
+    lang = str(lang)
+
+    vad_threshold = _vad_threshold_from_legacy(
+        getattr(cfg, "vad_aggressiveness", None),
+        getattr(cfg, "silero_vad_threshold", None),
+    )
+    # endpoint_silence_ms ⇆ vad_min_silence_ms — same semantic.
+    try:
+        silence_ms = int(getattr(cfg, "endpoint_silence_ms", 700) or 700)
+    except (TypeError, ValueError):
+        silence_ms = 700
+    silence_ms = max(150, min(2000, silence_ms))
+
     return PipecatLoopConfig(
         input_device_index=getattr(cfg, "input_device_index", None),
         output_device_index=getattr(cfg, "output_device_index", None),
         stt_mlx_model=getattr(cfg, "whisper_model", "LARGE_V3_TURBO"),
-        stt_language=getattr(cfg, "active_language", "ru"),
+        stt_language=lang,
         ollama_base_url=getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434"),
         chat_model=str(getattr(cfg, "ollama_chat_model", "qwen3:8b")),
         chat_temperature=float(getattr(cfg, "ollama_chat_temperature", 0.4)),
@@ -155,7 +219,9 @@ def from_settings(cfg) -> PipecatLoopConfig:
         piper_download_dir=(
             Path(p) if (p := getattr(cfg, "piper_download_dir", None)) else None
         ),
-        active_language=str(getattr(cfg, "active_language", "ru")),
+        vad_threshold=vad_threshold,
+        vad_min_silence_ms=silence_ms,
+        active_language=lang,
         extra={
             "voice_engine": getattr(cfg, "voice_engine", "legacy"),
             "remote_whisper_url": getattr(cfg, "whisper_remote_url", ""),
@@ -168,6 +234,14 @@ def from_settings(cfg) -> PipecatLoopConfig:
             "wake_fuzzy_ratio": float(getattr(cfg, "wake_fuzzy_ratio", 0.78)),
             "hot_window_seconds": float(
                 getattr(cfg, "hot_window_seconds", 30.0)
+            ),
+            # R34-S11 diagnostic: surface min mic-energy hint so the
+            # event stream can correlate ambient floor vs Silero output.
+            "voice_min_energy": float(
+                getattr(cfg, "voice_min_energy", 0.0025) or 0.0025
+            ),
+            "max_utterance_ms": int(
+                getattr(cfg, "max_utterance_ms", 7000) or 7000
             ),
         },
     )
@@ -1707,9 +1781,21 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     )
 
     # ── transport (mic + speakers) ───────────────────────────────────
+    # R34-S12 (CRITICAL): Pipecat's VADParams default is
+    #   confidence=0.7, min_volume=0.6, start_secs=0.2, stop_secs=0.2
+    # The ``min_volume`` knob is NORMALISED EBU R128 loudness in [0,1]:
+    # 0.0 → −20 LUFS, 1.0 → +80 LUFS. Default 0.6 maps to ~+40 LUFS —
+    # louder than a jackhammer and effectively unreachable for any
+    # real-world voice mic. Leaving it at default silently rejected
+    # 100 % of speech for nine straight hours. We're already gating on
+    # Silero confidence, so volume gating is redundant — pin it to 0.0.
+    # ``start_secs`` is also lifted from 0.2 → 0.25 to drop transient
+    # door-slam / keyboard clatter spikes without delaying real speech.
     vad_params = VADParams(
         confidence=cfg.vad_threshold,
+        start_secs=0.25,
         stop_secs=cfg.vad_min_silence_ms / 1000.0,
+        min_volume=0.0,
     )
     transport_params = LocalAudioTransportParams(
         input_device_index=cfg.input_device_index,
