@@ -1,8 +1,37 @@
-# Jarvis
+# Jarvis · Nexus Studio fork
+
+> **R34 build.** Powered by Pipecat 1.2.1 (R31) + KAOS-ported persona /
+> facts / skills / audit / capability gates (R32–R33). Nexus Studio brand
+> identity dashboard at `http://127.0.0.1:8789/dashboard/` (R34-S3).
 
 **A 100% private AI voice assistant that lives on your computer** (works offline). Talk naturally as if Jarvis is a third person in the room — say its name anywhere in your sentence and get conversational, context-aware responses. It remembers everything, always knows the current location and time, can search the web, read your screen, control Chrome, track nutrition, and much more with support for unlimited MCPs and tools without context rot. Sensitive info is automatically redacted before anything is saved to disk.
 
 🔒 100% local processing. No subscriptions. No data harvesting. Automatic redaction of sensitive info. Free offline dictation included.
+
+## R31–R34 architecture upgrade — at a glance
+
+| Round | Module | What it does |
+|-------|--------|--------------|
+| R31 | `jarvis/listening/pipecat_loop.py` | Pipecat 1.2.1 voice loop (VAD → STT → LLM → TTS), replaces legacy listener under `voice_engine=pipecat` |
+| R32 | `jarvis/skills/` | Progressive-disclosure skills (L1 catalog / L2 SKILL.md / L3 references), ported from KAOS |
+| R33-S1 | `jarvis/persona.py` | Central `~/.config/jarvis/persona.md` — identity, boundaries, shortcuts |
+| R33-S2 | `jarvis/memory/facts.py` | Atomic persistent facts with FTS5 + decay scoring (2^(-age/half_life)) |
+| R33-S3 | `jarvis/audit.py` | SQLite audit trail with PII redaction (key + value patterns) |
+| R33-S4 | `jarvis/capabilities.py` | Env-var capability gates (`JARVIS_ENABLE_*` / `JARVIS_DISABLE_*`) |
+| R33-S5–6 | `jarvis/dashboard/` | aiohttp control room + vanilla-ESM SPA; Nexus Studio brand |
+| R33-S7 | `jarvis/listening/warmup.py` | Background prime of Ollama + Whisper + Piper caches at boot |
+| R34-S1 | `pipecat_loop.py` | **Fix**: disable Pipecat `cancel_on_idle_timeout` (was killing pipeline after 5 min silence) |
+| R34-S4 | various | Security sweep: path-traversal sandbox in skills, value-pattern PII scrub in audit, CORS verbs |
+| R34-S6 | `seed-skills/` | 5 real Nexus-Studio agency-workflow seed skills |
+
+### Dashboard
+
+The Control Room ships at `http://127.0.0.1:8789/dashboard/` and is
+gated behind a bearer token stored in `~/Library/Application Support/jarvis/dashboard-token`.
+
+Views: Overview · Skills · Audit · Persona · Capabilities · Facts · Live.
+
+Disable: `JARVIS_DASHBOARD_DISABLE=true`.
 
 ---
 
