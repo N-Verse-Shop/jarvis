@@ -264,6 +264,43 @@ input::placeholder { color: var(--text-mute); }
   opacity: 0; transition: opacity 0.3s ease;
 }
 .brand-mark:hover::after { opacity: 1; }
+
+/* R34-S13: real Nexus Studio logo (winged ferret on shield).
+ * Drops the gradient tile + "J" character in favour of the
+ * official brand mark. Keeps the same footprint so layout
+ * stays pixel-stable. The drop-shadow makes the gold pop
+ * against the dark glassmorphism panels. */
+.brand-mark--logo {
+  background: transparent !important;
+  box-shadow: none !important;
+  object-fit: contain;
+  padding: 2px;
+  filter: drop-shadow(0 4px 18px rgba(255, 184, 76, 0.35));
+  transition: filter 0.3s ease, transform 0.3s ease;
+}
+.brand-mark--logo:hover {
+  filter: drop-shadow(0 6px 24px rgba(255, 184, 76, 0.55));
+  transform: scale(1.04);
+}
+.auth-brand .brand-mark--logo { padding: 0; }
+
+/* Full wordmark on the unlock card — Nexus Studio · Digital Innovation.
+ * Sits below the password input. Subtle fade so it doesn't compete
+ * with the input/button. */
+.auth-footer {
+  margin-top: 22px;
+  display: flex;
+  justify-content: center;
+  opacity: 0.75;
+  transition: opacity 0.3s ease;
+}
+.auth-footer:hover { opacity: 1; }
+.auth-wordmark {
+  width: 220px;
+  max-width: 80%;
+  height: auto;
+  filter: drop-shadow(0 6px 18px rgba(255, 184, 76, 0.25));
+}
 .brand-stack { display: flex; flex-direction: column; gap: 2px; }
 .brand-title {
   font-family: var(--display);
