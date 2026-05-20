@@ -183,9 +183,17 @@ class TestKeywordStrategy:
         assert "stop" in result
 
     @pytest.mark.unit
-    def test_vague_query_falls_back_to_all(self):
+    def test_vague_query_returns_stop_only(self):
+        """A vague utterance with no keyword overlap returns only the
+        always-included ``stop`` tool. Voice-loop optimization (R29):
+        we no longer fall back to ALL tools on a non-match because
+        that inflates the chat prompt to ~2000 tokens on qwen2.5:3b
+        CPU. The model can re-enter selection if it actually needs
+        a wider net via ``toolSearchTool``."""
         result = select_tools("hmm", _builtin(), {}, strategy=ToolSelectionStrategy.KEYWORD)
-        assert len(result) == len(_builtin())
+        assert result == ["stop"], (
+            f"expected only the always-included stop tool, got {result!r}"
+        )
 
     @pytest.mark.unit
     def test_mcp_tools_included(self):
@@ -253,7 +261,11 @@ class TestEmbeddingStrategy:
 
     @pytest.mark.unit
     def test_failed_query_embedding_falls_back(self):
-        """If query embedding fails, fall back to all tools."""
+        """If query embedding fails, fall back to all tools — but voice
+        hard-cap still applies (a runaway embedding service must not
+        unleash the full catalogue onto a CPU-served voice model)."""
+        from jarvis.tools.selection import _VOICE_HARD_CAP
+
         def mock_fail(text, base_url, model, timeout_sec=10.0):
             return None
 
@@ -265,7 +277,10 @@ class TestEmbeddingStrategy:
                 llm_base_url="http://localhost",
                 embed_model="nomic-embed-text",
             )
-        assert len(result) == len(_builtin()) + len(_mcp())
+        # Falls back to the all-set, then capped to _VOICE_HARD_CAP.
+        assert len(result) == _VOICE_HARD_CAP
+        # Stop is always preserved across the cap.
+        assert "stop" in result
 
     @pytest.mark.unit
     def test_returns_minimum_tools(self):
@@ -486,7 +501,13 @@ class TestLLMStrategy:
         """Chatty routers wrap names in backticks, bullets, or JSON brackets.
         The parser must strip that formatting before matching — a literal
         `webSearch` should resolve to the tool called webSearch, not be
-        silently dropped as an unknown token."""
+        silently dropped as an unknown token.
+
+        Hard cap still applies (we keep stop + first 2 explicitly named),
+        but the parser must at least RECOGNISE all 3 names — verified by
+        checking the un-capped path through ``_select_llm`` directly.
+        """
+        from jarvis.tools.selection import _select_llm
         def mock_llm(base_url, model, sys, user, timeout_sec=8.0):
             # A realistic worst case combining bullets, backticks, and a
             # bracketed list tail — all of which have appeared from gemma-class
@@ -494,16 +515,15 @@ class TestLLMStrategy:
             return "- `webSearch`, * `getWeather`, [logMeal]"
 
         with patch("jarvis.llm.call_llm_direct", side_effect=mock_llm):
-            result = select_tools(
+            # Bypass the hard-cap to verify ALL three names were parsed.
+            parsed = _select_llm(
                 "chatty router",
                 _builtin(), {},
-                strategy=ToolSelectionStrategy.LLM,
-                llm_base_url="http://localhost",
-                llm_model="test",
+                "http://localhost", "test", 8.0,
             )
-        assert "webSearch" in result
-        assert "getWeather" in result
-        assert "logMeal" in result
+        assert "webSearch" in parsed
+        assert "getWeather" in parsed
+        assert "logMeal" in parsed
 
     @pytest.mark.unit
     def test_caps_chatty_router_output_at_max(self):

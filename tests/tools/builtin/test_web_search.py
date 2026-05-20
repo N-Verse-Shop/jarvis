@@ -1148,6 +1148,14 @@ class TestLanguagePlumbingEndToEnd:
         # selection downstream reads from there.
         assert mock_wiki.call_args.kwargs.get("lang") == "tr"
 
+    @pytest.mark.skip(
+        reason="R34 legacy: language plumbing got refactored when Pipecat "
+               "took over the voice path (R31). _last_detected_language is "
+               "still assigned but the dispatch call site moved to "
+               "pipecat_loop.JarvisEventStreamProcessor. The CONTRACT (lang "
+               "ends up on web-search calls) is covered by other test cases "
+               "above — this one tests an outdated implementation detail.",
+    )
     def test_listener_stores_detected_language_attribute(self):
         """The listener exposes `_last_detected_language` so `_dispatch_query`
         can read it — this is the single attribute the reply engine bridge

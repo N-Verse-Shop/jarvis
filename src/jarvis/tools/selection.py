@@ -210,6 +210,39 @@ def _all_tool_names(
 # Strategy: keyword
 # ---------------------------------------------------------------------------
 
+def _keyword_score(query_tokens: set, kw: set) -> int:
+    """Token-level match between query and tool-keyword sets.
+
+    Pure exact intersection misses common English morphology: a query
+    "what did I eat yesterday" never matches a tool keyword "eating".
+    We add a prefix-overlap pass on top of the exact match: any query
+    token of ≥3 chars that prefixes a keyword (or vice-versa) counts
+    as one weak hit. Exact matches still dominate via the 2× bonus.
+    """
+    if not query_tokens or not kw:
+        return 0
+    exact = len(query_tokens & kw)
+    weak = 0
+    # Skip the prefix loop if exact match already covers everything —
+    # cheap optimisation since the common case is "no overlap".
+    for q in query_tokens:
+        if q in kw or len(q) < 3:
+            continue
+        for k in kw:
+            if len(k) < 3:
+                continue
+            # prefix either direction, min 3-char shared prefix
+            shared = 0
+            for ca, cb in zip(q, k):
+                if ca != cb:
+                    break
+                shared += 1
+            if shared >= 3 and (q.startswith(k) or k.startswith(q)):
+                weak += 1
+                break  # one weak hit per query token is enough
+    return exact * 2 + weak
+
+
 def _select_keyword(
     query: str,
     builtin_tools: Dict[str, "Tool"],
@@ -224,12 +257,12 @@ def _select_keyword(
 
     for name, tool in builtin_tools.items():
         kw = _build_tool_keywords(name, tool.description)
-        score = len(query_tokens & kw)
+        score = _keyword_score(query_tokens, kw)
         scored.append((name, score))
 
     for name, spec in mcp_tools.items():
         kw = _build_tool_keywords(name, spec.description)
-        score = len(query_tokens & kw)
+        score = _keyword_score(query_tokens, kw)
         scored.append((name, score))
 
     matched = [name for name, score in scored if score > 0]
@@ -569,10 +602,12 @@ def select_tools(
     else:
         selected = _all_tool_names(builtin_tools, mcp_tools)
 
-    # Apply voice hard cap. Always keep ALWAYS_INCLUDED (stop) so users can
-    # interrupt. Cap remaining tools at _VOICE_HARD_CAP-1 to keep chat-prompt
-    # token count manageable on CPU-served small models.
-    if len(selected) > _VOICE_HARD_CAP:
+    # Voice hard cap — keeps the chat-prompt token count manageable on
+    # CPU-served small models. CRITICAL: never applied to ALL strategy;
+    # ALL is the caller saying "I want every tool" and capping would
+    # silently break that contract. The cap is for the heuristic
+    # strategies (keyword / embedding / LLM) which can overshoot.
+    if strategy != ToolSelectionStrategy.ALL and len(selected) > _VOICE_HARD_CAP:
         always = [t for t in selected if t in _ALWAYS_INCLUDED]
         extra = [t for t in selected if t not in _ALWAYS_INCLUDED]
         max_extra = max(0, _VOICE_HARD_CAP - len(always))
