@@ -941,7 +941,11 @@ def _op_run_shortcut(name: str = "", input_text: str = "") -> tuple[bool, str]:
         return False, "shortcut name required"
     # Strict allowlist — keeps a hostile/typo'd name from being
     # interpreted as a flag (`-h`, `--help`, etc.).
-    if not re.match(r"^[\w\s\.\-_'\(\)]{1,80}$", nm, re.UNICODE):
+    # R34-S40 — was `re.match` but module never imports top-level `re`;
+    # the other ops in this file use a local `import re as _re`. NameError
+    # at first call to run_shortcut.
+    import re as _re_shortcut
+    if not _re_shortcut.match(r"^[\w\s\.\-_'\(\)]{1,80}$", nm, _re_shortcut.UNICODE):
         return False, f"shortcut name not allowed: {nm!r}"
     try:
         cmd = ["shortcuts", "run", nm]

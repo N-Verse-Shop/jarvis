@@ -189,6 +189,42 @@ def extract_query_after_wake(text_lower: str, wake_word: str, aliases: List[str]
             # Fallback to plain replace if regex compile fails on weird input.
             fragment = fragment.replace(alias, " ")
 
+    # R34-S40 — ALSO strip tokens that fuzzy-match a wake alias (≥0.78).
+    # Without this, Whisper variants ("джагвіз", "джаглись", "джарри",
+    # "джавис") slip through the exact-match stripper above and the LLM
+    # receives the misheard wake-word as the entire user query —
+    # leading to confident hallucinations like "Сейчас 00:25" from a
+    # bare "джавис" input. Fuzzy stripping is bounded by the same length
+    # delta + ratio rules as is_wake_word_detected to avoid eating real
+    # words.
+    try:
+        tokens = re.findall(r"[\wа-щьюяїієґА-ЩЬЮЯЇІЄҐʼ'\-]+", fragment, re.UNICODE)
+        for token in tokens:
+            tlow = token.lower()
+            if len(tlow) < 4:
+                continue
+            for alias in sorted_aliases:
+                if not alias or len(alias) < 4:
+                    continue
+                _delta = abs(len(alias) - len(tlow))
+                if _delta > 2:
+                    continue
+                try:
+                    ratio = difflib.SequenceMatcher(a=alias, b=tlow).ratio()
+                except Exception:
+                    continue
+                if ratio >= 0.78:
+                    # Word-boundary replace once so we don't gut a
+                    # longer word that happens to contain the token.
+                    bp = r"(?:(?<=^)|(?<=[^\wа-щьюяїієґА-ЩЬЮЯЇІЄҐ]))" + re.escape(token) + r"(?:(?=$)|(?=[^\wа-щьюяїієґА-ЩЬЮЯЇІЄҐ]))"
+                    try:
+                        fragment = re.sub(bp, " ", fragment, flags=re.IGNORECASE)
+                    except re.error:
+                        fragment = fragment.replace(token, " ", 1)
+                    break  # one alias hit is enough for this token
+    except Exception:
+        pass
+
     # Clean up punctuation that might be left after wake word removal,
     # including em-dash / en-dash often produced by Whisper on long pauses.
     fragment = re.sub(r"\s+", " ", fragment)

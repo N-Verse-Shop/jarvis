@@ -250,6 +250,15 @@ class FactStore:
             isolation_level=None,  # autocommit; we manage txns explicitly
         )
         self._conn.row_factory = sqlite3.Row
+        # R34-S40 — explicit busy_timeout. Without this, concurrent
+        # writes from the voice loop's _store_facts() and the dashboard's
+        # CRUD endpoints can collide on SQLITE_BUSY (instant locked error)
+        # because WAL doesn't serialise writers — only readers. 5s gives
+        # any contending writer time to commit + release the journal.
+        try:
+            self._conn.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
         with self._lock:
             self._conn.executescript(_SCHEMA)
 

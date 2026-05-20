@@ -1264,25 +1264,53 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
 
         async def _call_ollama(self, text: str, lang: str = "ru") -> str:
             session = await self._ensure_session()
-            # R34-S39 — system prompt cached per-language for the lifetime
-            # of this processor. Previously we rebuilt the prompt on every
-            # turn (including a synchronous SQLite call for the digest),
-            # which broke Ollama's prefix-cache and forced qwen3:8b to
-            # re-eval ~700-800 prompt tokens at ~50 tok/s = 14s+ per turn.
-            # The base+lock combo is stable for the conversation; one
-            # cache hit per language saves the prompt-eval cost entirely.
+            # R34-S39/40 — system prompt cached per-language. Re-validated
+            # against ~/.config/jarvis/persona.md mtime so dashboard
+            # persona edits propagate to the next turn without daemon
+            # restart. Without invalidation, the processor would serve a
+            # stale persona until the process was killed.
             cache = getattr(self, "_sys_prompt_cache", None)
+            cache_mtime = getattr(self, "_sys_prompt_cache_mtime", 0.0)
             if cache is None:
                 cache = {}
                 self._sys_prompt_cache = cache
+            # Cheap stat call — ~10µs. If persona.md changed, drop cache.
+            try:
+                from pathlib import Path as _Path
+                persona_path = _Path.home() / ".config/jarvis/persona.md"
+                if persona_path.exists():
+                    new_mtime = persona_path.stat().st_mtime
+                    if new_mtime != cache_mtime:
+                        cache.clear()
+                        self._sys_prompt_cache_mtime = new_mtime
+            except Exception:
+                pass
             sys_prompt = cache.get(lang)
             if sys_prompt is None:
+                # Use the FULL system prompt builder (persona + facts +
+                # base + skills + time block) — NOT just _base_system_prompt
+                # which omits the persona block (R34-S37 bug). Then append
+                # the per-turn language lock.
+                try:
+                    full_prompt = _system_prompt_for(lang)
+                except Exception:
+                    full_prompt = _base_system_prompt
                 try:
                     from ..memory.self_learning import language_lock_block
                     lock = language_lock_block(lang)
                 except Exception:
                     lock = ""
-                parts = [_base_system_prompt]
+                # R34-S40 — added clarification instruction so the model
+                # asks "перепитайте" instead of confidently inventing an
+                # answer to a misheard/empty input.
+                clarify = (
+                    "Якщо запит незрозумілий, нечіткий або схожий на безглуздий — "
+                    "перепитай одним коротким реченням, НЕ вигадуй відповідь."
+                    if lang == "uk"
+                    else "Если запрос неясный, нечёткий или похож на бессмыслицу — "
+                         "переспроси одним коротким предложением, НЕ выдумывай ответ."
+                )
+                parts = [full_prompt, clarify]
                 if lock:
                     parts.append(lock)
                 sys_prompt = "\n\n".join(p for p in parts if p)
@@ -1370,10 +1398,16 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                 def _run_say() -> None:
                     import subprocess as _sp
                     try:
+                        # R34-S40 — close stdio so launchd-detached child
+                        # can't accidentally inherit terminal (would cause
+                        # SIGTTIN under some shells).
                         _sp.run(
                             ["say", "-v", "Milena", "-r", "210", text],
                             check=False,
                             timeout=60,
+                            stdin=_sp.DEVNULL,
+                            stdout=_sp.DEVNULL,
+                            stderr=_sp.DEVNULL,
                         )
                     except Exception as exc:
                         debug_log(
@@ -1386,6 +1420,16 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             # echo for up to _BOT_HISTORY_TTL_SEC (30s), so we don't need
             # the artificial dead-time anymore. Saves ~1s before the
             # user can start the next turn.
+            #
+            # R34-S40 — RE-register bot phrase AFTER playback so the
+            # fingerprint's 30s TTL window starts when the user can
+            # actually hear it (and the mic can capture echo).
+            # Without this, a 10-second reply uses up most of the TTL
+            # on its own playback time, leaving <20s for late echo.
+            try:
+                _register_bot_utterance(text)
+            except Exception:
+                pass
             try:
                 await self.push_frame(BotStoppedSpeakingFrame(), direction)
                 await self.push_frame(TTSStoppedFrame(), direction)
@@ -1686,6 +1730,16 @@ def _make_fast_path_processor():
             # echo for up to _BOT_HISTORY_TTL_SEC (30s), so we don't need
             # the artificial dead-time anymore. Saves ~1s before the
             # user can start the next turn.
+            #
+            # R34-S40 — RE-register bot phrase AFTER playback so the
+            # fingerprint's 30s TTL window starts when the user can
+            # actually hear it (and the mic can capture echo).
+            # Without this, a 10-second reply uses up most of the TTL
+            # on its own playback time, leaving <20s for late echo.
+            try:
+                _register_bot_utterance(text)
+            except Exception:
+                pass
             try:
                 await self.push_frame(BotStoppedSpeakingFrame(), direction)
                 await self.push_frame(TTSStoppedFrame(), direction)

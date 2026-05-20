@@ -71,11 +71,13 @@ def _warmup_ollama(
     base_url: str,
     model: str,
     system_prompt: str,
-    timeout_s: float = 45.0,
-    # R34-S39 — back from 180. qwen3:8b cold-load on Hetzner remote
-    # is 30-40s; if it doesn't warm in 45s assume the network is bad
-    # and let the daemon proceed — the first real turn will retry.
-    # Holding the daemon for 3 minutes on every restart hurt UX.
+    timeout_s: float = 90.0,
+    # R34-S40 — bumped 45→90s. qwen3:8b cold load on Hetzner GPU is
+    # 30-60s under contention, occasionally 70s+. 45s was too tight and
+    # we saw repeated read-timeout failures on boot. 90s covers the
+    # realistic worst case while still failing fast if the host is
+    # genuinely unreachable (DNS fail / Tailscale down hit in <3s via
+    # connect timeout). Once warm the model stays for 24h.
 ) -> None:
     """Prime Ollama's KV cache with the actual system prompt.
 

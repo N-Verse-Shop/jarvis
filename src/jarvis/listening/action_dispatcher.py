@@ -548,6 +548,18 @@ def _say_time() -> tuple[bool, str]:
     return True, f"Зараз {now.strftime('%H:%M')}, {weekday}, {now.day} число."
 
 
+def _say_date() -> tuple[bool, str]:
+    """R34-S40 — fast path for date queries."""
+    from datetime import datetime
+    now = datetime.now()
+    weekday = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"][now.weekday()]
+    months = [
+        "січня", "лютого", "березня", "квітня", "травня", "червня",
+        "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+    ]
+    return True, f"Сьогодні {weekday}, {now.day} {months[now.month-1]} {now.year}."
+
+
 def _show_screen() -> tuple[bool, str]:
     """Take a screenshot, save to /tmp/jarvis-screen.png."""
     try:
@@ -2076,6 +2088,23 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     (
         re.compile(r"^\s*(?:котра\s+(?:зараз\s+)?година|скільки\s+(?:зараз\s+)?часу|який\s+зараз\s+час)\s*[!\.\?]?\s*$", re.IGNORECASE),
         lambda m: Action(name="say_time", description="Дивлюся час", fn=_say_time, created_ts=time.time()),
+    ),
+    # R34-S40 — Russian + English variants for time. Without these,
+    # "сколько сейчас времени" / "what time is it" hit the slow LLM
+    # path (qwen3:8b cold-eval = 8-12s) instead of the instant
+    # ``datetime.now()`` regex.
+    (
+        re.compile(r"^\s*(?:сколько\s+(?:сейчас\s+)?времени|который\s+(?:сейчас\s+)?час|какое\s+(?:сейчас\s+)?время|время)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="say_time", description="Смотрю время", fn=_say_time, created_ts=time.time()),
+    ),
+    (
+        re.compile(r"^\s*(?:what(?:'s|\s+is)?\s+the\s+time|what\s+time\s+is\s+it)\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="say_time", description="Checking time", fn=_say_time, created_ts=time.time()),
+    ),
+    # ── date ──
+    (
+        re.compile(r"^\s*(?:який\s+(?:сьогодні\s+)?(?:день|число|дата)|сьогодні\s+(?:який|яке)\s+(?:день|число|дата)|какое\s+(?:сегодня\s+)?(?:число|день|дата)|сегодня\s+(?:какое|какой)\s+(?:число|день|дата))\s*[!\.\?]?\s*$", re.IGNORECASE),
+        lambda m: Action(name="say_date", description="Дивлюсь дату", fn=_say_date, created_ts=time.time()),
     ),
     (
         re.compile(r"^\s*(?:рівень\s+)?батаре[яюїіея]\s*[!\.\?]?\s*$", re.IGNORECASE),

@@ -1035,6 +1035,25 @@ def main() -> None:
         except Exception:
             pass
 
+        # R34-S40 — explicit flush of the audit + facts stores BEFORE
+        # _exit. Previous shutdown skipped atexit (to avoid torch race)
+        # but that also skipped audit_store.close() → up to 100 events
+        # lost on every shutdown. Drain them synchronously now.
+        try:
+            from .audit import get_audit_store as _gas
+            _store = _gas()
+            if hasattr(_store, "close"):
+                _store.close()
+        except Exception:
+            pass
+        try:
+            from .memory.facts import get_facts_store as _gfs
+            _facts = _gfs()
+            if hasattr(_facts, "close"):
+                _facts.close()
+        except Exception:
+            pass
+
         # Skip Python's normal exit path to avoid torch destructor race.
         # PyTorch's c10::Dispatcher::deregisterFallback_ has a known
         # SIGSEGV at interpreter shutdown when atexit handlers run in
