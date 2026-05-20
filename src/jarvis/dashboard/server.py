@@ -281,6 +281,10 @@ class DashboardServer:
         app.router.add_get("/api/facts/stats", self._h_facts_stats)
         app.router.add_get("/api/events", self._h_events_tail)
         app.router.add_get("/ws/events", self._h_ws_events)
+        # R34-S18: settings panel — read + update + restart-daemon.
+        app.router.add_get("/api/settings", self._h_settings_get)
+        app.router.add_patch("/api/settings", self._h_settings_patch)
+        app.router.add_post("/api/restart", self._h_restart)
         # OPTIONS fallback for every route (CORS preflight)
         app.router.add_route("OPTIONS", "/{tail:.*}", self._h_options)
 
@@ -602,6 +606,229 @@ class DashboardServer:
             except json.JSONDecodeError:
                 continue
         return out
+
+    # ── Settings panel (R34-S18) ─────────────────────────────────
+    # Whitelist of config.json keys the dashboard is allowed to read.
+    # Everything ELSE (DB paths, MCP creds, internal toggles) stays
+    # opaque even to a local-network attacker who has the token.
+    _SETTINGS_READ_KEYS = (
+        "piper_voice",
+        "vad_aggressiveness",
+        "endpoint_silence_ms",
+        "max_utterance_ms",
+        "voice_min_energy",
+        "wake_word",
+        "wake_fuzzy_ratio",
+        "hot_window_seconds",
+        "active_language",
+        "whisper_language",
+        "whisper_model",
+        "voice_device",
+        "ollama_chat_model",
+        "ollama_chat_temperature",
+        "ollama_chat_num_predict",
+        "voice_engine",
+        "tts_enabled",
+        "silero_vad_threshold",
+    )
+    # Subset of the above that the dashboard is allowed to WRITE.
+    # We deliberately keep this tighter than the read set — changing
+    # paths / engine choices mid-session breaks things in ways that
+    # need a daemon restart anyway.
+    _SETTINGS_WRITE_KEYS = (
+        "piper_voice",
+        "vad_aggressiveness",
+        "endpoint_silence_ms",
+        "max_utterance_ms",
+        "voice_min_energy",
+        "wake_word",
+        "wake_fuzzy_ratio",
+        "hot_window_seconds",
+        "active_language",
+        "whisper_language",
+        "whisper_model",
+        "voice_device",
+        "ollama_chat_model",
+        "silero_vad_threshold",
+    )
+    # Per-key validators — return the coerced value or raise ValueError.
+    @staticmethod
+    def _validate_setting(key: str, value):  # noqa: C901 — intentional schema
+        import re as _re
+        s = value
+        if key == "piper_voice":
+            s = str(s).strip()
+            if not _re.fullmatch(r"[a-zA-Z]{2,3}_[A-Z]{2}-[a-zA-Z0-9_]+-[a-z_]+", s):
+                raise ValueError(
+                    "piper_voice must look like 'ru_RU-ruslan-medium'"
+                )
+            return s
+        if key == "vad_aggressiveness":
+            v = int(s)
+            if not 0 <= v <= 3:
+                raise ValueError("vad_aggressiveness must be 0..3")
+            return v
+        if key in ("endpoint_silence_ms", "max_utterance_ms"):
+            v = int(s)
+            if not 100 <= v <= 30000:
+                raise ValueError(f"{key} must be 100..30000 ms")
+            return v
+        if key in ("voice_min_energy", "wake_fuzzy_ratio", "silero_vad_threshold"):
+            v = float(s)
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"{key} must be 0.0..1.0")
+            return v
+        if key == "hot_window_seconds":
+            v = float(s)
+            if not 0.5 <= v <= 600.0:
+                raise ValueError("hot_window_seconds must be 0.5..600")
+            return v
+        if key in ("wake_word", "voice_device", "whisper_model"):
+            s = str(s).strip()
+            if not s or len(s) > 200:
+                raise ValueError(f"{key} must be 1..200 chars")
+            return s
+        if key in ("active_language", "whisper_language"):
+            s = str(s).strip().lower()
+            if s not in ("ru", "uk", "en", "de"):
+                raise ValueError(f"{key} must be ru | uk | en | de")
+            return s
+        if key == "ollama_chat_model":
+            s = str(s).strip()
+            # Ollama tags look like 'qwen3:8b' or 'library/llama3.2:1b'.
+            # Slashes are legal (registry prefix) but '..' is a clear
+            # path-traversal attempt and must never reach disk-adjacent
+            # code paths. Same for leading slash.
+            if not _re.fullmatch(r"[a-zA-Z0-9._:\-/]+", s):
+                raise ValueError("ollama_chat_model has invalid chars")
+            if ".." in s or s.startswith("/"):
+                raise ValueError("ollama_chat_model has path-traversal pattern")
+            if len(s) > 120:
+                raise ValueError("ollama_chat_model too long")
+            return s
+        raise ValueError(f"{key} is not a writable setting")
+
+    async def _h_settings_get(self, req):
+        from aiohttp import web
+        try:
+            from ..config import load_config
+            raw = await asyncio.to_thread(load_config) or {}
+        except Exception as exc:
+            log.warning("settings load failed: %s", exc)
+            raw = {}
+        out = {k: raw.get(k) for k in self._SETTINGS_READ_KEYS}
+        # Piper voice catalog — let the UI populate a dropdown without
+        # the user typing a magic string.
+        out["_piper_voice_catalog"] = [
+            {"id": "uk_UA-mykyta-high", "label": "Микита (UA, чоловічий, high)"},
+            {"id": "uk_UA-oleksa-high", "label": "Олекса (UA, чоловічий, high)"},
+            {"id": "uk_UA-ukrainian_tts-medium", "label": "Lada (UA, жіночий, medium)"},
+            {"id": "uk_UA-lada-x_low", "label": "Lada (UA, жіночий, x_low)"},
+            {"id": "uk_UA-tetiana-high", "label": "Тетяна (UA, жіночий, high)"},
+            {"id": "ru_RU-ruslan-medium", "label": "Руслан (RU, чоловічий, medium)"},
+            {"id": "ru_RU-dmitri-medium", "label": "Дмитро (RU, чоловічий, medium)"},
+            {"id": "ru_RU-denis-medium", "label": "Денис (RU, чоловічий, medium)"},
+            {"id": "ru_RU-irina-medium", "label": "Ірина (RU, жіночий, medium)"},
+        ]
+        out["_writable_keys"] = list(self._SETTINGS_WRITE_KEYS)
+        return web.json_response(out)
+
+    async def _h_settings_patch(self, req):
+        from aiohttp import web
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid JSON body"}, status=400
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "error": "body must be a JSON object"},
+                status=400,
+            )
+        # Validate every key first; reject the WHOLE batch on any
+        # failure so the file is never left in a half-written state.
+        validated: dict = {}
+        for k, v in body.items():
+            if k not in self._SETTINGS_WRITE_KEYS:
+                return web.json_response(
+                    {"ok": False, "error": f"{k!r} is not writable"},
+                    status=400,
+                )
+            try:
+                validated[k] = self._validate_setting(k, v)
+            except (ValueError, TypeError) as exc:
+                return web.json_response(
+                    {"ok": False, "error": f"{k}: {exc}"},
+                    status=400,
+                )
+
+        # Merge into config.json atomically.
+        def _write_config():
+            from ..config import default_config_path
+            import os as _os
+            path = default_config_path()
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except json.JSONDecodeError:
+                raw = {}
+            raw.update(validated)
+            tmp = path.with_suffix(path.suffix + f".tmp-{_os.getpid()}")
+            tmp.write_text(
+                json.dumps(raw, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _os.replace(tmp, path)
+            try:
+                _os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+        try:
+            await asyncio.to_thread(_write_config)
+        except Exception as exc:
+            log.warning("settings patch failed: %s", exc)
+            return web.json_response(
+                {"ok": False, "error": f"write failed: {exc}"}, status=500
+            )
+
+        return web.json_response(
+            {"ok": True, "updated": validated, "restart_required": True}
+        )
+
+    async def _h_restart(self, req):
+        """Trigger a daemon restart via launchctl (macOS launchd)."""
+        from aiohttp import web
+        import subprocess as _sp
+
+        async def _do_restart():
+            # Give the HTTP response time to flush before we kill our
+            # own process.
+            await asyncio.sleep(0.3)
+            plist = Path.home() / "Library/LaunchAgents/com.jarvis.assistant.plist"
+            if plist.exists():
+                # Stop + re-load (launchd RunAtLoad will respawn us).
+                try:
+                    await asyncio.to_thread(
+                        _sp.run,
+                        ["launchctl", "unload", str(plist)],
+                        check=False, capture_output=True, timeout=10,
+                    )
+                    await asyncio.to_thread(
+                        _sp.run,
+                        ["launchctl", "load", str(plist)],
+                        check=False, capture_output=True, timeout=10,
+                    )
+                except Exception as exc:
+                    log.error("restart via launchctl failed: %s", exc)
+            else:
+                # No plist → fall back to graceful exit; user's
+                # supervisor/shell can re-spawn.
+                import os as _os, signal as _sig
+                _os.kill(_os.getpid(), _sig.SIGTERM)
+
+        asyncio.create_task(_do_restart())
+        return web.json_response({"ok": True, "restarting": True})
 
     async def _h_ws_events(self, req):
         from aiohttp import web, WSMsgType

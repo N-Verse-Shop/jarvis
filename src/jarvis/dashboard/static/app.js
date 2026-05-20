@@ -63,6 +63,7 @@ function setView(name) {
   if (name === "persona") loadPersona();
   if (name === "capabilities") loadCapabilities();
   if (name === "facts") loadFacts();
+  if (name === "settings") loadSettings();
   if (name === "live") startLiveStream();
 }
 tabs.forEach(t => t.addEventListener("click", () => setView(t.dataset.view)));
@@ -466,6 +467,124 @@ async function bootstrap() {
   tickClock();
   setInterval(tickClock, 1000);
 }
+
+// ─── Settings (R34-S18) ──────────────────────────────────────────
+const _settingsCurrent = { _writable_keys: [] };
+
+async function loadSettings() {
+  try {
+    const data = await api("/api/settings");
+    Object.assign(_settingsCurrent, data);
+    // Populate Piper voice dropdown
+    const sel = document.getElementById("set-piper-voice");
+    if (sel) {
+      sel.innerHTML = (data._piper_voice_catalog || [])
+        .map(v => `<option value="${v.id}">${v.label}</option>`)
+        .join("");
+      sel.value = data.piper_voice || "ru_RU-ruslan-medium";
+    }
+    // Apply scalar values to inputs
+    const setVal = (id, value, fallback) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.value = (value !== null && value !== undefined) ? value : fallback;
+    };
+    setVal("set-wake-word", data.wake_word, "jarvis");
+    setVal("set-vad-aggr", data.vad_aggressiveness, 2);
+    setVal("set-wake-fuzzy", data.wake_fuzzy_ratio, 0.68);
+    setVal("set-hot-window", data.hot_window_seconds, 3);
+    setVal("set-endpoint", data.endpoint_silence_ms, 700);
+    setVal("set-active-lang", data.active_language || data.whisper_language, "ru");
+    setVal("set-whisper-lang", data.whisper_language || data.active_language, "ru");
+    setVal("set-chat-model", data.ollama_chat_model, "qwen3:8b");
+    // Sync live readout spans
+    document.getElementById("set-vad-aggr-val").textContent = data.vad_aggressiveness ?? 2;
+    document.getElementById("set-wake-fuzzy-val").textContent = (data.wake_fuzzy_ratio ?? 0.68).toFixed(2);
+    document.getElementById("set-hot-window-val").textContent = data.hot_window_seconds ?? 3;
+    document.getElementById("set-endpoint-val").textContent = data.endpoint_silence_ms ?? 700;
+  } catch (exc) {
+    settingsToast(`Завантажити не вдалося: ${exc.message || exc}`, "error");
+  }
+}
+
+function settingsToast(message, level = "ok") {
+  const el = document.getElementById("settings-toast");
+  if (!el) return;
+  el.textContent = message;
+  el.className = `toast toast-${level}`;
+  el.hidden = false;
+  clearTimeout(window._settingsToastTimer);
+  window._settingsToastTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+async function saveSettings() {
+  // Collect form values into a patch object.
+  const numOrUndef = (id, parser) => {
+    const el = document.getElementById(id);
+    if (!el || el.value === "" || el.value === null) return undefined;
+    const v = parser(el.value);
+    return Number.isFinite(v) ? v : undefined;
+  };
+  const strOrUndef = (id) => {
+    const el = document.getElementById(id);
+    const v = (el?.value || "").trim();
+    return v ? v : undefined;
+  };
+  const patch = {
+    piper_voice: strOrUndef("set-piper-voice"),
+    wake_word: strOrUndef("set-wake-word"),
+    vad_aggressiveness: numOrUndef("set-vad-aggr", parseInt),
+    wake_fuzzy_ratio: numOrUndef("set-wake-fuzzy", parseFloat),
+    hot_window_seconds: numOrUndef("set-hot-window", parseFloat),
+    endpoint_silence_ms: numOrUndef("set-endpoint", parseInt),
+    active_language: strOrUndef("set-active-lang"),
+    whisper_language: strOrUndef("set-whisper-lang"),
+    ollama_chat_model: strOrUndef("set-chat-model"),
+  };
+  // Strip undefined so the server doesn't reject "key: undefined".
+  Object.keys(patch).forEach(k => patch[k] === undefined && delete patch[k]);
+  if (Object.keys(patch).length === 0) {
+    settingsToast("Нічого не змінено", "warn");
+    return;
+  }
+  try {
+    const res = await api("/api/settings", { method: "PATCH", body: patch });
+    if (res.ok) {
+      const n = Object.keys(res.updated || {}).length;
+      settingsToast(`✓ Збережено ${n} налаштування. Натисни «Restart Jarvis» щоб застосувати.`, "ok");
+    } else {
+      settingsToast(`✗ ${res.error || "невідома помилка"}`, "error");
+    }
+  } catch (exc) {
+    settingsToast(`✗ ${exc.message || exc}`, "error");
+  }
+}
+
+async function restartDaemon() {
+  if (!confirm("Перезапустити Jarvis daemon? Сесія дашборду залишиться відкритою, але новий PID підніметься за ~30s.")) return;
+  try {
+    await api("/api/restart", { method: "POST" });
+    settingsToast("⟳ Перезапуск… дашборд автоматично перепідключиться через ~30s.", "ok");
+    // Force a settings reload after the daemon comes back.
+    setTimeout(() => loadSettings(), 35_000);
+  } catch (exc) {
+    settingsToast(`Не вдалося перезапустити: ${exc.message || exc}`, "error");
+  }
+}
+
+// Wire up controls + live readouts
+document.getElementById("settings-save")?.addEventListener("click", saveSettings);
+document.getElementById("settings-restart")?.addEventListener("click", restartDaemon);
+document.getElementById("settings-reload")?.addEventListener("click", loadSettings);
+["set-vad-aggr", "set-wake-fuzzy", "set-hot-window", "set-endpoint"].forEach(id => {
+  document.getElementById(id)?.addEventListener("input", e => {
+    const valEl = document.getElementById(`${id}-val`);
+    if (!valEl) return;
+    const v = parseFloat(e.target.value);
+    if (id === "set-wake-fuzzy") valEl.textContent = v.toFixed(2);
+    else valEl.textContent = v;
+  });
+});
 
 // Boot
 if (localStorage.getItem(TOKEN_KEY)) {

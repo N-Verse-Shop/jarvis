@@ -63,6 +63,7 @@
           <button class="nav-tab" data-view="persona">Persona</button>
           <button class="nav-tab" data-view="capabilities">Capabilities</button>
           <button class="nav-tab" data-view="facts">Facts</button>
+          <button class="nav-tab" data-view="settings">Settings</button>
           <button class="nav-tab" data-view="live">Live</button>
         </nav>
         <div class="header-meta">
@@ -220,6 +221,96 @@
           </select>
         </div>
         <div id="facts-list" class="facts-list"></div>
+      </section>
+
+      <!-- view: settings (R34-S18) -->
+      <section class="view" id="view-settings">
+        <div class="view-toolbar">
+          <h2>Settings · Jarvis Tuning</h2>
+          <div class="filters">
+            <button id="settings-reload" class="ghost" title="Re-load from disk">⟳ Reload</button>
+            <button id="settings-restart" class="ghost danger" title="Restart daemon to apply">⏻ Restart Jarvis</button>
+          </div>
+        </div>
+        <div id="settings-toast" class="toast" hidden></div>
+        <div class="settings-grid">
+          <!-- Voice / TTS -->
+          <div class="card settings-card">
+            <h3>🔊 Voice (TTS)</h3>
+            <label class="setting">
+              <span class="setting-label">Piper voice</span>
+              <select id="set-piper-voice" class="setting-input"></select>
+              <span class="setting-hint">Чоловічий / жіночий голос. Зміна вимагає перезапуску.</span>
+            </label>
+          </div>
+          <!-- Wake word / VAD -->
+          <div class="card settings-card">
+            <h3>🎤 Wake-word + VAD</h3>
+            <label class="setting">
+              <span class="setting-label">Wake word</span>
+              <input id="set-wake-word" type="text" class="setting-input" maxlength="40" />
+              <span class="setting-hint">Основне слово (наприклад: jarvis, джарвіс).</span>
+            </label>
+            <label class="setting">
+              <span class="setting-label">VAD aggressiveness <code id="set-vad-aggr-val">2</code></span>
+              <input id="set-vad-aggr" type="range" min="0" max="3" step="1" class="setting-input" />
+              <span class="setting-hint">0=lenient · 3=aggressive. Менше = ловить тихий голос, більше = ігнорує шум.</span>
+            </label>
+            <label class="setting">
+              <span class="setting-label">Wake fuzzy ratio <code id="set-wake-fuzzy-val">0.68</code></span>
+              <input id="set-wake-fuzzy" type="range" min="0.50" max="0.95" step="0.01" class="setting-input" />
+              <span class="setting-hint">Нижче = більше варіантів вимови (наприклад «джагріс» теж пройде).</span>
+            </label>
+            <label class="setting">
+              <span class="setting-label">Hot window seconds <code id="set-hot-window-val">3.0</code></span>
+              <input id="set-hot-window" type="range" min="1" max="60" step="1" class="setting-input" />
+              <span class="setting-hint">Скільки секунд після відповіді можна задавати follow-up без «Джарвіс».</span>
+            </label>
+            <label class="setting">
+              <span class="setting-label">Endpoint silence (ms) <code id="set-endpoint-val">700</code></span>
+              <input id="set-endpoint" type="range" min="200" max="2000" step="50" class="setting-input" />
+              <span class="setting-hint">Тиша між словами для завершення реплики. ↑= більше пауз перед речами; ↓= швидше реакція.</span>
+            </label>
+          </div>
+          <!-- Language + STT -->
+          <div class="card settings-card">
+            <h3>🌐 Language &amp; STT</h3>
+            <label class="setting">
+              <span class="setting-label">Active language</span>
+              <select id="set-active-lang" class="setting-input">
+                <option value="ru">Русский (ru)</option>
+                <option value="uk">Українська (uk)</option>
+                <option value="en">English (en)</option>
+                <option value="de">Deutsch (de)</option>
+              </select>
+              <span class="setting-hint">Мова персони + системного prompt.</span>
+            </label>
+            <label class="setting">
+              <span class="setting-label">Whisper language</span>
+              <select id="set-whisper-lang" class="setting-input">
+                <option value="ru">Русский (ru)</option>
+                <option value="uk">Українська (uk)</option>
+                <option value="en">English (en)</option>
+                <option value="de">Deutsch (de)</option>
+              </select>
+              <span class="setting-hint">Мова розпізнавання голосу (STT).</span>
+            </label>
+          </div>
+          <!-- LLM -->
+          <div class="card settings-card">
+            <h3>🧠 LLM Brain</h3>
+            <label class="setting">
+              <span class="setting-label">Chat model</span>
+              <input id="set-chat-model" type="text" class="setting-input"
+                     placeholder="qwen3:8b" />
+              <span class="setting-hint">Ollama tag. Має існувати на сервері (Hetzner).</span>
+            </label>
+          </div>
+        </div>
+        <div class="settings-footer">
+          <button id="settings-save" class="primary">Save changes</button>
+          <span class="subtle">Зміни записуються в <code>~/.config/jarvis/config.json</code>. Натисни «Restart Jarvis» щоб застосувати.</span>
+        </div>
       </section>
 
       <!-- view: live -->
