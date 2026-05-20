@@ -649,6 +649,51 @@ def main() -> None:
             daemon=True,
         ).start()
 
+    # R34-S10: pipeline heartbeat. Emits a lightweight `heartbeat`
+    # event every 60s with current state.json snapshot + uptime. Gives
+    # the HUD a live "last seen" timestamp so users can tell the
+    # difference between "Jarvis is idle but alive" and "Jarvis is
+    # frozen / stalled / fell off CoreAudio". Disable with
+    # JARVIS_HEARTBEAT_DISABLE=true.
+    if os.environ.get("JARVIS_HEARTBEAT_DISABLE", "").lower() not in (
+        "1", "true", "yes", "on"
+    ):
+        _hb_started_at = time.time()
+
+        def _heartbeat_loop():
+            import json as _json
+            import time as _t
+            from pathlib import Path as _P
+            state_path = _P.home() / "Library/Application Support/jarvis/state.json"
+            from .ipc import get_stream as _gs
+            stream = _gs()
+            _t.sleep(10)  # let warmup land before the first beat
+            while True:
+                try:
+                    snap = {}
+                    if state_path.exists():
+                        try:
+                            snap = _json.loads(state_path.read_text(encoding="utf-8"))
+                        except (_json.JSONDecodeError, OSError):
+                            snap = {}
+                    stream.emit(
+                        "heartbeat",
+                        state=str(snap.get("state", "UNKNOWN")),
+                        level=float(snap.get("level", 0.0) or 0.0),
+                        uptime_s=round(_t.time() - _hb_started_at, 1),
+                        pid=os.getpid(),
+                    )
+                except Exception as exc:
+                    # Never let observability kill the loop.
+                    debug_log(f"heartbeat emit failed: {exc!r}", "daemon")
+                _t.sleep(60)
+
+        threading.Thread(
+            target=_heartbeat_loop,
+            name="heartbeat",
+            daemon=True,
+        ).start()
+
     # Initialize dictation engine (hold-to-dictate)
     dictation = None
     if bool(getattr(cfg, "dictation_enabled", True)):
