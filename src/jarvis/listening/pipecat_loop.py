@@ -446,9 +446,20 @@ def _system_prompt_for(lang: str) -> str:
 # echo filter to drop late mic-captured bot echoes that arrived past
 # the time-window gate. Kept module-level so all three live without
 # explicit cross-references.
+import threading as _threading
 _BOT_HISTORY: list = []  # list of (ts, fingerprint)
 _BOT_HISTORY_TTL_SEC = 30.0
-_BOT_HISTORY_MAX = 8
+_BOT_HISTORY_MAX = 16  # R34-S41 — bumped from 8 to survive 30s burst
+# R34-S41 — protects _BOT_HISTORY mutations + reads across the
+# asyncio loop thread and the executor threads used by _run_say /
+# _piper_synthesize. CPython GIL guarantees individual list ops but
+# slice-replace + del-prefix are multi-op and can tear under load.
+_BOT_HISTORY_LOCK = _threading.Lock()
+# R34-S41 — same race on the playback handle. _stop_current_playback
+# can run from either the interrupt-poller (async) or the wake-gate
+# universal-stop branch (also async, different task); meanwhile
+# _play_audio_interruptable's finally clears it from the executor.
+_PLAYBACK_LOCK = _threading.Lock()
 
 
 def _bot_history_fingerprint(text: str) -> str:
@@ -474,13 +485,15 @@ def _register_bot_utterance(text: str) -> None:
     fp = _bot_history_fingerprint(text)
     if not fp:
         return
-    now = _time.time()
-    _BOT_HISTORY.append((now, fp))
-    cutoff = now - _BOT_HISTORY_TTL_SEC
-    # Trim in place — list is shared
-    _BOT_HISTORY[:] = [(t, f) for (t, f) in _BOT_HISTORY if t > cutoff]
-    if len(_BOT_HISTORY) > _BOT_HISTORY_MAX:
-        del _BOT_HISTORY[: len(_BOT_HISTORY) - _BOT_HISTORY_MAX]
+    now = _time.monotonic()  # R34-S41: monotonic — clock-jump-proof
+    # R34-S41 — lock the entire read-modify-write; called from both
+    # the asyncio loop thread AND _run_say executor threads.
+    with _BOT_HISTORY_LOCK:
+        _BOT_HISTORY.append((now, fp))
+        cutoff = now - _BOT_HISTORY_TTL_SEC
+        _BOT_HISTORY[:] = [(t, f) for (t, f) in _BOT_HISTORY if t > cutoff]
+        if len(_BOT_HISTORY) > _BOT_HISTORY_MAX:
+            del _BOT_HISTORY[: len(_BOT_HISTORY) - _BOT_HISTORY_MAX]
 
 
 # R34-S34: Piper voice cache + interruptable playback state.
@@ -568,6 +581,7 @@ async def _play_audio_interruptable(wav_path: Path) -> None:
     global _CURRENT_PLAYBACK_PROC
     import asyncio as _asyncio
     import subprocess as _sp
+    proc = None
     try:
         proc = _sp.Popen(
             ["afplay", str(wav_path)],
@@ -575,7 +589,10 @@ async def _play_audio_interruptable(wav_path: Path) -> None:
             stdout=_sp.DEVNULL,
             stderr=_sp.DEVNULL,
         )
-        _CURRENT_PLAYBACK_PROC = proc
+        # R34-S41 — atomically publish the handle so _stop_current_playback
+        # always sees a consistent view (set+test from another thread).
+        with _PLAYBACK_LOCK:
+            _CURRENT_PLAYBACK_PROC = proc
         loop = _asyncio.get_event_loop()
         await loop.run_in_executor(None, proc.wait)
     except Exception as exc:
@@ -584,7 +601,12 @@ async def _play_audio_interruptable(wav_path: Path) -> None:
         except Exception:
             pass
     finally:
-        _CURRENT_PLAYBACK_PROC = None
+        # Only clear if WE still own the slot. _stop_current_playback may
+        # have already swapped in a fresh None, OR another playback might
+        # have raced ahead — either way, don't clobber a stranger's handle.
+        with _PLAYBACK_LOCK:
+            if _CURRENT_PLAYBACK_PROC is proc:
+                _CURRENT_PLAYBACK_PROC = None
         try:
             wav_path.unlink()
         except Exception:
@@ -604,10 +626,21 @@ def _stop_current_playback() -> bool:
     zombie until the parent exits because no .wait() was called).
     """
     global _CURRENT_PLAYBACK_PROC
-    proc = _CURRENT_PLAYBACK_PROC
-    if proc is None:
-        return False
-    _CURRENT_PLAYBACK_PROC = None
+    # R34-S41 — atomic read+clear under lock so a concurrent
+    # _play_audio_interruptable.finally doesn't race-clear the slot
+    # then we hit a None handle here.
+    with _PLAYBACK_LOCK:
+        proc = _CURRENT_PLAYBACK_PROC
+        if proc is None:
+            return False
+        _CURRENT_PLAYBACK_PROC = None
+    # Skip if the process already finished — terminate() on a dead
+    # PID is harmless but the reaper thread is unnecessary.
+    try:
+        if proc.poll() is not None:
+            return False
+    except Exception:
+        pass
     try:
         proc.terminate()
     except Exception:
@@ -1483,9 +1516,25 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                     f"direct_chat: skipping LLM for wake-only input: {text!r}",
                     "pipecat",
                 )
+                # R34-S41 — debounce repeated wake-only acks. Without
+                # this, mashing "Джарвіс. Джарвіс. Джарвіс." queues
+                # multiple "Слухаю" replies that chain after each
+                # plays. 5s gap suppresses follow-on acks; the wake
+                # window stays open so the user can still issue a
+                # command after the first ack.
+                import time as _t_ack
+                _last_ack = getattr(self, "_last_ack_monotonic", 0.0)
+                _now_mon = _t_ack.monotonic()
+                if _now_mon - _last_ack < 5.0:
+                    debug_log(
+                        "direct_chat: ack debounced — already acked recently",
+                        "pipecat",
+                    )
+                    return
                 # Just emit a short audible ack so user knows mic is hot.
                 if not self._busy:
                     self._busy = True
+                    self._last_ack_monotonic = _now_mon
                     try:
                         # Detect lang for the ack so RU/UK speakers
                         # both feel native.
@@ -2586,6 +2635,50 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
             # through the pipeline. Without wake-word during SPEAKING
             # we IGNORE the transcript entirely (no interruption on
             # background talk).
+            #
+            # R34-S41: ALSO barge-in on universal stop keywords. The
+            # user complains "perebivayetsya tilki pry imeni" but they
+            # ALSO need a fast way to say "стоп"/"тихо" without prefix
+            # when Jarvis is rambling. We pre-check a tight set of
+            # interrupt words BEFORE the wake-only filter so they get
+            # honoured even mid-sentence.
+            _STOP_KEYWORDS = {
+                "стоп", "стой", "тихо", "хватит",
+                "досить", "тиша", "вистачить",
+                "stop", "silence", "quiet", "enough",
+            }
+            _normalised_stop = text_lower.strip().strip(".,!?;:-—–").strip()
+            _is_universal_stop = (
+                _normalised_stop in _STOP_KEYWORDS
+                or any(_normalised_stop == f"{w} джарвіс" for w in _STOP_KEYWORDS)
+                or any(_normalised_stop == f"{w} джарвис" for w in _STOP_KEYWORDS)
+                or any(_normalised_stop == f"джарвіс {w}" for w in _STOP_KEYWORDS)
+                or any(_normalised_stop == f"джарвис {w}" for w in _STOP_KEYWORDS)
+            )
+            if self._bot_speaking and _is_universal_stop:
+                try:
+                    _stop_current_playback()
+                    self._stream.emit(
+                        "log",
+                        level="INFO",
+                        component="wake-gate",
+                        message=(
+                            f"universal stop during SPEAKING: {text[:40]!r} "
+                            "→ killed playback"
+                        ),
+                    )
+                except Exception:
+                    pass
+                # Also write interrupt.flag so DirectChat in-flight
+                # LLM call gets cancelled by the poller.
+                try:
+                    from pathlib import Path as _P
+                    import time as _t
+                    _flag = _P.home() / "Library/Application Support/jarvis/interrupt.flag"
+                    _flag.write_text(str(int(_t.time())))
+                except Exception:
+                    pass
+                return  # consume — don't process "стоп" as a query
             if self._bot_speaking:
                 if wake_hit:
                     try:
@@ -2882,8 +2975,12 @@ def _make_echo_filter_processor():
         fp = _bot_history_fingerprint(text)
         if not fp or len(fp) < 3:
             return False
-        now = _time.time()
-        for ts, bot_fp in _BOT_HISTORY:
+        # R34-S41 — monotonic clock + snapshot under lock so we
+        # don't iterate a list being mutated by the producer thread.
+        now = _time.monotonic()
+        with _BOT_HISTORY_LOCK:
+            snapshot = list(_BOT_HISTORY)
+        for ts, bot_fp in snapshot:
             if now - ts > _BOT_HISTORY_TTL_SEC:
                 continue
             if not bot_fp or len(bot_fp) < 3:
