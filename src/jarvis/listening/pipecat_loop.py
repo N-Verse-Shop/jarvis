@@ -141,6 +141,67 @@ class PipecatLoopConfig:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+def _resolve_input_device_index(
+    explicit_index: Optional[int],
+    name_substring: Optional[str],
+) -> Optional[int]:
+    """Resolve a PyAudio input device index from config.
+
+    Resolution order (first match wins):
+
+    1. ``input_device_index`` numeric — pass through (legacy/exact path)
+    2. ``voice_device`` substring — case-insensitive match against
+       ``pa.get_device_info_by_index(i)['name']`` for any device with
+       ``maxInputChannels > 0``
+    3. ``None`` — Pipecat falls back to PortAudio default
+
+    Why this matters: on macOS, Continuity Camera routes the iPhone
+    microphone as input[0] and quietly takes over the system default.
+    A legacy comment in this user's config.json captured the bug
+    perfectly — "daemon listened to silent iPhone mic → wake-word
+    never fired". The Pipecat path bypassed that bridge for two
+    rounds (R31..R34-S15) because we only read ``input_device_index``
+    and never the user-friendly ``voice_device`` substring.
+    """
+    if explicit_index is not None:
+        try:
+            return int(explicit_index)
+        except (TypeError, ValueError):
+            pass
+    if not name_substring or not str(name_substring).strip():
+        return None
+    name_lc = str(name_substring).strip().lower()
+    try:
+        import pyaudio  # lazy import — heavy module
+        pa = pyaudio.PyAudio()
+        try:
+            best_idx: Optional[int] = None
+            best_default = False
+            try:
+                default_idx = pa.get_default_input_device_info()["index"]
+            except (OSError, KeyError):
+                default_idx = None
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                if int(info.get("maxInputChannels", 0)) <= 0:
+                    continue
+                if name_lc not in str(info.get("name", "")).lower():
+                    continue
+                # Prefer the device that's already the system default
+                # if multiple matches (saves a re-open).
+                is_default = (i == default_idx)
+                if best_idx is None or (is_default and not best_default):
+                    best_idx = i
+                    best_default = is_default
+            return best_idx
+        finally:
+            pa.terminate()
+    except Exception:
+        # Probe failures must not block daemon boot — fall back to
+        # PortAudio default and let the user see the noisy log.
+        return None
+
+
 def _vad_threshold_from_legacy(
     aggressiveness: Optional[int], explicit: Optional[float]
 ) -> float:
@@ -218,8 +279,28 @@ def from_settings(cfg) -> PipecatLoopConfig:
         silence_ms = 700
     silence_ms = max(150, min(2000, silence_ms))
 
+    # R34-S16: resolve voice_device substring → numeric PortAudio
+    # index BEFORE handing it to Pipecat. The legacy listener
+    # honoured a string match ("MacBook" matches "Мікрофон MacBook
+    # Pro"); Pipecat only accepts an integer index, so we bridge it
+    # here. Falls back to None → PortAudio default.
+    resolved_in_idx = _resolve_input_device_index(
+        getattr(cfg, "input_device_index", None),
+        getattr(cfg, "voice_device", None),
+    )
+    # R34-S16: ``Settings`` is a strict frozen dataclass — keys we add
+    # via config.json (``piper_voice``, future tuning knobs) don't
+    # surface via getattr. Read them from the raw merged dict so power
+    # users can override without touching ``config.py``. Cheap: just a
+    # JSON re-read at boot.
+    try:
+        from ..config import load_config as _load_raw_config
+        _raw_cfg = _load_raw_config() or {}
+    except Exception:
+        _raw_cfg = {}
+    _piper_voice_override = _raw_cfg.get("piper_voice")
     return PipecatLoopConfig(
-        input_device_index=getattr(cfg, "input_device_index", None),
+        input_device_index=resolved_in_idx,
         output_device_index=getattr(cfg, "output_device_index", None),
         stt_mlx_model=getattr(cfg, "whisper_model", "LARGE_V3_TURBO"),
         stt_language=lang,
@@ -228,7 +309,11 @@ def from_settings(cfg) -> PipecatLoopConfig:
         chat_temperature=float(getattr(cfg, "ollama_chat_temperature", 0.4)),
         chat_num_predict=int(getattr(cfg, "ollama_chat_num_predict", 220)),
         chat_num_ctx=int(getattr(cfg, "ollama_chat_num_ctx", 2048)),
-        piper_voice_id=str(getattr(cfg, "piper_voice", "uk_UA-ukrainian_tts-medium")),
+        piper_voice_id=str(
+            _piper_voice_override
+            or getattr(cfg, "piper_voice", None)
+            or "uk_UA-ukrainian_tts-medium"
+        ),
         piper_download_dir=(
             Path(p) if (p := getattr(cfg, "piper_download_dir", None)) else None
         ),

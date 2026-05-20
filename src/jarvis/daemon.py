@@ -694,6 +694,101 @@ def main() -> None:
             daemon=True,
         ).start()
 
+    # R34-S17: mic-RMS probe. PyAudio on macOS allows multiple readers
+    # on the same input device — opening a second stream lets us sample
+    # the real signal independently of Pipecat's audio callback. Emits
+    # a `mic_probe` event every 30 s carrying the peak RMS over the
+    # last 5 seconds. The user (and the dashboard) can finally tell:
+    #   * RMS == 0          → daemon doesn't actually have mic permission
+    #                         (or PortAudio routed to a silent device)
+    #   * RMS > 0, no VAD   → Silero confidence threshold still too high
+    #   * RMS > 0, VAD fires→ pipeline is reaching STT; wake-word filter
+    #                         is the next suspect
+    # Disable with JARVIS_MIC_PROBE_DISABLE=true (e.g. for unit tests
+    # or single-mic devices that can't tolerate parallel readers).
+    if os.environ.get("JARVIS_MIC_PROBE_DISABLE", "").lower() not in (
+        "1", "true", "yes", "on"
+    ):
+        def _mic_probe_loop():
+            import time as _t
+            try:
+                import pyaudio  # noqa: F401
+                import numpy as np  # noqa: F401
+            except ImportError:
+                debug_log("mic-probe: pyaudio/numpy missing", "daemon")
+                return
+            from .ipc import get_stream as _gs
+            from .listening.pipecat_loop import _resolve_input_device_index
+            stream = _gs()
+            # Wait for the main pipeline to finish warmup so we don't
+            # contend on PortAudio's setup phase.
+            _t.sleep(20)
+            # Resolve the same device the daemon's voice pipeline uses
+            # (voice_device substring → numeric idx). If we can't, fall
+            # back to PortAudio default — better than silently nothing.
+            device_idx = _resolve_input_device_index(
+                getattr(cfg, "input_device_index", None),
+                getattr(cfg, "voice_device", None),
+            )
+            while True:
+                try:
+                    import pyaudio as _pa
+                    import numpy as _np
+                    pa = _pa.PyAudio()
+                    try:
+                        stm = pa.open(
+                            format=_pa.paInt16,
+                            channels=1,
+                            rate=16000,
+                            input=True,
+                            frames_per_buffer=1600,
+                            input_device_index=device_idx,
+                        )
+                        # Sample for 5 s, take peak RMS so a single
+                        # syllable is enough to register.
+                        peak = 0.0
+                        n_frames = 0
+                        for _ in range(50):  # 50 × 100 ms = 5 s
+                            try:
+                                data = stm.read(1600, exception_on_overflow=False)
+                            except Exception:
+                                break
+                            arr = _np.frombuffer(data, dtype=_np.int16)
+                            arr_f = arr.astype(_np.float32) / 32768.0
+                            rms = float(_np.sqrt(_np.mean(arr_f * arr_f)))
+                            if rms > peak:
+                                peak = rms
+                            n_frames += 1
+                        stm.close()
+                    finally:
+                        pa.terminate()
+                    # Resolve device name for the event.
+                    try:
+                        pa2 = _pa.PyAudio()
+                        name = pa2.get_device_info_by_index(
+                            device_idx if device_idx is not None
+                            else pa2.get_default_input_device_info()["index"]
+                        )["name"]
+                        pa2.terminate()
+                    except Exception:
+                        name = "unknown"
+                    stream.emit(
+                        "mic_probe",
+                        device_index=device_idx,
+                        device_name=name,
+                        peak_rms=round(peak, 5),
+                        sampled_frames=n_frames,
+                    )
+                except Exception as exc:
+                    debug_log(f"mic-probe failed: {exc!r}", "daemon")
+                _t.sleep(30)
+
+        threading.Thread(
+            target=_mic_probe_loop,
+            name="mic-probe",
+            daemon=True,
+        ).start()
+
     # Initialize dictation engine (hold-to-dictate)
     dictation = None
     if bool(getattr(cfg, "dictation_enabled", True)):

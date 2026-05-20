@@ -237,3 +237,101 @@ def test_hallucination_matching_is_case_insensitive():
     assert is_hallucination("Thank You For Watching") is True
     assert is_hallucination("дякую за перегляд") is True
     assert is_hallucination("ДЯКУЮ ЗА ПЕРЕГЛЯД") is True
+
+
+# ─── input device resolver (R34-S16) ─────────────────────────────────
+
+
+def test_resolve_input_device_index_passthrough():
+    """Explicit integer index passes through unchanged."""
+    from jarvis.listening.pipecat_loop import _resolve_input_device_index
+    assert _resolve_input_device_index(3, "MacBook") == 3
+    assert _resolve_input_device_index(0, None) == 0
+
+
+def test_resolve_input_device_index_no_input():
+    """Both args None / empty → returns None (let PortAudio pick)."""
+    from jarvis.listening.pipecat_loop import _resolve_input_device_index
+    assert _resolve_input_device_index(None, None) is None
+    assert _resolve_input_device_index(None, "") is None
+    assert _resolve_input_device_index(None, "   ") is None
+
+
+def test_resolve_input_device_index_bad_integer_falls_back_to_name():
+    """A garbage explicit-index → fall through to name match."""
+    from jarvis.listening.pipecat_loop import _resolve_input_device_index
+    # "garbage" can't be int-cast; with no name, returns None.
+    assert _resolve_input_device_index("garbage", None) is None
+
+
+def test_resolve_input_device_index_uses_pyaudio_when_named(monkeypatch):
+    """When a name substring is given, scan PyAudio devices."""
+    import jarvis.listening.pipecat_loop as loop_mod
+
+    class _FakePA:
+        def __init__(self):
+            self._closed = False
+
+        def get_device_count(self):
+            return 3
+
+        def get_default_input_device_info(self):
+            return {"index": 1}
+
+        def get_device_info_by_index(self, i):
+            return [
+                {"name": "iPhone Continuity", "maxInputChannels": 1},
+                {"name": "MacBook Pro Microphone", "maxInputChannels": 1},
+                {"name": "Speakers (output)", "maxInputChannels": 0},
+            ][i]
+
+        def terminate(self):
+            self._closed = True
+
+    class _FakeModule:
+        PyAudio = _FakePA
+
+    monkeypatch.setattr(
+        "builtins.__import__",
+        lambda name, *a, **kw: _FakeModule() if name == "pyaudio" else __builtins__["__import__"](name, *a, **kw)
+        if hasattr(__builtins__, "__import__") else __import__(name, *a, **kw),
+    )
+    # Substring match → returns the MacBook index (1).
+    assert loop_mod._resolve_input_device_index(None, "MacBook") == 1
+    # Match against iPhone instead.
+    assert loop_mod._resolve_input_device_index(None, "iPhone") == 0
+
+
+def test_resolve_input_device_index_no_match_returns_none(monkeypatch):
+    """Substring with no matching device → None (PortAudio default)."""
+    import jarvis.listening.pipecat_loop as loop_mod
+
+    class _FakePA:
+        def get_device_count(self): return 1
+        def get_default_input_device_info(self): return {"index": 0}
+        def get_device_info_by_index(self, i):
+            return {"name": "Some Other Mic", "maxInputChannels": 1}
+        def terminate(self): pass
+
+    class _FakeModule:
+        PyAudio = _FakePA
+
+    monkeypatch.setattr(
+        "builtins.__import__",
+        lambda name, *a, **kw: _FakeModule() if name == "pyaudio" else __import__(name, *a, **kw),
+    )
+    assert loop_mod._resolve_input_device_index(None, "NonExistent") is None
+
+
+def test_resolve_input_device_index_swallows_pyaudio_errors(monkeypatch):
+    """Probe failure → None, no exception leaks to daemon boot."""
+    import jarvis.listening.pipecat_loop as loop_mod
+
+    def _bad_import(name, *a, **kw):
+        if name == "pyaudio":
+            raise RuntimeError("PortAudio init crashed")
+        return __import__(name, *a, **kw)
+
+    monkeypatch.setattr("builtins.__import__", _bad_import)
+    # Must not raise.
+    assert loop_mod._resolve_input_device_index(None, "MacBook") is None
