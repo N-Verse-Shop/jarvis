@@ -711,6 +711,231 @@ def _next_track() -> tuple[bool, str]:
     return False, "Не знайшов музичний плеєр"
 
 
+def _previous_track() -> tuple[bool, str]:
+    """Skip to previous track. R34-S31."""
+    for app in ("Spotify", "Music"):
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", f'tell application "{app}" to previous track'],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                return True, f"Попередній трек у {app}"
+        except Exception:
+            continue
+    return False, "Не знайшов музичний плеєр"
+
+
+def _youtube_search(query: str) -> tuple[bool, str]:
+    """Open YouTube search results for the given query. R34-S31.
+
+    The user said "знайди X на YouTube" — we want them landed on the
+    actual YouTube SERP, not Google's web search showing YouTube as one
+    of many results. We URL-encode and open
+    ``https://www.youtube.com/results?search_query=...`` in the default
+    browser.
+    """
+    from urllib.parse import quote_plus
+    q = (query or "").strip()
+    if not q:
+        return False, "Не вказано що шукати"
+    url = f"https://www.youtube.com/results?search_query={quote_plus(q)}"
+    try:
+        subprocess.run(["open", url], timeout=10, check=True)
+        return True, f"Шукаю на YouTube: {q[:60]}"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
+def _open_in_browser(url: str, browser_app: str) -> tuple[bool, str]:
+    """Open URL in a specific browser (Safari/Chrome/Firefox/Arc). R34-S31.
+
+    Uses ``open -a <browser> <url>`` which forces the URL into the
+    named browser regardless of system default. Falls back to default
+    browser if the specified one isn't installed.
+    """
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    canonical = _resolve_app_name(browser_app)
+    try:
+        r = subprocess.run(
+            ["open", "-a", canonical, url],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return True, f"Відкрив {url} у {canonical}"
+        # Fallback: default browser via plain `open`.
+        r2 = subprocess.run(["open", url], timeout=10, capture_output=True)
+        if r2.returncode == 0:
+            return True, f"Відкрив {url} у браузері за замовчуванням"
+        return False, f"Не зміг відкрити {url} у {canonical}"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
+def _browser_new_tab(browser_hint: str = "") -> tuple[bool, str]:
+    """Open a new tab in the specified (or frontmost) browser. R34-S31.
+
+    If ``browser_hint`` is empty we figure out which browser is
+    frontmost via ``osascript`` and send Cmd+T to that one. Falls back
+    to Safari if no known browser is active.
+    """
+    browser = _resolve_app_name(browser_hint) if browser_hint else ""
+    if not browser or browser not in (
+        "Safari", "Google Chrome", "Firefox", "Arc", "Microsoft Edge", "Brave Browser",
+    ):
+        # Detect frontmost
+        try:
+            r = subprocess.run(
+                [
+                    "osascript", "-e",
+                    'tell application "System Events" to '
+                    'get name of first application process whose frontmost is true',
+                ],
+                capture_output=True, text=True, timeout=5,
+            )
+            front = (r.stdout or "").strip()
+            if front in ("Safari", "Google Chrome", "Firefox", "Arc", "Microsoft Edge", "Brave Browser"):
+                browser = front
+            else:
+                browser = "Safari"
+        except Exception:
+            browser = "Safari"
+    try:
+        # Make sure the browser is frontmost first
+        subprocess.run(
+            ["osascript", "-e", f'tell application "{browser}" to activate'],
+            timeout=5, capture_output=True,
+        )
+        # Cmd+T for new tab — works in all common browsers
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f'tell application "System Events" to '
+                f'tell process "{browser}" to keystroke "t" using {{command down}}',
+            ],
+            timeout=5, capture_output=True, check=True,
+        )
+        return True, f"Нова вкладка у {browser}"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
+def _browser_close_tab(browser_hint: str = "") -> tuple[bool, str]:
+    """Close current browser tab via Cmd+W. R34-S31."""
+    browser = _resolve_app_name(browser_hint) if browser_hint else ""
+    if not browser:
+        try:
+            r = subprocess.run(
+                [
+                    "osascript", "-e",
+                    'tell application "System Events" to '
+                    'get name of first application process whose frontmost is true',
+                ],
+                capture_output=True, text=True, timeout=5,
+            )
+            browser = (r.stdout or "").strip() or "Safari"
+        except Exception:
+            browser = "Safari"
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f'tell application "System Events" to '
+                f'tell process "{browser}" to keystroke "w" using {{command down}}',
+            ],
+            timeout=5, capture_output=True, check=True,
+        )
+        return True, f"Закрив вкладку у {browser}"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
+def _hide_app(app_name: str) -> tuple[bool, str]:
+    """Hide / minimize a Mac app to the Dock. R34-S31."""
+    canonical = _resolve_app_name(app_name) if app_name else ""
+    if not canonical:
+        # Hide frontmost
+        try:
+            subprocess.run(
+                [
+                    "osascript", "-e",
+                    'tell application "System Events" to '
+                    'set visible of (first process whose frontmost is true) to false',
+                ],
+                timeout=5, capture_output=True, check=True,
+            )
+            return True, "Сховав активний додаток"
+        except Exception as e:
+            return False, f"Помилка: {e}"
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f'tell application "System Events" to set visible of process "{canonical}" to false',
+            ],
+            timeout=5, capture_output=True, check=True,
+        )
+        return True, f"Сховав {canonical}"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
+def _quit_app(app_name: str) -> tuple[bool, str]:
+    """Quit a Mac app gracefully. R34-S31.
+
+    We deliberately use AppleScript ``quit`` (sends Cmd+Q to the
+    app's main dispatcher) rather than ``killall`` because:
+      1. ``quit`` lets the app save state, close documents cleanly,
+         and prompt the user about unsaved changes.
+      2. ``killall`` would also blow away background helpers that
+         share the bundle id (e.g. browser plugin processes).
+    """
+    canonical = _resolve_app_name(app_name) if app_name else ""
+    if not canonical or len(canonical) < 2:
+        return False, "Не вказано назву додатка"
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", f'tell application "{canonical}" to quit'],
+            timeout=10, capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            return True, f"Закрив {canonical}"
+        return False, f"Не зміг закрити {canonical}"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
+def _switch_window() -> tuple[bool, str]:
+    """Cycle to next window via Cmd+Tab. R34-S31."""
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                'tell application "System Events" to keystroke tab using {command down}',
+            ],
+            timeout=5, capture_output=True, check=True,
+        )
+        return True, "Перемикнув вікно"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
+def _show_desktop() -> tuple[bool, str]:
+    """Show desktop via Mission Control's "Show Desktop" gesture (F11). R34-S31."""
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                'tell application "System Events" to key code 103',  # F11
+            ],
+            timeout=5, capture_output=True, check=True,
+        )
+        return True, "Показую робочий стіл"
+    except Exception as e:
+        return False, f"Помилка: {e}"
+
+
 def _read_clipboard() -> tuple[bool, str]:
     """Return current clipboard contents."""
     try:
@@ -1618,14 +1843,89 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             created_ts=time.time(),
         ),
     ),
+    # ── R34-S31: CLOSE + NEW-TAB patterns MUST come before open_app —
+    # the existing open_app verb alternation (?:від|за)крий matches
+    # both "відкрий" AND "закрий", and the app-name capture is greedy
+    # enough to grab "нову вкладку" too. First-match-wins, so we
+    # place close_tab + quit_app + new_tab FIRST.
+    (
+        re.compile(
+            r"^\s*(?:закрий|закрити|закрой|закрыть)\s+(?:вкладку|таб|tab)\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="browser_close_tab",
+            description="Закриваю вкладку",
+            fn=lambda: _browser_close_tab(""),
+            created_ts=time.time(),
+        ),
+    ),
+    (
+        # quit_app — "закрий <app>" / "закрой <app>". Must NOT match
+        # "вкладку" / "таб" / "tab" (those go to close_tab above).
+        re.compile(
+            r"^\s*(?:закрий|закрити|закрой|закрыть|вийди\s+з|выйди\s+из)\s+"
+            r"(?:додатка?|додатку|програму|приложения?|приложение|app)?\s*"
+            r"(?!вкладку\b|таб\b|tab\b)"
+            r"([A-Za-zА-Яа-яЇїІіЄєҐґЁё][A-Za-zА-Яа-яЇїІіЄєҐґЁё0-9\s-]{1,30})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="quit_app",
+            description=f"Закриваю {_resolve_app_name(m.group(1).strip())}",
+            fn=lambda: _quit_app(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # browser_new_tab — handles all variants:
+    #   "новий таб", "нова вкладка", "новая вкладка", "new tab",
+    #   "відкрий нову вкладку", "відкрий нову вкладку у Safari",
+    #   "open new tab", "створи новий таб у Chrome"
+    # Verb prefix optional; "нов\w*" matches all gendered/number
+    # forms of UA/RU "новий|нова|нову|новую|новой|...".
+    (
+        re.compile(
+            r"^\s*(?:(?:відкрий|відкрити|відкривай|открой|открыть|открывай|"
+            r"створи|створити|create|open)\s+)?"
+            r"(?:нов\w*\s+|new\s+)?(?:вкладку|вкладка|вкладки|таб|tab)"
+            r"(?:\s+(?:у|в|in)\s+"
+            r"([A-Za-zА-Яа-яЇїІіЄєҐґЁё][A-Za-zА-Яа-яЇїІіЄєҐґЁё0-9\s-]{1,20}))?"
+            r"\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="browser_new_tab",
+            description=(
+                f"Нова вкладка у {_resolve_app_name(m.group(1).strip())}"
+                if m.group(1)
+                else "Нова вкладка"
+            ),
+            fn=lambda: _browser_new_tab((m.group(1) or "").strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # English: "open X" → open_app (compat with existing UA/RU
+    # patterns; previously this fell through to the LLM).
+    (
+        re.compile(
+            r"^\s*(?:please\s+)?(?:open|launch|start)\s+"
+            r"([A-Za-zА-Яа-яЇїІіЄєҐґЁё][A-Za-zА-Яа-яЇїІіЄєҐґЁё0-9\s-]{1,30})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: _make_open_app_action(m.group(1).strip(), "Opening"),
+    ),
     # ── apps ── (must match clean imperatives, no dots)
     # Round 28 (F71): UA infinitive forms (відкрити/запустити) added —
     # same rationale as RU patterns below: intent_judge re-fires often
     # rewrite imperatives as infinitives.
+    # R34-S31: tightened verb alternation to ONLY match OPEN verbs
+    # (від-, but NOT за-). Previously "(?:від|за)крий" caused "закрий
+    # Telegram" to match and OPEN Telegram instead of quitting it.
+    # The close patterns above now handle "за-" exclusively.
     (
         re.compile(
             r"^\s*(?:а\s+)?(?:будь\s+ласка\s+)?"
-            r"(?:(?:від|за)крий(?:те)?|(?:від|за)крити|відкривай(?:те)?)\s+"
+            r"(?:відкрий(?:те)?|відкрити|відкривай(?:те)?)\s+"
             r"(?:додаток\s+|програму\s+)?"
             r"([A-Za-zА-Яа-яЇїІіЄєҐґ][A-Za-zА-Яа-яЇїІіЄєҐґ0-9\s-]{1,30})\s*[!\.\?]?\s*$",
             re.IGNORECASE,
@@ -1877,6 +2177,117 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
                 os.environ.get("JARVIS_NOTION_DEFAULT_PAGE_ID", ""),
                 m.group(1).strip(),
             ),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S31: YouTube search ──
+    # "знайди на ютубі котики" / "найди на youtube cats"
+    (
+        re.compile(
+            r"^\s*(?:знайди|пошукай|шукай|найди|поищи|ищи)\s+"
+            r"(?:на\s+)?(?:youtube|ютубі|ютубе|ютуб)\s+"
+            r"(.{2,80})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="youtube_search",
+            description=f"Шукаю на YouTube: {m.group(1).strip()[:50]}",
+            fn=lambda: _youtube_search(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    (
+        re.compile(
+            r"^\s*(?:відкрий|открой|открыть)\s+(?:на\s+)?(?:youtube|ютубі|ютубе|ютуб)\s+"
+            r"(.{2,80})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="youtube_search",
+            description=f"Шукаю на YouTube: {m.group(1).strip()[:50]}",
+            fn=lambda: _youtube_search(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S31: open URL in specific browser ──
+    # "відкрий google.com у Chrome" / "открой github.com в Safari"
+    (
+        re.compile(
+            r"^\s*(?:відкрий|открой|откры(?:ть|вай(?:те)?)|(?:від|за)крий(?:те)?)\s+"
+            r"((?:https?://)?[a-z0-9-]+\.[a-z]{2,}(?:/\S*)?)\s+"
+            r"(?:у|в|in)\s+"
+            r"([A-Za-zА-Яа-яЇїІіЄєҐґЁё][A-Za-zА-Яа-яЇїІіЄєҐґЁё0-9\s-]{1,20})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="open_in_browser",
+            description=f"Відкриваю {m.group(1).strip()} у {_resolve_app_name(m.group(2).strip())}",
+            fn=lambda: _open_in_browser(m.group(1).strip(), m.group(2).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S31: previous track ──
+    (
+        re.compile(
+            r"^\s*(?:попередн\w+\s+трек|назад|перемкни\s+назад|повернись)\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="previous_track",
+            description="Попередній трек",
+            fn=_previous_track,
+            created_ts=time.time(),
+        ),
+    ),
+    (
+        re.compile(
+            r"^\s*(?:предыдущ\w+\s+трек|обратно|перемени\s+назад)\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="previous_track",
+            description="Предыдущий трек",
+            fn=_previous_track,
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S31: hide / minimize app ──
+    (
+        re.compile(
+            r"^\s*(?:сховай|сховати|приховай|сверни|сверни[те]?|спрячь|сховати)\s+"
+            r"([A-Za-zА-Яа-яЇїІіЄєҐґЁё][A-Za-zА-Яа-яЇїІіЄєҐґЁё0-9\s-]{1,30})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="hide_app",
+            description=f"Ховаю {_resolve_app_name(m.group(1).strip())}",
+            fn=lambda: _hide_app(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S31: switch window ──
+    (
+        re.compile(
+            r"^\s*(?:перемкни|переключи|switch)\s+(?:вікно|окно|window)\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="switch_window",
+            description="Перемикаю вікно",
+            fn=_switch_window,
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S31: show desktop ──
+    (
+        re.compile(
+            r"^\s*(?:покажи|показати|покажу|show)\s+(?:робочий\s+стіл|desktop|рабочий\s+стол)\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="show_desktop",
+            description="Показую робочий стіл",
+            fn=_show_desktop,
             created_ts=time.time(),
         ),
     ),

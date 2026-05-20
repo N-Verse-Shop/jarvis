@@ -366,6 +366,15 @@ class DashboardServer:
         app.router.add_get("/api/settings", self._h_settings_get)
         app.router.add_patch("/api/settings", self._h_settings_patch)
         app.router.add_post("/api/restart", self._h_restart)
+        # R34-S29: text chat fallback for when voice path is wedged.
+        # POST {"text": "...", "tts": false} → Ollama → reply text.
+        # POST /api/interrupt → signal voice thread to stop current TTS.
+        app.router.add_post("/api/chat", self._h_chat)
+        app.router.add_post("/api/interrupt", self._h_interrupt)
+        # R34-S30: test endpoint — push a TranscriptionFrame into the
+        # voice pipeline without going through the microphone.
+        app.router.add_post("/api/voice/inject", self._h_voice_inject)
+        app.router.add_get("/api/brain", self._h_brain)
         # OPTIONS fallback for every route (CORS preflight)
         app.router.add_route("OPTIONS", "/{tail:.*}", self._h_options)
 
@@ -1289,6 +1298,326 @@ class DashboardServer:
                 "Content-Length": str(len(body)),
             },
         )
+
+    # ── R34-S29: text-chat fallback ───────────────────────────────────
+    # When the voice path is wedged (mic perm, wake mishearing, Continuity
+    # rerouting…) the user still needs a way to drive Jarvis. This endpoint
+    # takes plain text, runs it through Ollama directly with the persona
+    # system prompt, and returns the reply. No Pipecat involvement — the
+    # text-chat path stays alive even when the voice loop is on the floor.
+    async def _h_chat(self, req):
+        from aiohttp import web
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid JSON"}, status=400
+            )
+        text = str(body.get("text", "")).strip()
+        if not text:
+            return web.json_response(
+                {"ok": False, "error": "empty text"}, status=400
+            )
+        if len(text) > 8000:
+            return web.json_response(
+                {"ok": False, "error": "text too long (max 8000 chars)"},
+                status=400,
+            )
+        # Pull live config so model/url match what the daemon uses.
+        # R34-S30 fix: the previous import was `from ..config import settings`
+        # which doesn't exist — the public API is `load_settings()`. The
+        # ImportError silently swallowed every chat call into the qwen3:8b
+        # default, which (a) ignores `think:false` over the OpenAI shim
+        # and (b) dumps everything to `reasoning` → empty `content`.
+        cfg = None
+        base_url = "http://127.0.0.1:11434"
+        # qwen2.5:3b — chosen because it has no reasoning mode (the
+        # OpenAI /v1 shim dumps qwen3's output into `reasoning` and
+        # leaves `content` empty, so Pipecat hears nothing).
+        model = "qwen2.5:3b"
+        num_predict = 220
+        num_ctx = 4096
+        try:
+            from ..config import load_settings
+            cfg = load_settings()
+            base_url = str(getattr(cfg, "ollama_base_url", base_url))
+            model = str(getattr(cfg, "ollama_chat_model", model))
+            num_predict = int(getattr(cfg, "ollama_chat_num_predict", num_predict))
+            num_ctx = int(getattr(cfg, "ollama_chat_num_ctx", num_ctx))
+        except Exception as exc:
+            log.warning("chat: settings load failed: %r", exc)
+        # Build the same system prompt the voice pipeline assembles.
+        try:
+            from ..system_prompt import build_system_prompt
+            system_prompt = build_system_prompt("Jarvis")
+        except Exception as exc:
+            log.warning("chat: system prompt build failed: %r", exc)
+            system_prompt = (
+                "Ти — Jarvis, особистий голосовий асистент. "
+                "Відповідай стисло, по суті."
+            )
+        # R34-S30: switched from /v1/chat/completions (OpenAI shim) to
+        # native /api/chat. The OpenAI shim IGNORES the `think: false`
+        # flag — confirmed empirically: a qwen3:8b call over /v1 still
+        # routes every token into `message.reasoning` regardless of
+        # whether `think:false` is at top level or under `options`.
+        # The native /api/chat endpoint honours `think:false` properly
+        # and returns `{"message": {"content": "..."}}`.
+        import aiohttp as _ah
+        url = base_url.rstrip("/") + "/api/chat"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            "stream": False,
+            "think": False,
+            "options": {
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
+            },
+        }
+        try:
+            timeout = _ah.ClientTimeout(total=180)
+            async with _ah.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        return web.json_response(
+                            {
+                                "ok": False,
+                                "error": f"ollama {resp.status}: {err_text[:300]}",
+                            },
+                            status=502,
+                        )
+                    data = await resp.json()
+        except asyncio.TimeoutError:
+            return web.json_response(
+                {"ok": False, "error": "Ollama timed out (180s)"}, status=504
+            )
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "error": f"Ollama unreachable: {exc!r}"},
+                status=502,
+            )
+        # R34-S30: native /api/chat returns {"message": {"content": "..."}}
+        # — NOT the OpenAI-shim `choices[0].message.content` shape.
+        reply = ""
+        try:
+            reply = str(data.get("message", {}).get("content", "") or "")
+        except Exception:
+            pass
+        # Best-effort: emit a stream event so audit picks up the
+        # text-chat exchange alongside voice turns.
+        try:
+            from ..ipc import get_stream
+            get_stream().emit(
+                "chat_text",
+                source="dashboard",
+                user_text=text[:500],
+                reply_text=(reply or "")[:500],
+                model=model,
+            )
+        except Exception:
+            pass
+        return web.json_response(
+            {"ok": True, "reply": reply, "model": model}
+        )
+
+    # ── R34-S29: interrupt current Jarvis turn (stop TTS/LLM) ────────
+    # The voice thread polls ``~/Library/Application Support/jarvis/
+    # interrupt.flag`` once per pipeline tick. When the flag exists the
+    # voice thread pushes an InterruptionFrame into its PipelineTask and
+    # deletes the flag. Dashboard just needs to touch the file.
+    async def _h_interrupt(self, req):
+        from aiohttp import web
+        try:
+            base = _dashboard_data_dir()
+            flag = base / "interrupt.flag"
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text(str(time.time()), encoding="utf-8")
+            # Also emit an event so the dashboard sees the action.
+            try:
+                from ..ipc import get_stream
+                get_stream().emit(
+                    "interrupt_request",
+                    source="dashboard",
+                )
+            except Exception:
+                pass
+            return web.json_response({"ok": True, "flag": str(flag)})
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "error": repr(exc)}, status=500
+            )
+
+    # ── R34-S30: voice inject (test endpoint) ─────────────────────
+    # Writes a flag file that the voice pipeline's interrupt poller
+    # picks up and converts to a TranscriptionFrame. Used by smoke
+    # tests and the dashboard's voice-test button so we can verify
+    # the full LLM+TTS path without needing the user to speak.
+    async def _h_voice_inject(self, req):
+        from aiohttp import web
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "error": "invalid JSON"}, status=400
+            )
+        text = str(body.get("text", "")).strip()
+        if not text:
+            return web.json_response(
+                {"ok": False, "error": "empty text"}, status=400
+            )
+        if len(text) > 2000:
+            return web.json_response(
+                {"ok": False, "error": "text too long"}, status=400
+            )
+        try:
+            base = _dashboard_data_dir()
+            base.mkdir(parents=True, exist_ok=True)
+            flag = base / "inject_transcription.flag"
+            flag.write_text(text, encoding="utf-8")
+            try:
+                from ..ipc import get_stream
+                get_stream().emit(
+                    "voice_inject",
+                    source="dashboard",
+                    text=text[:200],
+                )
+            except Exception:
+                pass
+            return web.json_response({"ok": True, "flag": str(flag)})
+        except Exception as exc:
+            return web.json_response(
+                {"ok": False, "error": repr(exc)}, status=500
+            )
+
+    # ── R34-S27: brain-view data (Three.js dashboard tab) ────────────
+    # Reads cheaply from existing sources — no new computation in the
+    # voice loop. The endpoint compiles "regions" from skill categories
+    # + memory facts + recent audit events, each "neuron" maps to one
+    # underlying record. Firing rate = events in the last 5 minutes.
+    # Cached at 5s TTL to keep cost negligible during fast UI polling.
+    async def _h_brain(self, req):
+        from aiohttp import web
+        # Tiny TTL cache so a 1 Hz UI poll doesn't hammer the audit DB.
+        cache = getattr(self, "_brain_cache", None)
+        now = time.time()
+        if cache and now - cache.get("ts", 0) < 5.0:
+            return web.json_response(cache["data"])
+        try:
+            data = await asyncio.get_event_loop().run_in_executor(
+                None, self._brain_snapshot
+            )
+        except Exception as exc:
+            log.warning("brain snapshot failed: %r", exc)
+            data = {"ok": False, "error": repr(exc), "regions": []}
+        self._brain_cache = {"ts": now, "data": data}
+        return web.json_response(data)
+
+    def _brain_snapshot(self) -> dict:
+        """Build the brain-view payload. Runs in a thread to keep the
+        event loop free during DB reads."""
+        out = {"ok": True, "regions": [], "totals": {}}
+        # ── Region 1: Skills, grouped by ``risk`` tier ────────────────
+        try:
+            from ..skills import get_skill_store
+            skills = get_skill_store().list_skills() or []
+        except Exception:
+            skills = []
+        skill_groups: dict = {}
+        for sk in skills:
+            tier = str(getattr(sk, "risk", None) or "info").lower()
+            skill_groups.setdefault(tier, []).append(sk)
+        for tier, group in sorted(skill_groups.items()):
+            neurons = []
+            for sk in group:
+                name = getattr(sk, "name", None) or "?"
+                neurons.append({
+                    "id": f"skill:{name}",
+                    "label": str(name),
+                    "weight": 1.0,
+                })
+            out["regions"].append({
+                "id": f"skills:{tier}",
+                "label": f"Skills · {tier}",
+                "kind": "skills",
+                "tier": tier,
+                "neurons": neurons,
+                "firing_rate": 0.0,
+            })
+        # ── Region 2: Memory facts, top-N by recency ─────────────────
+        try:
+            from ..memory.facts import get_facts_store
+            store = get_facts_store()
+            facts = store.by_key("", limit=80) if store else []
+        except Exception:
+            facts = []
+        if facts:
+            neurons = []
+            now_ts = time.time()
+            for f in facts:
+                key = getattr(f, "key", "?")
+                try:
+                    score = float(f.score(now=now_ts))
+                except Exception:
+                    score = 1.0
+                neurons.append({
+                    "id": f"fact:{key}",
+                    "label": str(key)[:48],
+                    "weight": score,
+                })
+            out["regions"].append({
+                "id": "memory:facts",
+                "label": "Memory · Facts",
+                "kind": "memory",
+                "tier": "info",
+                "neurons": neurons,
+                "firing_rate": 0.0,
+            })
+        # ── Region 3: Recent audit events (firing rate) ──────────────
+        try:
+            from ..audit import get_audit_store
+            since_ts = time.time() - 300  # last 5 minutes
+            recent = get_audit_store().query(
+                since_ts=since_ts, limit=500
+            ) or []
+        except Exception:
+            recent = []
+        by_tool: dict = {}
+        for ev in recent:
+            tool = getattr(ev, "tool", None)
+            if not tool:
+                continue
+            by_tool[tool] = by_tool.get(tool, 0) + 1
+        if by_tool:
+            neurons = [
+                {
+                    "id": f"tool:{name}",
+                    "label": name,
+                    "weight": float(count),
+                }
+                for name, count in sorted(
+                    by_tool.items(), key=lambda kv: -kv[1]
+                )[:20]
+            ]
+            total = sum(by_tool.values())
+            out["regions"].append({
+                "id": "audit:tools",
+                "label": "Live · Tools (5min)",
+                "kind": "audit",
+                "tier": "live",
+                "neurons": neurons,
+                # Firing rate normalized 0..1 over the last 5 min.
+                "firing_rate": min(1.0, total / 60.0),
+            })
+        out["totals"] = {
+            "neurons": sum(len(r["neurons"]) for r in out["regions"]),
+            "regions": len(out["regions"]),
+        }
+        return out
 
     async def _h_ws_events(self, req):
         from aiohttp import web, WSMsgType

@@ -71,7 +71,11 @@ def _warmup_ollama(
     base_url: str,
     model: str,
     system_prompt: str,
-    timeout_s: float = 60.0,
+    timeout_s: float = 45.0,
+    # R34-S39 — back from 180. qwen3:8b cold-load on Hetzner remote
+    # is 30-40s; if it doesn't warm in 45s assume the network is bad
+    # and let the daemon proceed — the first real turn will retry.
+    # Holding the daemon for 3 minutes on every restart hurt UX.
 ) -> None:
     """Prime Ollama's KV cache with the actual system prompt.
 
@@ -127,8 +131,28 @@ def _warmup_whisper_mlx(model_repo: Optional[str]) -> None:
     takes ~250 ms on M-Pro. A no-content warmup with low-amplitude
     noise avoids both ENV-FILE warnings ("audio is empty") and
     decoder fast-paths that skip the heavy compile.
+
+    R34-S26 PROBLEM: MLX maintains a per-thread GPU stream. Warming up
+    in this background thread initialises the stream HERE — but Pipecat
+    runs the real transcription via ``asyncio.to_thread`` on a DIFFERENT
+    thread (the default ThreadPoolExecutor). That thread has no GPU
+    stream → ``RuntimeError: There is no Stream(gpu, 1) in current
+    thread.`` We now skip this warmup by default and let the first
+    real utterance pay the ~250 ms graph-compile on the executor
+    thread. Set ``JARVIS_WHISPER_WARMUP=true`` to re-enable for
+    benchmarking only (will break runtime transcription).
     """
     if not model_repo:
+        return
+    import os
+    if os.environ.get("JARVIS_WHISPER_WARMUP", "false").lower() not in (
+        "1", "true", "yes", "on"
+    ):
+        _log(
+            f"Whisper warmup SKIPPED ({model_repo}) — MLX per-thread "
+            "GPU streams prevent cross-thread reuse. First real "
+            "transcription pays the graph-compile cost (~250 ms)."
+        )
         return
     try:
         import mlx_whisper

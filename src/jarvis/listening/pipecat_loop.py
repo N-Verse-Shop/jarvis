@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re as _re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -440,6 +441,240 @@ def _system_prompt_for(lang: str) -> str:
 # ``self.push_frame()`` unmodified, never blocking or dropping a frame.
 
 
+# R34-S32: shared module-level registry of bot utterances. Populated
+# by fast_path._speak_ack and direct_chat._speak; consumed by the
+# echo filter to drop late mic-captured bot echoes that arrived past
+# the time-window gate. Kept module-level so all three live without
+# explicit cross-references.
+_BOT_HISTORY: list = []  # list of (ts, fingerprint)
+_BOT_HISTORY_TTL_SEC = 30.0
+_BOT_HISTORY_MAX = 8
+
+
+def _bot_history_fingerprint(text: str) -> str:
+    """Normalise text for echo comparison (lower, strip punct, collapse ws)."""
+    import re as _re
+    if not text:
+        return ""
+    s = _re.sub(r"[^\w\s]", " ", text.lower())
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _register_bot_utterance(text: str) -> None:
+    """Record a bot phrase + timestamp so the echo filter can match late echo.
+
+    Called by ``fast_path._speak_ack`` and ``direct_chat._speak``
+    immediately before invoking the macOS ``say`` subprocess. Best-
+    effort — never raises, never blocks.
+    """
+    import time as _time
+    if not text:
+        return
+    fp = _bot_history_fingerprint(text)
+    if not fp:
+        return
+    now = _time.time()
+    _BOT_HISTORY.append((now, fp))
+    cutoff = now - _BOT_HISTORY_TTL_SEC
+    # Trim in place — list is shared
+    _BOT_HISTORY[:] = [(t, f) for (t, f) in _BOT_HISTORY if t > cutoff]
+    if len(_BOT_HISTORY) > _BOT_HISTORY_MAX:
+        del _BOT_HISTORY[: len(_BOT_HISTORY) - _BOT_HISTORY_MAX]
+
+
+# R34-S34: Piper voice cache + interruptable playback state.
+#
+# We deliberately avoid macOS `say` because the only Russian voice
+# available natively is Milena (female + robotic), and `say` ignores
+# SIGINT — once started, the audio MUST play to completion. The
+# dashboard Stop button can't interrupt it.
+#
+# Piper gives:
+#  • The user-requested male voice (ru_RU-ruslan-medium — "billionaire
+#    CEO tone" per the project config comment).
+#  • Generation in ~300ms for a typical Jarvis reply (~80 chars).
+#  • Output is a WAV file → ``afplay`` subprocess plays it, and afplay
+#    DOES respond to SIGTERM/SIGKILL, so the Stop button works.
+#
+# We keep the loaded ``PiperVoice`` in module-level cache so we don't
+# pay the 1.6s ONNX load on every reply.
+_PIPER_VOICE_CACHE: dict = {}
+_PLAYBACK_LOCK: object | None = None  # asyncio.Lock created lazily
+_CURRENT_PLAYBACK_PROC: object | None = None  # subprocess.Popen of afplay
+
+
+def _get_piper_voice(voice_id: str = "ru_RU-ruslan-medium"):
+    """Load + cache a Piper voice ONNX model.
+
+    Returns the ``PiperVoice`` instance, or ``None`` if the model file
+    isn't on disk (caller should then fall back to macOS ``say``).
+    """
+    if voice_id in _PIPER_VOICE_CACHE:
+        return _PIPER_VOICE_CACHE[voice_id]
+    try:
+        from piper import PiperVoice
+        # Two possible locations — daemon vs warmup pre-stage.
+        for base in (
+            Path.home() / ".local/share/jarvis/piper",
+            Path.home() / ".local/share/jarvis/models/piper",
+        ):
+            onnx = base / f"{voice_id}.onnx"
+            if onnx.is_file():
+                voice = PiperVoice.load(str(onnx))
+                _PIPER_VOICE_CACHE[voice_id] = voice
+                return voice
+    except Exception as exc:
+        try:
+            debug_log(f"piper load failed for {voice_id}: {exc!r}", "pipecat")
+        except Exception:
+            pass
+    return None
+
+
+def _piper_synthesize(text: str, voice_id: str = "ru_RU-ruslan-medium") -> Path | None:
+    """Synthesise ``text`` via Piper, return path to WAV file.
+
+    Returns ``None`` if Piper isn't available (caller falls back to
+    ``say``). The WAV is written to a per-pid tmp file so concurrent
+    daemons don't clobber each other.
+    """
+    voice = _get_piper_voice(voice_id)
+    if voice is None:
+        return None
+    import os as _os
+    import time as _time
+    import wave as _wave
+    out = Path(f"/tmp/jarvis_tts_{_os.getpid()}_{int(_time.time() * 1000) % 100000}.wav")
+    try:
+        with _wave.open(str(out), "wb") as wav:
+            voice.synthesize_wav(text, wav)
+        return out
+    except Exception as exc:
+        try:
+            debug_log(f"piper synth failed: {exc!r}", "pipecat")
+        except Exception:
+            pass
+        return None
+
+
+async def _play_audio_interruptable(wav_path: Path) -> None:
+    """Play ``wav_path`` via ``afplay`` in a way that can be cancelled.
+
+    Stores the subprocess globally so an external Stop signal (the
+    interrupt flag from the dashboard) can ``terminate()`` it. The
+    file is deleted afterwards.
+    """
+    global _CURRENT_PLAYBACK_PROC
+    import asyncio as _asyncio
+    import subprocess as _sp
+    try:
+        proc = _sp.Popen(
+            ["afplay", str(wav_path)],
+            stdin=_sp.DEVNULL,
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+        )
+        _CURRENT_PLAYBACK_PROC = proc
+        loop = _asyncio.get_event_loop()
+        await loop.run_in_executor(None, proc.wait)
+    except Exception as exc:
+        try:
+            debug_log(f"afplay failed: {exc!r}", "pipecat")
+        except Exception:
+            pass
+    finally:
+        _CURRENT_PLAYBACK_PROC = None
+        try:
+            wav_path.unlink()
+        except Exception:
+            pass
+
+
+def _stop_current_playback() -> bool:
+    """Best-effort: kill the currently playing afplay (if any).
+
+    Returns True if we asked something to stop, False otherwise.
+    Called by the interrupt-flag poller when the Stop button is pressed.
+
+    R34-S39 — clears _CURRENT_PLAYBACK_PROC immediately so a fast
+    follow-up Stop press doesn't try to kill a stale handle. Also
+    schedules a non-blocking 2s wait in the default executor to reap
+    the zombie (without this, terminated afplay can linger as a
+    zombie until the parent exits because no .wait() was called).
+    """
+    global _CURRENT_PLAYBACK_PROC
+    proc = _CURRENT_PLAYBACK_PROC
+    if proc is None:
+        return False
+    _CURRENT_PLAYBACK_PROC = None
+    try:
+        proc.terminate()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            return False
+    # Reap in background so the zombie clears even if the original
+    # _play_audio_interruptable executor task was cancelled.
+    def _reap():
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+    try:
+        import threading as _th
+        _th.Thread(target=_reap, daemon=True, name="afplay-reap").start()
+    except Exception:
+        pass
+    return True
+
+
+def _cleanup_orphan_tts_wavs() -> int:
+    """Sweep /tmp for orphan jarvis_tts_*.wav files.
+
+    R34-S39 — called once at daemon startup. Each turn writes a temp
+    WAV; if the daemon crashes mid-turn the file leaks. With many
+    crash cycles these accumulate (each ~50-200 KB). Cheap sweep
+    once per boot. Files matching the current pid are skipped — they
+    may belong to the freshly-started process.
+    """
+    import os as _os
+    import time as _time
+    cleared = 0
+    try:
+        pid = _os.getpid()
+        for entry in Path("/tmp").glob("jarvis_tts_*.wav"):
+            try:
+                # Skip files that belong to a process still alive.
+                # Filename is jarvis_tts_<pid>_<ms>.wav
+                parts = entry.stem.split("_")
+                if len(parts) >= 3:
+                    fpid = int(parts[2])
+                    if fpid == pid:
+                        continue
+                    # Check if the owning PID is still alive.
+                    try:
+                        _os.kill(fpid, 0)
+                        continue  # alive, leave alone
+                    except OSError:
+                        pass  # process gone, file is orphan
+                # Also skip very recent files (<5s) to avoid races.
+                if _time.time() - entry.stat().st_mtime < 5.0:
+                    continue
+                entry.unlink()
+                cleared += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return cleared
+
+
 def _write_hud_state_atomic(state_value: str, level: float = 0.0) -> None:
     """Atomically write ``state.json`` for the Electron HUD coin.
 
@@ -519,6 +754,7 @@ def _make_event_stream_processor():
         CancelFrame,
         EndFrame,
         Frame,
+        InputAudioRawFrame,
         InterimTranscriptionFrame,
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
@@ -536,6 +772,62 @@ def _make_event_stream_processor():
     )
 
     from ..ipc import get_stream
+
+    # ── R34-S26: AudioRMSProbe — diagnostic processor right after
+    # LocalAudioInputTransport. Wake-word was not firing despite mic
+    # capturing real audio (mic_probe events showed RMS 0.013-0.076)
+    # but ZERO vad/stt events flowed for 30+ minutes. This probe
+    # confirms whether InputAudioRawFrame is reaching the pipeline.
+    # Emits ``pipecat_audio_rms`` every ~1 s with peak RMS over the
+    # window so the dashboard can see if Pipecat's stream is alive.
+    # Pure observer: never modifies the frame, never blocks.
+    class JarvisAudioProbeProcessor(FrameProcessor):
+        """Emit pipecat_audio_rms heartbeat on inbound audio frames."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._stream = get_stream()
+            self._last_emit_ts = 0.0
+            self._window_peak = 0.0
+            self._window_frame_count = 0
+            self._window_sample_rate = 0
+
+        async def process_frame(
+            self, frame: "Frame", direction: "FrameDirection"
+        ) -> None:
+            await super().process_frame(frame, direction)
+            try:
+                if isinstance(frame, InputAudioRawFrame):
+                    import time as _t
+                    # Compute RMS of this frame's int16 audio.
+                    try:
+                        import numpy as _np
+                        arr = _np.frombuffer(frame.audio, dtype=_np.int16)
+                        if arr.size:
+                            arr_f = arr.astype(_np.float32) / 32768.0
+                            rms = float(_np.sqrt((arr_f * arr_f).mean()))
+                            if rms > self._window_peak:
+                                self._window_peak = rms
+                            self._window_frame_count += 1
+                            self._window_sample_rate = int(
+                                getattr(frame, "sample_rate", 0) or 0
+                            )
+                    except Exception:
+                        pass
+                    now = _t.time()
+                    if now - self._last_emit_ts >= 1.0:
+                        self._stream.emit(
+                            "pipecat_audio_rms",
+                            peak_rms=round(self._window_peak, 5),
+                            frames_in_window=self._window_frame_count,
+                            sample_rate=self._window_sample_rate,
+                        )
+                        self._last_emit_ts = now
+                        self._window_peak = 0.0
+                        self._window_frame_count = 0
+            except Exception:
+                pass
+            await self.push_frame(frame, direction)
 
     class JarvisEventStreamProcessor(FrameProcessor):
         """Pure observer — translates Pipecat frames → events.jsonl.
@@ -714,7 +1006,7 @@ def _make_event_stream_processor():
                 self._stream.emit("tts_done", duration_ms=duration_ms)
                 return
 
-    return JarvisEventStreamProcessor
+    return JarvisEventStreamProcessor, JarvisAudioProbeProcessor
 
 
 def _make_state_processor():
@@ -858,6 +1150,416 @@ def _make_state_processor():
 # its normal chance to respond.
 
 
+def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
+    """Build the DirectChat FrameProcessor — bypasses Pipecat LLM+TTS.
+
+    Why we need it
+    --------------
+    Pipecat 1.2.1's OLLamaLLMService + LLMAssistantAggregator chain
+    becomes "wedged" after the first few minutes of uptime: the
+    OpenAI streaming client opens, Generating chat is logged, but
+    no chunks ever reach LLMAssistantAggregator — so no
+    LLMTextFrame, no TTSStartedFrame, no audio. We confirmed
+    via direct curl that Ollama itself is healthy and answers in
+    <2s. The bug is internal to Pipecat's streaming bridge.
+
+    Rather than patch Pipecat, we bypass it. Every TranscriptionFrame
+    that makes it past the wake gate is:
+      1. Converted to an Ollama `/api/chat` call (think:false,
+         the native endpoint, which we already proved works
+         reliably for the /api/chat dashboard route).
+      2. The reply is spoken via macOS `say` (which doesn't
+         depend on Pipecat at all).
+      3. State events are emitted so the dashboard SPEAKING ring
+         lights up while we're talking.
+      4. The frame is CONSUMED — never forwarded to the broken
+         LLM chain.
+    """
+    import asyncio as _asyncio
+
+    from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
+        Frame,
+        TranscriptionFrame,
+        TTSStartedFrame,
+        TTSStoppedFrame,
+    )
+    from pipecat.processors.frame_processor import (
+        FrameDirection,
+        FrameProcessor,
+    )
+
+    from ..ipc import get_stream
+
+    ollama_url = cfg.ollama_base_url.rstrip("/") + "/api/chat"
+    model = cfg.chat_model
+    num_predict = int(cfg.chat_num_predict)
+    num_ctx = int(cfg.chat_num_ctx)
+
+    # System prompt assembled the same way as the regular Pipecat
+    # path so behaviour stays consistent. We import the helper
+    # locally so a missing personas dir doesn't break module load.
+    #
+    # R34-S37: this is now the BASE prompt only — the per-turn
+    # language lock + recent-conversation digest are appended inside
+    # process_frame() so we always re-state them in the freshest
+    # detected language.
+    try:
+        from ..system_prompt import build_system_prompt
+        _base_system_prompt = build_system_prompt("Jarvis")
+    except Exception:
+        _base_system_prompt = (
+            "Ты — Джарвис, голосовой ассистент. Отвечай 1-2 фразами. "
+            "Никаких префиксов, никаких эмодзи, никаких списков."
+        )
+
+    class JarvisDirectChatProcessor(FrameProcessor):
+        """Direct LLM+TTS bypass for the user-facing voice turn."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._stream = get_stream()
+            self._busy = False  # crude reentrancy guard
+            # Reusable aiohttp session — single connection pool,
+            # finite keepalive so stale-NAT problems are bounded.
+            self._session = None
+
+        async def _ensure_session(self):
+            if self._session is None or self._session.closed:
+                import aiohttp as _ah
+                # R34-S39 — tightened timeouts.
+                # Previously total=60 / sock_read=45 caused 60s hangs when
+                # Tailscale dropped NAT mid-stream. qwen3:8b warm-eval of
+                # ≤140 predict tokens completes in <8s on the Hetzner GPU;
+                # 20s total is generous, 12s sock_read is the tightest
+                # SLA the network reliably meets.
+                timeout = _ah.ClientTimeout(
+                    total=20, connect=3, sock_connect=3, sock_read=12,
+                )
+                self._session = _ah.ClientSession(timeout=timeout)
+            return self._session
+
+        async def cleanup(self) -> None:
+            # R34-S39 — graceful shutdown so the daemon doesn't leak
+            # FIN_WAIT TCP sockets to Ollama across launchctl restarts.
+            # Pipecat calls FrameProcessor.cleanup() during pipeline
+            # teardown; we close the aiohttp session here.
+            try:
+                if self._session is not None and not self._session.closed:
+                    await self._session.close()
+                    # aiohttp connector close grace — without this
+                    # SSLContext is reaped abruptly and the connector
+                    # logs a "Unclosed connector" warning.
+                    await _asyncio.sleep(0.25)
+            except Exception as exc:
+                debug_log(
+                    f"direct_chat: session cleanup failed: {exc!r}",
+                    "pipecat",
+                )
+            try:
+                await super().cleanup()
+            except Exception:
+                pass
+
+        async def _call_ollama(self, text: str, lang: str = "ru") -> str:
+            session = await self._ensure_session()
+            # R34-S39 — system prompt cached per-language for the lifetime
+            # of this processor. Previously we rebuilt the prompt on every
+            # turn (including a synchronous SQLite call for the digest),
+            # which broke Ollama's prefix-cache and forced qwen3:8b to
+            # re-eval ~700-800 prompt tokens at ~50 tok/s = 14s+ per turn.
+            # The base+lock combo is stable for the conversation; one
+            # cache hit per language saves the prompt-eval cost entirely.
+            cache = getattr(self, "_sys_prompt_cache", None)
+            if cache is None:
+                cache = {}
+                self._sys_prompt_cache = cache
+            sys_prompt = cache.get(lang)
+            if sys_prompt is None:
+                try:
+                    from ..memory.self_learning import language_lock_block
+                    lock = language_lock_block(lang)
+                except Exception:
+                    lock = ""
+                parts = [_base_system_prompt]
+                if lock:
+                    parts.append(lock)
+                sys_prompt = "\n\n".join(p for p in parts if p)
+                cache[lang] = sys_prompt
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": text},
+                ],
+                "stream": False,
+                "think": False,
+                # R34-S39 — pass keep_alive so the model stays in VRAM
+                # between turns. Without this, after ~5min idle Ollama
+                # unloads qwen3:8b → next turn pays 30-60s reload.
+                "keep_alive": "24h",
+                "options": {
+                    "num_predict": num_predict,
+                    "num_ctx": num_ctx,
+                    "temperature": float(getattr(cfg, "chat_temperature", 0.3)),
+                },
+            }
+            try:
+                async with session.post(ollama_url, json=payload) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        debug_log(
+                            f"direct_chat: ollama {resp.status}: {body[:200]}",
+                            "pipecat",
+                        )
+                        return ""
+                    data = await resp.json()
+                    return str(data.get("message", {}).get("content", "") or "")
+            except Exception as exc:
+                debug_log(f"direct_chat: ollama call failed: {exc!r}", "pipecat")
+                return ""
+
+        async def _speak(self, text: str, direction: "FrameDirection") -> None:
+            """Speak the text via macOS `say`. Blocking subprocess in
+            executor so we don't stall the event loop. We pick a
+            Russian voice (Yuri or Milena) and a slightly faster
+            rate so responses feel snappy.
+
+            CRITICAL (R34-S30): we push REAL Pipecat
+            ``TTSStartedFrame``/``BotStartedSpeakingFrame`` (and their
+            stopped counterparts) downstream so the
+            ``JarvisStateProcessor`` at the pipeline tail can update
+            ``state.json`` to "SPEAKING", which is what the Electron
+            HUD overlay (the coin) watches. Without these frames the
+            coin stays stuck on LISTENING even though Jarvis is
+            actively talking.
+            """
+            if not text:
+                return
+            # R34-S32: register phrase before speaking for echo filter.
+            try:
+                _register_bot_utterance(text)
+            except Exception:
+                pass
+            # Belt-and-suspenders: write state.json directly so the HUD
+            # coin flips to SPEAKING even if Pipecat's task is sluggish.
+            try:
+                _write_hud_state_atomic("SPEAKING", level=1.0)
+            except Exception:
+                pass
+            try:
+                self._stream.emit("bot_started_speaking", text=text[:200])
+                self._stream.emit("state", state="SPEAKING", level=1.0)
+                await self.push_frame(TTSStartedFrame(), direction)
+                await self.push_frame(BotStartedSpeakingFrame(), direction)
+            except Exception as exc:
+                debug_log(
+                    f"direct_chat: TTS-start frames failed: {exc!r}",
+                    "pipecat",
+                )
+
+            # R34-S34: Piper male voice (Ruslan) + interruptable
+            # ``afplay``. Falls back to ``say`` if Piper unavailable.
+            wav_path = await _asyncio.get_event_loop().run_in_executor(
+                None, _piper_synthesize, text,
+            )
+            if wav_path is not None:
+                await _play_audio_interruptable(wav_path)
+            else:
+                def _run_say() -> None:
+                    import subprocess as _sp
+                    try:
+                        _sp.run(
+                            ["say", "-v", "Milena", "-r", "210", text],
+                            check=False,
+                            timeout=60,
+                        )
+                    except Exception as exc:
+                        debug_log(
+                            f"say subprocess failed: {exc!r}", "pipecat",
+                        )
+                loop = _asyncio.get_event_loop()
+                await loop.run_in_executor(None, _run_say)
+            # R34-S39 — drop the post-playback drain sleep. The
+            # fingerprint-based echo filter catches late mic-captured
+            # echo for up to _BOT_HISTORY_TTL_SEC (30s), so we don't need
+            # the artificial dead-time anymore. Saves ~1s before the
+            # user can start the next turn.
+            try:
+                await self.push_frame(BotStoppedSpeakingFrame(), direction)
+                await self.push_frame(TTSStoppedFrame(), direction)
+                self._stream.emit("bot_stopped_speaking")
+                self._stream.emit("state", state="LISTENING", level=1.0)
+            except Exception:
+                pass
+            try:
+                _write_hud_state_atomic("LISTENING", level=1.0)
+            except Exception:
+                pass
+
+        async def process_frame(
+            self, frame: "Frame", direction: "FrameDirection"
+        ) -> None:
+            await super().process_frame(frame, direction)
+            # Only TranscriptionFrames go through the bypass.
+            if not isinstance(frame, TranscriptionFrame):
+                await self.push_frame(frame, direction)
+                return
+            text = (frame.text or "").strip()
+            if not text:
+                await self.push_frame(frame, direction)
+                return
+            # R34-S38: drop wake-word-only utterances BEFORE LLM call.
+            # When STT transcribes only the wake-word (often mis-heard:
+            # "Джарвіс" → "Джагвіз", "Джаглись", "Jarvis", ...), there's
+            # no question for the LLM to answer. Smaller models then
+            # HALLUCINATE responses (observed: "сейчас 00:25" from a
+            # bare "джаглись" input — model invents a time query).
+            #
+            # Strategy: strip punctuation, lowercase, check word count.
+            # If the remaining text is just a wake-word variant or ≤1
+            # short token, speak a short "Слухаю" ack and return —
+            # don't waste an LLM call or risk a hallucination loop.
+            _normalised = _re.sub(r"[\s\.\!\?,\-—…\"']+", " ", text).strip().lower()
+            _wake_variants = {
+                "джарвіс", "джарвис", "джервіс", "джервис", "jarvis",
+                "джагвіз", "джагвис", "джагвіс", "джаглись", "джаквіс",
+                "джервиз", "джервиз", "джарвиз", "джарвиз",
+            }
+            _tokens = _normalised.split()
+            _is_wake_only = (
+                _normalised in _wake_variants
+                or (len(_tokens) == 1 and any(
+                    _tokens[0].startswith(w[:5]) for w in _wake_variants
+                ))
+            )
+            if _is_wake_only:
+                debug_log(
+                    f"direct_chat: skipping LLM for wake-only input: {text!r}",
+                    "pipecat",
+                )
+                # Just emit a short audible ack so user knows mic is hot.
+                if not self._busy:
+                    self._busy = True
+                    try:
+                        # Detect lang for the ack so RU/UK speakers
+                        # both feel native.
+                        try:
+                            from ..memory.self_learning import (
+                                detect_user_language,
+                            )
+                            _ack_lang = detect_user_language(text)
+                        except Exception:
+                            _ack_lang = "ru"
+                        ack = (
+                            "Слухаю." if _ack_lang == "uk" else "Слушаю."
+                        )
+                        self._stream.emit("sentence", text=ack, lang=_ack_lang)
+                        await self._speak(ack, direction)
+                    finally:
+                        self._busy = False
+                return
+            if self._busy:
+                # Another direct chat call in flight — drop the new one
+                # to avoid speaker overlap.
+                return
+            self._busy = True
+            try:
+                # Flip state to THINKING so the HUD coin's orange glow
+                # comes up while we wait on Ollama.
+                try:
+                    _write_hud_state_atomic("THINKING", level=0.5)
+                except Exception:
+                    pass
+                self._stream.emit(
+                    "state", state="THINKING", level=0.5,
+                )
+                self._stream.emit(
+                    "direct_chat_user", text=text[:300],
+                )
+                # R34-S37 — detect input language per-turn so the
+                # system prompt's language lock matches what the user
+                # actually said. Falls back to cfg.active_language on
+                # any detector failure.
+                try:
+                    from ..memory.self_learning import detect_user_language
+                    detected_lang = detect_user_language(text)
+                except Exception:
+                    detected_lang = cfg.active_language or "ru"
+                reply = await self._call_ollama(text, lang=detected_lang)
+                debug_log(
+                    f"direct_chat: reply len={len(reply)}: {reply[:80]!r}",
+                    "pipecat",
+                )
+                self._stream.emit(
+                    "direct_chat_reply", text=reply[:500], model=model,
+                )
+                # Also emit a `sentence` event — that's the canonical
+                # event the HUD's captions panel watches to show the
+                # streaming reply line under the floating coin. Stock
+                # Pipecat's TTS chain emits these per-sentence; since
+                # we bypass that chain, we emit one whole-reply
+                # ``sentence`` here so the user sees the text.
+                try:
+                    self._stream.emit(
+                        "sentence",
+                        text=(reply or "").strip()[:1000],
+                        lang="ru",
+                    )
+                except Exception:
+                    pass
+                # Also emit ``stt_final``-shaped event with the user's
+                # query text so the caption "user" row populates even
+                # when the path didn't come from real STT (i.e. when
+                # the request was injected via /api/voice/inject for
+                # tests). Real STT injects its own stt_final upstream
+                # via the event stream processor.
+                try:
+                    self._stream.emit(
+                        "stt_final",
+                        text=text[:500],
+                        lang="ru",
+                        confidence=1.0,
+                        duration_ms=0,
+                    )
+                except Exception:
+                    pass
+                if reply.strip():
+                    await self._speak(reply.strip(), direction)
+                else:
+                    # Empty reply — speak a polite fallback so the user
+                    # knows we heard them, not silence.
+                    fallback = (
+                        "Я не зрозумів, повтори, будь ласка."
+                        if detected_lang == "uk"
+                        else "Я не понял, повтори, пожалуйста."
+                    )
+                    await self._speak(fallback, direction)
+                # R34-S37 — self-learning: extract facts + record turn.
+                # Fire-and-forget; never delays the next turn.
+                try:
+                    from ..memory.self_learning import record_turn
+                    record_turn(
+                        user_text=text,
+                        bot_text=reply or "",
+                        lang=detected_lang,
+                        ollama_url=cfg.ollama_base_url,
+                        chat_model=cfg.chat_model,
+                        enable_llm_extract=True,
+                    )
+                except Exception as exc:
+                    debug_log(
+                        f"self-learn record_turn failed: {exc!r}",
+                        "pipecat",
+                    )
+            finally:
+                self._busy = False
+            # CONSUME the frame — do NOT forward to the broken LLM chain.
+
+    return JarvisDirectChatProcessor
+
+
 def _make_fast_path_processor():
     """Build the regex fast-path FrameProcessor.
 
@@ -866,14 +1568,23 @@ def _make_fast_path_processor():
     because the underlying ops use blocking ``subprocess.run``
     (AppleScript / ``open -a``) that would stall the asyncio loop
     and disrupt audio frame timing.
+
+    R34-S31: speaks confirmation via macOS ``say`` subprocess
+    directly (NOT ``TTSSpeakFrame``) because the Pipecat 1.2.1 TTS
+    chain wedges after a few minutes — same root cause that forced
+    the ``direct_chat`` bypass. Without this fix the user sees the
+    app launch but never hears "Зараз відкрию Safari".
     """
     import asyncio as _asyncio
 
     from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
         Frame,
         TextFrame,
         TranscriptionFrame,
-        TTSSpeakFrame,
+        TTSStartedFrame,
+        TTSStoppedFrame,
     )
     from pipecat.processors.frame_processor import (
         FrameDirection,
@@ -893,6 +1604,99 @@ def _make_fast_path_processor():
             # doesn't pay audit init cost when only Pipecat uses it.
             from ..audit import get_audit_store
             self._audit = get_audit_store()
+
+        async def _speak_ack(
+            self, text: str, direction: "FrameDirection"
+        ) -> None:
+            """Speak confirmation via macOS ``say`` and update HUD.
+
+            Mirrors :meth:`JarvisDirectChatProcessor._speak`. We can't
+            push a ``TTSSpeakFrame`` here because the Pipecat TTS
+            chain downstream is the very thing the ``direct_chat``
+            bypass was created to avoid (wedges after warmup, never
+            emits ``TTSStartedFrame``). Direct ``say`` + atomic
+            ``state.json`` writes keep the HUD coin in sync.
+            """
+            if not text:
+                return
+            # R34-S32: register the phrase BEFORE speaking so the
+            # echo filter has the fingerprint when mic-captured echo
+            # arrives ~2-3 s later.
+            try:
+                _register_bot_utterance(text)
+            except Exception:
+                pass
+            try:
+                _write_hud_state_atomic("SPEAKING", level=1.0)
+            except Exception:
+                pass
+            try:
+                self._stream.emit("bot_started_speaking", text=text[:200])
+                self._stream.emit("state", state="SPEAKING", level=1.0)
+                await self.push_frame(TTSStartedFrame(), direction)
+                await self.push_frame(BotStartedSpeakingFrame(), direction)
+            except Exception as exc:
+                debug_log(
+                    f"fast_path: TTS-start frames failed: {exc!r}",
+                    "pipecat",
+                )
+            # Also emit a `sentence` event so the HUD captions panel
+            # picks up the confirmation line.
+            try:
+                self._stream.emit(
+                    "sentence",
+                    text=text[:1000],
+                    lang="uk",
+                )
+            except Exception:
+                pass
+
+            # R34-S34: Piper (ru_RU-ruslan-medium = MALE, low tone)
+            # + interruptable ``afplay``. Falls back to macOS ``say``
+            # if Piper isn't available (e.g. ONNX missing).
+            wav_path = await _asyncio.get_event_loop().run_in_executor(
+                None, _piper_synthesize, text,
+            )
+            if wav_path is not None:
+                await _play_audio_interruptable(wav_path)
+            else:
+                # Fallback: macOS `say` with Milena (female RU). Not
+                # interruptable — user will have to wait for the
+                # current utterance to end.
+                def _run_say() -> None:
+                    import subprocess as _sp
+                    try:
+                        _sp.run(
+                            ["say", "-v", "Milena", "-r", "210", text],
+                            check=False,
+                            timeout=30,
+                        )
+                    except Exception as exc:
+                        debug_log(
+                            f"fast_path: say subprocess failed: {exc!r}",
+                            "pipecat",
+                        )
+                loop = _asyncio.get_event_loop()
+                await loop.run_in_executor(None, _run_say)
+            # Short drain so the BotStoppedSpeakingFrame fires AFTER
+            # the speaker buffer has fully flushed (matters for echo
+            # filter — see R34-S32 commentary).
+            # R34-S39 — drop the post-playback drain sleep. The
+            # fingerprint-based echo filter catches late mic-captured
+            # echo for up to _BOT_HISTORY_TTL_SEC (30s), so we don't need
+            # the artificial dead-time anymore. Saves ~1s before the
+            # user can start the next turn.
+            try:
+                await self.push_frame(BotStoppedSpeakingFrame(), direction)
+                await self.push_frame(TTSStoppedFrame(), direction)
+                self._stream.emit("bot_stopped_speaking")
+                self._stream.emit("state", state="LISTENING", level=1.0)
+            except Exception:
+                pass
+            try:
+                _write_hud_state_atomic("LISTENING", level=1.0)
+            except Exception:
+                pass
 
         async def process_frame(
             self, frame: "Frame", direction: "FrameDirection"
@@ -952,14 +1756,32 @@ def _make_fast_path_processor():
             # Suppress the original transcript (do not call push_frame
             # for it). Run the action in a worker thread so blocking
             # subprocess calls don't stall the event loop. Speak the
-            # acknowledgement via a TTSSpeakFrame so the user hears
-            # immediate feedback.
+            # acknowledgement via macOS ``say`` directly — the Pipecat
+            # TTS chain is wedged (the whole reason direct_chat exists).
+            try:
+                _write_hud_state_atomic("THINKING", level=0.5)
+            except Exception:
+                pass
+            self._stream.emit("state", state="THINKING", level=0.5)
             self._stream.emit(
                 "tool_call",
                 tool=action.name,
                 args={},
                 status="starting",
             )
+            # Also emit ``stt_final`` so the HUD captions show the
+            # user's matched command — real STT events already fired
+            # upstream, but injected /api/voice/inject paths need this.
+            try:
+                self._stream.emit(
+                    "stt_final",
+                    text=text[:500],
+                    lang="uk",
+                    confidence=1.0,
+                    duration_ms=0,
+                )
+            except Exception:
+                pass
             self._audit.emit(
                 kind="fast_path",
                 tool=action.name,
@@ -993,17 +1815,21 @@ def _make_fast_path_processor():
 
             # Speak the human-friendly description ("Зараз відкрию
             # Safari") regardless of success — the user still wants
-            # confirmation that the daemon heard them. We pass it
-            # downstream so the assistant-aggregator + TTS both see
-            # it: ``append_to_context=True`` (default) means it ends
-            # up in dialog history as if the LLM had said it.
+            # confirmation that the daemon heard them.
             ack = action.description or ("Готово." if ok else "Не вдалося.")
-            await self.push_frame(
-                TTSSpeakFrame(text=ack),
-                direction,
-            )
+            # On failure, append a short error hint so the user knows
+            # WHY it didn't work (e.g. "додаток не знайдено").
+            if not ok and msg and msg.strip():
+                # Keep the spoken hint short — `say` chokes on very
+                # long strings, and the dashboard already shows the
+                # full error message in the tool_call event log.
+                hint = msg.strip()
+                if len(hint) > 80:
+                    hint = hint[:80] + "..."
+                ack = f"{ack}. {hint}"
+            await self._speak_ack(ack, direction)
             # DO NOT push the original TranscriptionFrame — that's
-            # the whole point of the fast path.
+            # the whole point of the fast path. The frame stops here.
 
     return JarvisFastPathProcessor
 
@@ -1601,8 +2427,12 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
     import time as _time
 
     from pipecat.frames.frames import (
+        BotStartedSpeakingFrame,
+        BotStoppedSpeakingFrame,
         Frame,
+        InterruptionFrame,
         TranscriptionFrame,
+        TTSStartedFrame,
         TTSStoppedFrame,
     )
     from pipecat.processors.frame_processor import (
@@ -1631,6 +2461,9 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
             super().__init__(**kwargs)
             self._hot_until: float = 0.0  # unix ts; 0 = closed
             self._stream = get_stream()
+            # R34-S34: track bot SPEAKING state so a wake-word during
+            # active playback triggers barge-in (kill audio + interrupt).
+            self._bot_speaking: bool = False
 
         def _open_hot_window(self) -> None:
             self._hot_until = _time.time() + hot_window_seconds
@@ -1651,6 +2484,12 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
         ) -> None:
             await super().process_frame(frame, direction)
 
+            # R34-S34: track SPEAKING state for barge-in logic below.
+            if isinstance(frame, (BotStartedSpeakingFrame, TTSStartedFrame)):
+                self._bot_speaking = True
+            elif isinstance(frame, (BotStoppedSpeakingFrame, TTSStoppedFrame)):
+                self._bot_speaking = False
+
             # Bot just finished speaking — extend the hot window so
             # the user can follow up without re-saying the wake word.
             if isinstance(frame, TTSStoppedFrame):
@@ -1668,10 +2507,59 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
                 await self.push_frame(frame, direction)
                 return
 
+            # R34-S31: dashboard-injected transcripts bypass the wake
+            # gate entirely — the user already explicitly asked via
+            # /api/voice/inject or the chat UI, so requiring a wake
+            # word would be redundant friction. We ALSO open the hot
+            # window so any natural follow-up doesn't need a wake
+            # word either.
+            try:
+                if getattr(frame, "user_id", "") == "dashboard":
+                    self._open_hot_window()
+                    await self.push_frame(frame, direction)
+                    return
+            except Exception:
+                pass
+
             text_lower = text.lower()
             wake_hit = is_wake_word_detected(
                 text_lower, wake_word, wake_aliases, fuzzy_ratio
             )
+
+            # R34-S34: barge-in — if Jarvis is currently speaking AND
+            # the new transcript contains the wake-word, kill the
+            # current audio and let the new transcript propagate
+            # through the pipeline. Without wake-word during SPEAKING
+            # we IGNORE the transcript entirely (no interruption on
+            # background talk).
+            if self._bot_speaking:
+                if wake_hit:
+                    try:
+                        _stop_current_playback()
+                        self._stream.emit(
+                            "log",
+                            level="INFO",
+                            component="wake-gate",
+                            message="barge-in: wake-word during SPEAKING — killing playback",
+                        )
+                    except Exception:
+                        pass
+                    # Fall through to standard wake-hit handling below.
+                else:
+                    # Background talk while Jarvis is speaking → drop.
+                    try:
+                        self._stream.emit(
+                            "log",
+                            level="DEBUG",
+                            component="wake-gate",
+                            message=(
+                                "dropped during SPEAKING (no wake-word in "
+                                f"transcript): {text[:60]!r}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return  # consume frame, do NOT push
 
             # Hot window open → pass everything.
             if self._is_hot():
@@ -1787,7 +2675,28 @@ def _make_echo_filter_processor():
     # well after the BotStoppedSpeaking frame fires. Tuned empirically
     # on macOS CoreAudio + Piper TTS; raise if cross-talk leaks
     # through, lower if the user feels they can't interrupt.
-    _TAIL_SEC = 0.5
+    #
+    # R34-S32: bumped 0.5 → 3.0s. With direct ``say``-based TTS the
+    # `say` subprocess returns BEFORE the speaker has finished
+    # playing the audio (CoreAudio queues the buffer). Add to that
+    # ~500-1000 ms of room reverb + ~1-2 s mic-to-Whisper-to-
+    # FrameProcessor latency, and 0.5s wasn't catching ANY of the
+    # bot-echo. Live evidence (events.jsonl R34-S32): 6+ consecutive
+    # mic stt_finals matched Jarvis own utterances ("Шукаю на YouTube
+    # котики", "Сейчас 23 часа 24 минуты") with `Dropped by echo: 0`.
+    # 3.0s catches the realistic round-trip; if the user wants to
+    # barge in faster they can use the explicit Stop button.
+    # R34-S39 — dropped from 3.0s to 0.7s. The bot-utterance
+    # fingerprint registry (_BOT_HISTORY, 30s TTL) is the real defence
+    # against late echo; the 3.0s window was paranoid overkill that
+    # cost the user 3 full seconds of dead-time after every reply.
+    # 0.7s still catches the immediate room reverb (typically <250ms)
+    # plus STT pipeline latency, fingerprint covers the rest.
+    _TAIL_SEC = 0.7
+
+    # R34-S32: bot-utterance fingerprint match against the module-
+    # level _BOT_HISTORY registry catches mic-captured echoes that
+    # arrived past _TAIL_SEC due to room reverb + STT pipeline lag.
 
     # Whisper large-v3-turbo hallucination corpus. Sourced from the
     # legacy listener's ``KNOWN_HALLUCINATIONS`` set + new entries
@@ -1831,10 +2740,57 @@ def _make_echo_filter_processor():
         "подписывайтесь на канал",
         "подписывайтесь",
         "продолжение следует",
+        # R34-S32: extra fillers seen in live events.jsonl when mic
+        # was capturing room conversation. Whisper transcribed these
+        # short Russian/Ukrainian interjections every few seconds and
+        # they were polluting the pipeline → wake-gate burned cycles
+        # on each. All confirmed safe to drop (not real commands).
+        "так",
+        "ну",
+        "ну ладно",
+        "ну хорошо",
+        "хорошо",
+        "ладно",
+        "конечно",
+        "понятно",
+        "да",
+        "нет",
+        "не",
+        "ага",
+        "ага ага",
+        "ой",
+        "эй",
+        "э",
+        "ху",
+        "хм",
+        "м",
+        "ммм",
+        "а",
+        "о",
+        "у",
+        # Russian variant of "yes/no"
+        "да да",
+        "нет нет",
         # Misc Whisper-isms
         ".",
         "-",
         "—",
+        "…",
+        "...",
+        # R34-S39 — Jarvis's own fallback phrases (when LLM returned
+        # empty / timed-out). These get spoken via TTS, mic re-captures,
+        # STT transcribes back, and without permanent drop the user
+        # hears an infinite "Я не понял, повтори, пожалуйста" loop
+        # because each cycle pushes the 30s _BOT_HISTORY TTL forward.
+        # Permanent ban — these are NEVER valid user input.
+        "я не понял повтори пожалуйста",
+        "я не понял, повтори, пожалуйста",
+        "я не зрозумів повтори будь ласка",
+        "я не зрозумів, повтори, будь ласка",
+        "я не понял",
+        "я не зрозумів",
+        "слухаю",
+        "слушаю",
     })
 
     # Strip surrounding punctuation/whitespace for normalised match.
@@ -1857,6 +2813,39 @@ def _make_echo_filter_processor():
         words = normalised.split()
         if len(words) >= 3 and len(set(words)) == 1:
             return True
+        return False
+
+    def _looks_like_bot_echo(text: str) -> bool:
+        """True if ``text`` is plausibly a mic-capture of a recent bot
+        phrase (registered via ``_register_bot_utterance``).
+
+        Two-way containment: either the bot phrase is a substring of
+        the transcript (typical for shorter bot replies + mic noise
+        prefix/suffix), or the transcript is a substring of the bot
+        phrase (mic truncated the echo). Either match scores high
+        enough for a drop. Also: ≥70% word overlap.
+        """
+        fp = _bot_history_fingerprint(text)
+        if not fp or len(fp) < 3:
+            return False
+        now = _time.time()
+        for ts, bot_fp in _BOT_HISTORY:
+            if now - ts > _BOT_HISTORY_TTL_SEC:
+                continue
+            if not bot_fp or len(bot_fp) < 3:
+                continue
+            # bidirectional containment
+            if fp in bot_fp or bot_fp in fp:
+                return True
+            # word-level overlap — if ≥70% of transcript words match
+            # bot-phrase words, treat as echo. Catches partial mic
+            # capture / inserted filler words.
+            t_words = set(fp.split())
+            b_words = set(bot_fp.split())
+            if t_words and b_words:
+                overlap = len(t_words & b_words) / max(len(t_words), 1)
+                if overlap >= 0.7:
+                    return True
         return False
 
     class JarvisEchoFilterProcessor(FrameProcessor):
@@ -1888,7 +2877,13 @@ def _make_echo_filter_processor():
                 self._speak_end_ts = _time.time() + _TAIL_SEC
 
             if isinstance(frame, TranscriptionFrame):
-                # 1. Echo gate
+                # 0. Dashboard-injected transcripts always pass — the
+                # user explicitly asked, so echo-gate / hallucination
+                # filters shouldn't second-guess them.
+                if getattr(frame, "user_id", "") == "dashboard":
+                    await self.push_frame(frame, direction)
+                    return
+                # 1. Echo gate (time window after BotStoppedSpeaking)
                 if self._is_blocking_window():
                     try:
                         self._stream.emit(
@@ -1904,7 +2899,20 @@ def _make_echo_filter_processor():
                     except Exception:
                         pass
                     return  # drop
-                # 2. Hallucination gate
+                # 2. Bot-utterance fingerprint match (catches late echo
+                # that arrived past _TAIL_SEC — room reverb + STT lag).
+                if _looks_like_bot_echo(frame.text or ""):
+                    try:
+                        self._stream.emit(
+                            "log",
+                            level="DEBUG",
+                            component="echo-filter",
+                            message=f"dropped late bot-echo: {frame.text!r}",
+                        )
+                    except Exception:
+                        pass
+                    return  # drop
+                # 3. Hallucination gate
                 if _is_hallucination(frame.text or ""):
                     try:
                         self._stream.emit(
@@ -1965,6 +2973,14 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     )
     from pipecat.audio.vad.silero import SileroVADAnalyzer
     from pipecat.audio.vad.vad_analyzer import VADParams
+    # R34-S26: VADProcessor is a separate pipeline stage in Pipecat 1.2.x.
+    # The legacy ``vad_analyzer=`` kwarg on LocalAudioTransportParams was
+    # quietly accepted (Pydantic allows extras) but never wired in — see
+    # pipecat/transports/local/audio.py: LocalAudioTransportParams only
+    # exposes ``input_device_index`` / ``output_device_index``. Without a
+    # VADProcessor, no VADUserStartedSpeakingFrame ever fires, so the
+    # downstream STT/aggregator/wake-word stages get audio but no segments.
+    from pipecat.processors.audio.vad_processor import VADProcessor
     from pipecat.services.whisper.stt import (
         WhisperSTTServiceMLX,
         WhisperMLXSTTSettings,
@@ -1981,6 +2997,7 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     from pipecat.processors.aggregators.llm_context import LLMContext
     from pipecat.processors.aggregators.llm_response_universal import (
         LLMContextAggregatorPair,
+        LLMUserAggregatorParams,
     )
 
     # ── transport (mic + speakers) ───────────────────────────────────
@@ -2024,9 +3041,21 @@ def _build_pipeline(cfg: PipecatLoopConfig):
         # Sample-rate alignment: Whisper expects 16k; Piper UA model is
         # 22050 Hz. Pipecat resamples internally between processors.
         audio_in_sample_rate=cfg.sample_rate,
-        vad_analyzer=SileroVADAnalyzer(params=vad_params),
     )
     transport = LocalAudioTransport(params=transport_params)
+
+    # R34-S26: explicit VAD stage. In Pipecat 1.2.x, the LocalAudioTransport
+    # does NOT run VAD itself — the ``vad_analyzer=`` arg used to be wired
+    # into the input callback in older pipecat versions but was removed in
+    # the 1.2 transport refactor. We now run Silero VAD as a standalone
+    # processor right after the transport, which broadcasts the
+    # VADUserStartedSpeakingFrame / VADUserStoppedSpeakingFrame events the
+    # WhisperSTT service and LLM aggregator need to segment user turns.
+    # Audio frames continue to pass through unmodified (VADProcessor is
+    # pure observer + control-frame emitter).
+    vad_processor = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(params=vad_params),
+    )
 
     # ── STT ─────────────────────────────────────────────────────────
     # MLX path (on-device Apple Silicon). For Hetzner remote STT we
@@ -2044,8 +3073,27 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     # F95: use the new Settings-based API to silence DeprecationWarning.
     # The deprecated kwargs (``model=...``, ``voice_id=...``) still
     # work but pipecat plans to remove them; future-proof now.
+    #
+    # R34-S26: pass the ``.value`` (the HF repo string like
+    # ``mlx-community/whisper-large-v3-turbo``) NOT the MLXModel enum.
+    # mlx_whisper.transcribe() does ``isinstance(model, (str, bytes,
+    # os.PathLike))`` and rejects enums with: "expected str, bytes or
+    # os.PathLike object, not MLXModel". The error fires after every
+    # VAD-stop, killing every transcription attempt silently. The
+    # WhisperMLXSTTSettings type hint says ``str | MLXModel | None``
+    # but the runtime path doesn't unwrap the enum. Always pass .value.
+    #
+    # R34-S26 (cont.): force ``language`` so MLX whisper doesn't auto-
+    # detect English on every utterance. Without an explicit language,
+    # Whisper picked "en" for live transcriptions of Russian/Ukrainian
+    # voice and mangled them into English phrases like "I rarely
+    # remember…" — the wake-gate then dropped every utterance because
+    # "jarvis/джарвіс" never appeared in the English mistranscription.
     stt = WhisperSTTServiceMLX(
-        settings=WhisperMLXSTTSettings(model=mlx_model),
+        settings=WhisperMLXSTTSettings(
+            model=mlx_model.value,
+            language=cfg.stt_language or "ru",
+        ),
     )
 
     # ── LLM ─────────────────────────────────────────────────────────
@@ -2053,7 +3101,54 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     # OpenAI-compatible /v1/chat/completions endpoint. Hetzner runs
     # Ollama on the same host:port the legacy listener uses, so the
     # base_url config maps directly.
-    llm = OLLamaLLMService(
+    #
+    # R34-S30 (CRITICAL FIX, third revision):
+    #
+    #   v1 (failed): tried `extra_body={think:false}` for qwen3's
+    #   reasoning-dump — produced a stream Pipecat hung on.
+    #   v2 (insufficient): switched to qwen2.5:3b — fixes content but
+    #   stream STILL hangs after a few minutes of uptime.
+    #   v3 (this fix): the stock Pipecat ``create_client`` uses
+    #   ``keepalive_expiry=None`` with ``max_keepalive_connections=
+    #   100``. Over Tailscale to Hetzner, NAT mappings expire after
+    #   ~3 min idle. Pipecat reuses a stale TCP connection that the
+    #   remote already closed — the request hangs until the client's
+    #   request_timeout kicks in, which is also unbounded. Symptom:
+    #   ``lsof -p <daemon>`` shows ZERO connections to Ollama while
+    #   ``state: THINKING`` persists for 60-90 s.
+    #
+    #   Override ``create_client`` to set a finite keepalive_expiry
+    #   (60 s) AND wrap the httpx client with sane connect/read/
+    #   write timeouts. This forces stale connections to be dropped
+    #   instead of stuck in the pool.
+    class _RobustOLLamaLLMService(OLLamaLLMService):  # type: ignore[misc]
+        def create_client(self, base_url=None, **kwargs):
+            from openai import AsyncOpenAI
+            from openai import DefaultAsyncHttpxClient
+            import httpx as _httpx
+            return AsyncOpenAI(
+                api_key=kwargs.get("api_key", "ollama"),
+                base_url=base_url or kwargs.get("base_url"),
+                http_client=DefaultAsyncHttpxClient(
+                    limits=_httpx.Limits(
+                        max_keepalive_connections=10,
+                        max_connections=20,
+                        # Finite expiry — drop idle conns after 60 s
+                        # so stale-NAT-mapping reuses never happen.
+                        keepalive_expiry=60.0,
+                    ),
+                    timeout=_httpx.Timeout(
+                        # connect: 5s; reading body: 60s; writing: 10s;
+                        # acquiring a pool slot: 5s
+                        connect=5.0,
+                        read=60.0,
+                        write=10.0,
+                        pool=5.0,
+                    ),
+                ),
+            )
+
+    llm = _RobustOLLamaLLMService(
         settings=OllamaLLMSettings(model=cfg.chat_model),
         # Ollama's OpenAI shim is at /v1, not /api.
         base_url=cfg.ollama_base_url.rstrip("/") + "/v1",
@@ -2103,18 +3198,58 @@ def _build_pipeline(cfg: PipecatLoopConfig):
         messages=[{"role": "system", "content": system_prompt}],
         tools=tools_schema,
     )
-    aggregators = LLMContextAggregatorPair(context)
+    # R34-S30 (CRITICAL): the default VADUserTurnStartStrategy
+    # broadcasts an InterruptionFrame on EVERY VAD speech_started
+    # event. With a low-threshold Silero (0.30 to cope with the
+    # user's close-mic Russian speech), ambient noise was reliably
+    # firing speech_started about every 15-20 s — which CANCELLED
+    # the in-flight LLM stream and prevented any TTS audio from
+    # ever reaching the speaker. Symptom: Pipecat logs
+    # ``Generating chat`` → 17 s of silence → next user_turn_started
+    # → no LLMTextFrame, no TTSStartedFrame, no Piper output.
+    #
+    # Fix: keep VAD as a start-strategy (so we still detect speech
+    # for echo-filter + state HUD), but DISABLE its interruption
+    # behaviour. The transcription-based start strategy still fires
+    # an interruption on real STT output — so the user CAN still
+    # interrupt Jarvis mid-sentence by speaking, it just requires a
+    # real transcription rather than raw VAD shimmer.
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
+    from pipecat.turns.user_start.vad_user_turn_start_strategy import (
+        VADUserTurnStartStrategy,
+    )
+    from pipecat.turns.user_start.transcription_user_turn_start_strategy import (
+        TranscriptionUserTurnStartStrategy,
+    )
+    # R34-S34: also DISABLE transcription-based interruptions. The
+    # user wants Jarvis to be interruptable ONLY when explicitly
+    # named ("Джарвіс, стоп" / "Джарвіс, кажи замість цього …").
+    # With this disabled, the wake_gate processor handles barge-in
+    # explicitly: when SPEAKING + wake-word detected in transcript,
+    # it kills the current audio playback and queues an
+    # InterruptionFrame. Random talking nearby / background noise
+    # CANNOT cancel Jarvis mid-reply any more.
+    _user_params = LLMUserAggregatorParams(
+        user_turn_strategies=UserTurnStrategies(
+            start=[
+                VADUserTurnStartStrategy(enable_interruptions=False),
+                TranscriptionUserTurnStartStrategy(enable_interruptions=False),
+            ],
+        ),
+    )
+    aggregators = LLMContextAggregatorPair(context, user_params=_user_params)
 
     # ── Stage-3 HUD adapters + Stage-5 gates ───────────────────────
     # We instantiate the processor CLASSES lazily here because the
     # factories import pipecat — if pipecat isn't installed we want
     # ``from_settings`` / config helpers to still work for callers
     # that just want to introspect the loop without booting it.
-    EventStreamProc = _make_event_stream_processor()
+    EventStreamProc, AudioProbeProc = _make_event_stream_processor()
     StateProc = _make_state_processor()
     FastPathProc = _make_fast_path_processor()
     WakeWordProc = _make_wake_word_processor(cfg)
     EchoFilterProc = _make_echo_filter_processor()
+    audio_probe = AudioProbeProc()         # R34-S26: input-audio RMS heartbeat
     events_user = EventStreamProc()        # observes STT side
     events_assistant = EventStreamProc()   # observes LLM/TTS side
     echo_filter = EchoFilterProc()         # drops bot-echo transcripts
@@ -2169,14 +3304,34 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     #   ``BotStartedSpeakingFrame``/``BotStoppedSpeakingFrame`` that
     #   propagate from the transport's interruption logic, so the
     #   ordering above still lets them see TTS lifecycle frames.
+    # R34-S30: Direct chat bypass. The stock Pipecat LLM→TTS chain
+    # gets wedged after a few minutes of uptime — `_RobustOLLamaLLMService`
+    # streams the response from Ollama but the LLMAssistantAggregator
+    # / TTS pair never emits a TTSStartedFrame, so the user hears
+    # silence. Symptom: `state: THINKING` → `state: LISTENING` with
+    # no `SPEAKING` in between, no `bot_started_speaking` event.
+    #
+    # `direct_chat` sits BETWEEN wake_gate and the LLM/TTS chain. On
+    # every TranscriptionFrame that survives the wake gate, it:
+    #   (1) calls native Ollama `/api/chat` over aiohttp directly
+    #       (think:false, options:{num_predict, num_ctx}),
+    #   (2) speaks the reply via macOS `say` in a thread,
+    #   (3) emits state events so the dashboard reflects SPEAKING,
+    #   (4) consumes the frame so the broken Pipecat LLM chain
+    #       never sees it.
+    direct_chat = _make_direct_chat_processor(cfg)()
+
     pipeline = Pipeline(
         [
             transport.input(),
+            audio_probe,   # R34-S26: emit pipecat_audio_rms ~1 Hz
+            vad_processor, # R34-S26: Silero VAD → VADUserStarted/Stopped
             stt,
             events_user,
             echo_filter,
             wake_gate,
             fast_path,
+            direct_chat,   # R34-S30: bypass Pipecat LLM/TTS — direct say+ollama
             aggregators.user(),
             llm,
             aggregators.assistant(),
@@ -2241,6 +3396,96 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     return pipeline, context, task, transport
 
 
+# ─────────────────── interrupt-flag bridge (R34-S29) ───────────────────
+async def _interrupt_flag_poller(task: Any) -> None:
+    """Poll for an external interrupt request and forward it to Pipecat.
+
+    The dashboard's ``POST /api/interrupt`` writes a flag file at
+    ``~/Library/Application Support/jarvis/interrupt.flag``. This
+    coroutine, scheduled on the same loop as the pipeline runner,
+    notices the file and queues an ``InterruptionFrame`` into the
+    active task — which causes Pipecat to cancel in-flight LLM
+    streaming + cut off TTS playback cleanly. The flag is removed
+    so the next request is a fresh event.
+
+    Polls at 250 ms — fast enough that the user perceives the Stop
+    button as instant (≤ 1 frame of TTS audio after click), light
+    enough that 4 stat-calls/s is dwarfed by the rest of the loop.
+    """
+    from pathlib import Path as _P
+    base = _P.home() / "Library/Application Support/jarvis"
+    flag = base / "interrupt.flag"
+    # R34-S30: ALSO poll a transcription-injection flag so the
+    # dashboard / tests can drive the LLM+TTS path without going
+    # through the microphone (used for end-to-end smoke tests
+    # when the audio device is busy or the user is debugging).
+    inject_flag = base / "inject_transcription.flag"
+    try:
+        # Use late import so a missing pipecat install doesn't break
+        # the whole module — _amain only runs when pipecat is loaded.
+        from pipecat.frames.frames import (
+            InterruptionFrame,
+            TranscriptionFrame,
+        )
+    except Exception:
+        debug_log(
+            "interrupt poller: InterruptionFrame import failed — "
+            "stop button will not work",
+            "pipecat",
+        )
+        return
+    while True:
+        try:
+            if flag.exists():
+                debug_log("interrupt flag detected → cancelling turn", "pipecat")
+                # R34-S34: ALSO kill any in-flight afplay so the user
+                # hears immediate silence. Without this, the user
+                # presses Stop and waits 3-5 s for the WAV buffer to
+                # drain (afplay can't be SIGINT'd cleanly otherwise).
+                try:
+                    _stop_current_playback()
+                except Exception:
+                    pass
+                try:
+                    await task.queue_frame(InterruptionFrame())
+                except Exception as exc:
+                    debug_log(f"interrupt queue failed: {exc!r}", "pipecat")
+                try:
+                    flag.unlink()
+                except Exception:
+                    pass
+            if inject_flag.exists():
+                try:
+                    text = inject_flag.read_text(encoding="utf-8").strip()
+                    if text:
+                        debug_log(
+                            f"inject_transcription: queueing {text[:60]!r}",
+                            "pipecat",
+                        )
+                        from time import time as _t
+                        await task.queue_frame(
+                            TranscriptionFrame(
+                                text=text,
+                                user_id="dashboard",
+                                timestamp=str(_t()),
+                            )
+                        )
+                except Exception as exc:
+                    debug_log(
+                        f"inject_transcription error: {exc!r}",
+                        "pipecat",
+                    )
+                try:
+                    inject_flag.unlink()
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # pragma: no cover — observability
+            debug_log(f"poller error: {exc!r}", "pipecat")
+        await asyncio.sleep(0.25)
+
+
 # ─────────────────────────────── loop class ──────────────────────────────
 
 
@@ -2292,11 +3537,43 @@ class PipecatLoop:
         from pipecat.pipeline.runner import PipelineRunner
 
         async def _amain() -> None:
+            # R34-S39 — startup hygiene: clear orphan TTS files left by
+            # prior crashed daemons. Cheap, runs once per boot.
+            try:
+                n = _cleanup_orphan_tts_wavs()
+                if n > 0:
+                    debug_log(
+                        f"startup: cleared {n} orphan /tmp/jarvis_tts_*.wav files",
+                        "pipecat",
+                    )
+            except Exception as exc:
+                debug_log(f"startup wav-sweep failed: {exc!r}", "pipecat")
+            # Also register FactStore atexit close so SQLite checkpoints
+            # cleanly on SIGTERM (otherwise WAL can grow unboundedly
+            # across kill-cycles).
+            try:
+                import atexit as _atexit
+                from ..memory.facts import get_facts_store as _gfs
+                def _close_facts():
+                    try:
+                        _gfs().close()
+                    except Exception:
+                        pass
+                _atexit.register(_close_facts)
+            except Exception:
+                pass
+
             _, _, task, _ = _build_pipeline(self.cfg)
             self._task = task
             runner = PipelineRunner(handle_sigint=False)
             self._runner = runner
             debug_log("PipecatLoop starting PipelineRunner", "pipecat")
+            # R34-S29: poll the dashboard's interrupt flag in a side
+            # task so the user can stop TTS / abort the current turn
+            # without waiting for VAD to detect their voice.
+            interrupt_task = asyncio.create_task(
+                _interrupt_flag_poller(task)
+            )
             try:
                 await runner.run(task)
             except asyncio.CancelledError:
@@ -2305,6 +3582,17 @@ class PipecatLoop:
                 debug_log(f"PipecatLoop runner crashed: {exc!r}", "pipecat")
                 raise
             finally:
+                interrupt_task.cancel()
+                # R34-S39 — await the interrupt task so its file handle
+                # on interrupt.flag and inject_transcription.flag closes
+                # cleanly. Without this the .stat()/.unlink() ops can
+                # race a fresh daemon's startup.
+                try:
+                    await asyncio.gather(
+                        interrupt_task, return_exceptions=True,
+                    )
+                except Exception:
+                    pass
                 debug_log("PipecatLoop runner stopped", "pipecat")
 
         asyncio.run(_amain())

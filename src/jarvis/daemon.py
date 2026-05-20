@@ -706,6 +706,18 @@ def main() -> None:
     #                         is the next suspect
     # Disable with JARVIS_MIC_PROBE_DISABLE=true (e.g. for unit tests
     # or single-mic devices that can't tolerate parallel readers).
+    #
+    # R34-S26 LESSON LEARNED: on macOS 26+ this probe HARMS the daemon
+    # it tries to diagnose. The "PyAudio on macOS allows multiple
+    # readers" assumption is FALSE for AUHAL exclusive-mode streams
+    # when Continuity Camera/iPhone is in the device list — the second
+    # open re-arbitrates AUHAL and silently kills Pipecat's input
+    # callback. Symptom: pipecat_audio_rms events fire for ~17 s then
+    # stop, wake-word never triggers, daemon "не викликається" even
+    # though it's running. We now ship with JARVIS_MIC_PROBE_DISABLE=true
+    # in the launchd plist. JarvisAudioProbeProcessor inside the Pipecat
+    # pipeline emits pipecat_audio_rms from the SAME stream that VAD
+    # sees — that's both safer and a more accurate diagnostic.
     if os.environ.get("JARVIS_MIC_PROBE_DISABLE", "").lower() not in (
         "1", "true", "yes", "on"
     ):

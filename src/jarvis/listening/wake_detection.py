@@ -139,7 +139,15 @@ def is_wake_word_detected(text_lower: str, wake_word: str, aliases: List[str], f
         # like "жарить" (cooking), "жалить", "чарівний". 0.65 still catches
         # mishearings ("джавіс" 0.77, "жарюс" 0.71, "джоргус" 0.66) but cuts
         # ambient false-positives.
-        if soft >= 0.65:
+        #
+        # R34-S28: lowered 0.65 → 0.58. Whisper transcribed user's
+        # "Джарвіс" as "Джарри" (live evidence in events.jsonl); softmax
+        # of (jarvis, джарвис, джарвіс) ratios = 0.769. Threshold 0.65
+        # SHOULD have caught it — but during turn-after-stop hot-window
+        # logic, edge cases like "джарри стоп" reached the gate with the
+        # hot window already closed. 0.58 widens the catchment without
+        # opening up "жарить"/"чарівний" again (those score ~0.40-0.50).
+        if soft >= 0.58:
             debug_log(f"wake word prefix match: '{token}' (soft ratio: {soft:.3f})", "wake")
             print(f"🟡 wake prefix: '{token}' (soft {soft:.2f})", flush=True)
             return True

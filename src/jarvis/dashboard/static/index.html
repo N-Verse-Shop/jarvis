@@ -7,7 +7,7 @@
     <meta name="theme-color" content="#6C63FF" />
     <meta name="description" content="Jarvis Control Room · Powered by Nexus Studio" />
     <title>Jarvis · Nexus Studio</title>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=R34-S23" />
+    <link rel="stylesheet" href="/dashboard/styles.css?v=R34-S29" />
     <!-- favicon: Nexus indigo→cyan gradient with stylised J -->
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236C63FF'/%3E%3Cstop offset='1' stop-color='%2300D4FF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='8' y='8' width='84' height='84' rx='20' fill='url(%23g)'/%3E%3Cpath d='M52 28 L52 62 Q52 74 40 74 Q28 74 28 62' stroke='%23fff' stroke-width='8' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
   </head>
@@ -67,6 +67,8 @@
         </div>
         <nav class="app-nav">
           <button class="nav-tab active" data-view="overview">Overview</button>
+          <button class="nav-tab" data-view="chat">Chat</button>
+          <button class="nav-tab" data-view="brain">Brain</button>
           <button class="nav-tab" data-view="skills">Skills</button>
           <button class="nav-tab" data-view="audit">Audit</button>
           <button class="nav-tab" data-view="persona">Persona</button>
@@ -434,6 +436,50 @@
         <ul class="event-feed" id="live-feed"></ul>
       </section>
 
+      <!-- view: chat (R34-S29) -->
+      <section class="view" id="view-chat">
+        <div class="view-toolbar">
+          <h2>Chat with Jarvis</h2>
+          <div class="filters">
+            <span class="subtle">Текстовий канал — обходить voice pipeline.</span>
+          </div>
+        </div>
+        <div class="card glass" id="chat-card">
+          <div id="chat-log" class="chat-log" aria-live="polite"></div>
+          <div class="chat-input-row">
+            <textarea id="chat-input"
+              class="setting-input"
+              placeholder="Напиши Джарвісу… (Enter — надіслати, Shift+Enter — новий рядок, Esc — очистити)"
+              rows="3" maxlength="8000"></textarea>
+          </div>
+          <div class="form-actions">
+            <button id="chat-send" class="primary">Надіслати ↵</button>
+            <button id="chat-reset" class="ghost">Очистити</button>
+            <button id="chat-stop" class="ghost danger">⏹ Зупинити Jarvis</button>
+            <span id="chat-status" class="subtle" style="margin-left:auto"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- view: brain (R34-S27) -->
+      <section class="view" id="view-brain">
+        <div class="view-toolbar">
+          <h2>Brain View</h2>
+          <div class="filters">
+            <span id="brain-totals" class="subtle">—</span>
+            <button id="brain-refresh" class="ghost">⟳ Refresh</button>
+          </div>
+        </div>
+        <div class="card glass" id="brain-card">
+          <canvas id="brain-canvas" width="1200" height="600"
+                  style="display:block;width:100%;height:60vh;
+                         background: radial-gradient(ellipse at center,
+                           #0d0f1c 0%, #050610 100%);
+                         border-radius:12px;"></canvas>
+          <div id="brain-legend" class="brain-legend"></div>
+        </div>
+      </section>
+
       <!-- footer: Nexus Studio mark -->
       <footer class="app-footer">
         <div class="footer-left">
@@ -452,6 +498,6 @@
       </footer>
     </div>
 
-    <script type="module" src="/dashboard/app.js?v=R34-S23"></script>
+    <script type="module" src="/dashboard/app.js?v=R34-S29"></script>
   </body>
 </html>

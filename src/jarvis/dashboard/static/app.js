@@ -65,6 +65,9 @@ function setView(name) {
   if (name === "facts") loadFacts();
   if (name === "settings") loadSettings();
   if (name === "live") startLiveStream();
+  if (name === "chat") initChatTab();
+  if (name === "brain") startBrainView();
+  if (name !== "brain") stopBrainView();
 }
 tabs.forEach(t => t.addEventListener("click", () => setView(t.dataset.view)));
 
@@ -861,6 +864,277 @@ document.getElementById("settings-reload")?.addEventListener("click", loadSettin
     else valEl.textContent = v;
   });
 });
+
+// ─── Chat tab (R34-S29) ──────────────────────────────────────────
+// Text fallback for when voice path is wedged — sends user text
+// straight to Ollama via /api/chat. Stop button hits /api/interrupt
+// which the voice thread polls and translates to InterruptionFrame.
+let _chatBusy = false;
+let _chatAbort = null;
+function _chatStatus(msg, level = "ok") {
+  const el = document.getElementById("chat-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.className = `subtle chat-status chat-status-${level}`;
+}
+function _chatAppend(role, text) {
+  const log = document.getElementById("chat-log");
+  if (!log) return;
+  const row = document.createElement("div");
+  row.className = `chat-row chat-${role}`;
+  row.innerHTML = `
+    <div class="chat-role">${role === "user" ? "Ти" : "Jarvis"}</div>
+    <div class="chat-text">${escapeHtml(text).replace(/\n/g, "<br>")}</div>
+  `;
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+}
+function initChatTab() {
+  // Lazy bind once; subsequent setView(chat) calls are no-ops.
+  if (window._chatInit) return;
+  window._chatInit = true;
+  const input = document.getElementById("chat-input");
+  const sendBtn = document.getElementById("chat-send");
+  const resetBtn = document.getElementById("chat-reset");
+  const stopBtn = document.getElementById("chat-stop");
+  if (!input || !sendBtn) return;
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      input.value = "";
+      _chatStatus("");
+    }
+  });
+  sendBtn.addEventListener("click", sendChatMessage);
+  resetBtn.addEventListener("click", () => {
+    input.value = "";
+    input.focus();
+    _chatStatus("Очищено", "ok");
+  });
+  stopBtn.addEventListener("click", interruptJarvis);
+  setTimeout(() => input.focus(), 50);
+}
+async function sendChatMessage() {
+  if (_chatBusy) return;
+  const input = document.getElementById("chat-input");
+  const text = (input.value || "").trim();
+  if (!text) {
+    _chatStatus("Порожнє повідомлення", "warn");
+    return;
+  }
+  _chatBusy = true;
+  _chatStatus("Jarvis думає…", "ok");
+  _chatAppend("user", text);
+  input.value = "";
+  _chatAbort = new AbortController();
+  try {
+    const r = await fetch(`/api/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+      },
+      body: JSON.stringify({ text }),
+      signal: _chatAbort.signal,
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || `HTTP ${r.status}`);
+    }
+    const j = await r.json();
+    _chatAppend("assistant", j.reply || "(порожня відповідь)");
+    _chatStatus(`Готово · модель ${j.model || "?"}`, "ok");
+  } catch (e) {
+    if (e.name === "AbortError") {
+      _chatStatus("Скасовано", "warn");
+    } else {
+      _chatAppend("assistant", `⚠ ${e.message || e}`);
+      _chatStatus(`Помилка: ${e.message || e}`, "error");
+    }
+  } finally {
+    _chatBusy = false;
+    _chatAbort = null;
+  }
+}
+async function interruptJarvis() {
+  // 1. Abort in-flight /api/chat fetch (if any)
+  if (_chatAbort) {
+    try { _chatAbort.abort(); } catch {}
+  }
+  // 2. Tell voice pipeline to drop current TTS / LLM stream
+  try {
+    const r = await fetch(`/api/interrupt`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+    if (r.ok) {
+      _chatStatus("Зупинено", "warn");
+    } else {
+      const j = await r.json().catch(() => ({}));
+      _chatStatus(`Не вдалось: ${j.error || r.status}`, "error");
+    }
+  } catch (e) {
+    _chatStatus(`Помилка: ${e.message || e}`, "error");
+  }
+}
+
+// ─── Brain View (R34-S27) ─────────────────────────────────────────
+// Canvas2D animated visualization of skills + memory + tool firing.
+// Polls /api/brain at 5s TTL, renders nodes per region as glowing
+// orbs that pulse when their region has recent activity. Designed
+// to look like the @KZZY47 "Kronos" UI without the marketing
+// dishonesty: every neuron is a real piece of state Jarvis tracks.
+const _brainState = {
+  raf: null,
+  timer: null,
+  data: null,
+  t0: 0,
+};
+async function _fetchBrain() {
+  try {
+    const data = await api("/api/brain");
+    if (data && data.regions) {
+      _brainState.data = data;
+      const tot = data.totals || {};
+      document.getElementById("brain-totals").textContent =
+        `${tot.neurons || 0} neurons · ${tot.regions || 0} regions`;
+      _renderBrainLegend(data);
+    }
+  } catch (e) {
+    console.warn("brain fetch:", e);
+  }
+}
+function _renderBrainLegend(data) {
+  const el = document.getElementById("brain-legend");
+  if (!el) return;
+  const palette = _brainPalette();
+  el.innerHTML = (data.regions || [])
+    .map((r, idx) => {
+      const c = palette(idx);
+      return `<span class="brain-legend-item">
+        <span class="brain-dot" style="background:${c}"></span>
+        ${escapeHtml(r.label)} · ${r.neurons.length}
+      </span>`;
+    })
+    .join("");
+}
+function _brainPalette() {
+  const colors = [
+    "#6C63FF", "#00D4FF", "#FF6B9D", "#FFD166",
+    "#06D6A0", "#EF476F", "#118AB2", "#073B4C",
+  ];
+  return (i) => colors[i % colors.length];
+}
+function _brainDraw() {
+  const canvas = document.getElementById("brain-canvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;
+  const H = canvas.height;
+  // Background fade for trailing motion blur
+  ctx.fillStyle = "rgba(5, 6, 16, 0.18)";
+  ctx.fillRect(0, 0, W, H);
+  if (!_brainState.data) {
+    _brainState.raf = requestAnimationFrame(_brainDraw);
+    return;
+  }
+  const t = (performance.now() - _brainState.t0) / 1000;
+  const palette = _brainPalette();
+  const regions = _brainState.data.regions || [];
+  // Polar layout: regions evenly distributed around the centre,
+  // neurons stretched radially out from each region anchor.
+  const cx = W / 2, cy = H / 2;
+  regions.forEach((region, ri) => {
+    const angle = (ri / Math.max(1, regions.length)) * Math.PI * 2 - Math.PI / 2;
+    const r0 = Math.min(W, H) * 0.18;
+    const ax = cx + Math.cos(angle) * r0;
+    const ay = cy + Math.sin(angle) * r0;
+    const color = palette(ri);
+    const firing = Math.max(0, Math.min(1, region.firing_rate || 0));
+    const pulse = 0.55 + 0.45 * Math.sin(t * (1.5 + firing * 4) + ri);
+    // Region anchor: bigger glow on higher firing
+    ctx.beginPath();
+    const ar = 8 + firing * 16 + pulse * 6;
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.85;
+    ctx.arc(ax, ay, ar, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.18;
+    ctx.arc(ax, ay, ar * 2.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    // Region label
+    ctx.fillStyle = "#aab0d4";
+    ctx.font = "12px ui-sans-serif, system-ui, -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(region.label, ax, ay - ar - 8);
+    // Neurons radiating outward
+    const neurons = region.neurons || [];
+    const ringRadius = Math.min(W, H) * 0.28;
+    neurons.forEach((n, ni) => {
+      const spread = Math.PI * 0.7;
+      const localAngle = angle + ((ni - neurons.length / 2) / Math.max(1, neurons.length)) * spread;
+      const d = ringRadius * (0.6 + 0.4 * ((ni + ri) % 7) / 7);
+      const nx = ax + Math.cos(localAngle) * d * 0.6;
+      const ny = ay + Math.sin(localAngle) * d * 0.6;
+      // Connection line region→neuron
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.18;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(nx, ny);
+      ctx.stroke();
+      // Neuron dot
+      const w = Math.max(0.5, Math.min(3, n.weight || 1));
+      const flicker = 0.7 + 0.3 * Math.sin(t * 3 + ni * 0.6 + ri);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.6 + 0.4 * flicker;
+      ctx.beginPath();
+      ctx.arc(nx, ny, 2 + w * 0.8, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  });
+  _brainState.raf = requestAnimationFrame(_brainDraw);
+}
+function startBrainView() {
+  // Resize canvas to actual pixel size so we get crisp rendering.
+  const canvas = document.getElementById("brain-canvas");
+  if (canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.floor(rect.width * dpr);
+    canvas.height = Math.floor(rect.height * dpr);
+    canvas.getContext("2d").scale(dpr, dpr);
+    canvas.width = canvas.width / dpr;
+    canvas.height = canvas.height / dpr;
+  }
+  _brainState.t0 = performance.now();
+  _fetchBrain();
+  if (_brainState.timer) clearInterval(_brainState.timer);
+  _brainState.timer = setInterval(_fetchBrain, 5000);
+  if (_brainState.raf) cancelAnimationFrame(_brainState.raf);
+  _brainState.raf = requestAnimationFrame(_brainDraw);
+  const btn = document.getElementById("brain-refresh");
+  if (btn && !btn._wired) {
+    btn._wired = true;
+    btn.addEventListener("click", _fetchBrain);
+  }
+}
+function stopBrainView() {
+  if (_brainState.timer) {
+    clearInterval(_brainState.timer);
+    _brainState.timer = null;
+  }
+  if (_brainState.raf) {
+    cancelAnimationFrame(_brainState.raf);
+    _brainState.raf = null;
+  }
+}
 
 // Boot
 if (localStorage.getItem(TOKEN_KEY)) {
