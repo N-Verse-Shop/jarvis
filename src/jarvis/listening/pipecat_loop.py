@@ -1915,6 +1915,22 @@ def _build_pipeline(cfg: PipecatLoopConfig):
         stop_secs=cfg.vad_min_silence_ms / 1000.0,
         min_volume=0.0,
     )
+    # R34-S14 startup banner — print once at pipeline build so users
+    # can see in jarvis-assistant.err.log which VAD knobs are actually
+    # active. Bypasses debug_log's voice-debug gate (always stderr).
+    try:
+        print(
+            f"[voice] VAD active: confidence={cfg.vad_threshold} "
+            f"start_secs={vad_params.start_secs} "
+            f"stop_secs={vad_params.stop_secs} "
+            f"min_volume={vad_params.min_volume} "
+            f"lang={cfg.stt_language} "
+            f"wake={cfg.wake_words[0]!r}",
+            file=__import__("sys").stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
     transport_params = LocalAudioTransportParams(
         input_device_index=cfg.input_device_index,
         output_device_index=cfg.output_device_index,
