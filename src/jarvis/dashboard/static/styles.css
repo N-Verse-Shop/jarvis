@@ -322,43 +322,150 @@ input::placeholder { color: var(--text-mute); }
 .brand-state { font-family: var(--mono); font-size: 11px; color: var(--text-dim);
                text-transform: uppercase; letter-spacing: 0.18em; }
 
-/* state orb — animated based on JarvisState */
-.orb {
-  width: 44px; height: 44px; border-radius: 50%;
-  background: radial-gradient(circle at 30% 30%,
-                              var(--nexus-cyan-2),
-                              var(--nexus-indigo) 60%,
-                              transparent 80%);
-  box-shadow: 0 0 28px var(--nexus-indigo),
-              inset 0 0 12px rgba(255, 255, 255, 0.2);
-  animation: idle-pulse 3.6s ease-in-out infinite;
-  position: relative;
+/* ── status pill (R34-S19) ──────────────────────────────────────────
+   Replaces the chunky animated orb. 4-bar equalizer + state text in
+   one compact pill — the visual language professional voice agents
+   actually use (ChatGPT Voice, Pi.ai, Siri). State drives both the
+   pill chrome (background/border/glow) and the bar animation.
+   ───────────────────────────────────────────────────────────────── */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: rgba(108, 99, 255, 0.08);
+  border: 1px solid rgba(108, 99, 255, 0.22);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.18em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  transition: background 0.25s ease, border-color 0.25s ease,
+              color 0.25s ease, box-shadow 0.25s ease;
   flex-shrink: 0;
+  min-height: 30px;
 }
-.orb::before {
-  content: ""; position: absolute; inset: -6px;
-  border-radius: 50%;
-  border: 1px solid rgba(108, 99, 255, 0.4);
-  animation: ring-pulse 3.6s ease-in-out infinite;
+.status-eq {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2.5px;
+  height: 14px;
+  width: 22px;
 }
-.orb.state-LISTENING { animation: listening-pulse 1.2s ease-in-out infinite; }
-.orb.state-LISTENING::before { animation: ring-pulse 1.2s ease-in-out infinite; }
-.orb.state-THINKING  { animation: thinking-spin 2.6s linear infinite;
-                       background: radial-gradient(circle at 50% 50%, var(--accent-warn) 0%, var(--nexus-indigo) 50%, transparent 80%); }
-.orb.state-SPEAKING  { animation: speaking-pulse 0.6s ease-in-out infinite;
-                       background: radial-gradient(circle at 50% 50%, var(--accent-ok) 0%, var(--nexus-indigo) 60%, transparent 85%); }
-.orb.state-OFFLINE   { background: radial-gradient(circle at 50% 50%, #333 0%, transparent 80%);
-                       box-shadow: none; animation: none; }
-.orb.state-OFFLINE::before { display: none; }
+.status-eq span {
+  width: 3px;
+  background: linear-gradient(180deg,
+              var(--nexus-cyan-2), var(--nexus-indigo));
+  border-radius: 2px;
+  height: 4px;
+  transform-origin: center;
+  transition: height 0.18s ease, background 0.25s ease;
+}
+.status-text {
+  font-weight: 600;
+  white-space: nowrap;
+}
 
-@keyframes idle-pulse { 0%,100% { transform: scale(1); opacity: 0.95; }
-                        50% { transform: scale(1.06); opacity: 1; } }
-@keyframes ring-pulse { 0%,100% { opacity: 0.5; transform: scale(1); }
-                        50% { opacity: 0.15; transform: scale(1.18); } }
-@keyframes listening-pulse { 0%,100% { transform: scale(1.0); box-shadow: 0 0 28px var(--nexus-indigo); }
-                              50% { transform: scale(1.15); box-shadow: 0 0 48px var(--nexus-indigo); } }
-@keyframes thinking-spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
-@keyframes speaking-pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.18); } }
+/* IDLE: gentle steady wave */
+.status-pill.state-idle {
+  background: rgba(108, 99, 255, 0.08);
+  border-color: rgba(108, 99, 255, 0.28);
+  color: var(--text-dim);
+}
+.status-pill.state-idle .status-eq span {
+  animation: eq-idle 2.4s ease-in-out infinite;
+}
+.status-pill.state-idle .status-eq span:nth-child(1) { animation-delay: 0s;    }
+.status-pill.state-idle .status-eq span:nth-child(2) { animation-delay: 0.3s;  }
+.status-pill.state-idle .status-eq span:nth-child(3) { animation-delay: 0.6s;  }
+.status-pill.state-idle .status-eq span:nth-child(4) { animation-delay: 0.9s;  }
+
+/* LISTENING: lively cyan audio-wave */
+.status-pill.state-listening {
+  background: rgba(0, 212, 255, 0.10);
+  border-color: rgba(0, 212, 255, 0.45);
+  color: var(--nexus-cyan-2);
+  box-shadow: 0 0 22px rgba(0, 212, 255, 0.18);
+}
+.status-pill.state-listening .status-eq span {
+  animation: eq-listen 0.85s ease-in-out infinite;
+}
+.status-pill.state-listening .status-eq span:nth-child(1) { animation-delay: 0s;    }
+.status-pill.state-listening .status-eq span:nth-child(2) { animation-delay: 0.18s; }
+.status-pill.state-listening .status-eq span:nth-child(3) { animation-delay: 0.36s; }
+.status-pill.state-listening .status-eq span:nth-child(4) { animation-delay: 0.54s; }
+
+/* THINKING: amber, sweep wave */
+.status-pill.state-thinking {
+  background: rgba(255, 180, 76, 0.10);
+  border-color: rgba(255, 180, 76, 0.38);
+  color: var(--accent-warn);
+}
+.status-pill.state-thinking .status-eq span {
+  background: linear-gradient(180deg, #ffd28a, var(--accent-warn));
+  animation: eq-think 1.3s ease-in-out infinite;
+}
+.status-pill.state-thinking .status-eq span:nth-child(1) { animation-delay: 0s;    }
+.status-pill.state-thinking .status-eq span:nth-child(2) { animation-delay: 0.22s; }
+.status-pill.state-thinking .status-eq span:nth-child(3) { animation-delay: 0.44s; }
+.status-pill.state-thinking .status-eq span:nth-child(4) { animation-delay: 0.66s; }
+
+/* SPEAKING: green, big pulse */
+.status-pill.state-speaking {
+  background: rgba(68, 238, 153, 0.10);
+  border-color: rgba(68, 238, 153, 0.42);
+  color: var(--accent-ok);
+  box-shadow: 0 0 22px rgba(68, 238, 153, 0.18);
+}
+.status-pill.state-speaking .status-eq span {
+  background: linear-gradient(180deg, #a8ffd0, var(--accent-ok));
+  animation: eq-speak 0.42s ease-in-out infinite;
+}
+.status-pill.state-speaking .status-eq span:nth-child(1) { animation-delay: 0s;    }
+.status-pill.state-speaking .status-eq span:nth-child(2) { animation-delay: 0.08s; }
+.status-pill.state-speaking .status-eq span:nth-child(3) { animation-delay: 0.16s; }
+.status-pill.state-speaking .status-eq span:nth-child(4) { animation-delay: 0.04s; }
+
+/* OFFLINE: dim grey, bars flat */
+.status-pill.state-offline {
+  background: rgba(255, 255, 255, 0.02);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: var(--text-mute);
+  box-shadow: none;
+}
+.status-pill.state-offline .status-eq span {
+  height: 2px;
+  background: var(--text-mute);
+  animation: none;
+}
+
+/* unknown / connecting → behave like idle */
+.status-pill:not([class*=" state-"]) .status-eq span,
+.status-pill.state-connecting .status-eq span {
+  animation: eq-idle 2.4s ease-in-out infinite;
+}
+
+@keyframes eq-idle {
+  0%, 100% { height: 4px;  opacity: 0.45; }
+  50%      { height: 8px;  opacity: 0.85; }
+}
+@keyframes eq-listen {
+  0%, 100% { height: 3px;  }
+  20%      { height: 12px; }
+  45%      { height: 5px;  }
+  70%      { height: 11px; }
+  90%      { height: 6px;  }
+}
+@keyframes eq-think {
+  0%, 100% { height: 3px;  }
+  50%      { height: 13px; }
+}
+@keyframes eq-speak {
+  0%, 100% { height: 5px;  }
+  50%      { height: 14px; }
+}
 
 /* ── nav tabs ──────────────────────────────────────────────────── */
 .app-nav { display: flex; gap: 4px; justify-content: center; flex-wrap: wrap; }

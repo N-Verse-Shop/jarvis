@@ -7,7 +7,7 @@
     <meta name="theme-color" content="#6C63FF" />
     <meta name="description" content="Jarvis Control Room · Powered by Nexus Studio" />
     <title>Jarvis · Nexus Studio</title>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=R34-S18" />
+    <link rel="stylesheet" href="/dashboard/styles.css?v=R34-S19" />
     <!-- favicon: Nexus indigo→cyan gradient with stylised J -->
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236C63FF'/%3E%3Cstop offset='1' stop-color='%2300D4FF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='8' y='8' width='84' height='84' rx='20' fill='url(%23g)'/%3E%3Cpath d='M52 28 L52 62 Q52 74 40 74 Q28 74 28 62' stroke='%23fff' stroke-width='8' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
   </head>
@@ -53,8 +53,17 @@
             <div class="brand-title">Jarvis</div>
             <div class="brand-tagline">Nexus&nbsp;Studio · Control&nbsp;Room</div>
           </div>
-          <div id="state-orb" class="orb" title="agent state"></div>
-          <div class="brand-state" id="brand-state">connecting…</div>
+          <!-- R34-S19: replaced the chunky orb with a professional
+               equalizer-bars status pill. State + EQ animation in one
+               compact component — easier to read at a glance and
+               matches what real voice-AI products use (ChatGPT Voice,
+               Pi.ai, Siri). -->
+          <div id="state-pill" class="status-pill state-offline" title="agent state">
+            <span class="status-eq" aria-hidden="true">
+              <span></span><span></span><span></span><span></span>
+            </span>
+            <span class="status-text" id="brand-state">connecting</span>
+          </div>
         </div>
         <nav class="app-nav">
           <button class="nav-tab active" data-view="overview">Overview</button>
@@ -343,6 +352,6 @@
       </footer>
     </div>
 
-    <script type="module" src="/dashboard/app.js?v=R34-S18"></script>
+    <script type="module" src="/dashboard/app.js?v=R34-S19"></script>
   </body>
 </html>

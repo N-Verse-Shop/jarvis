@@ -137,8 +137,12 @@ async function loadOverview() {
 }
 
 function setStateOrb(state) {
-  const orb = document.getElementById("state-orb");
-  orb.className = "orb state-" + (state || "OFFLINE").toUpperCase();
+  // R34-S19: orb → EQ-pill. Kept the function name so existing
+  // call-sites in overview poller + state poller don't need touching.
+  const pill = document.getElementById("state-pill");
+  if (!pill) return;
+  const norm = (state || "OFFLINE").toLowerCase();
+  pill.className = "status-pill state-" + norm;
 }
 
 // ─── skills ──────────────────────────────────────────────────────
