@@ -420,6 +420,19 @@ def _system_prompt_for(lang: str, *, slim: bool = False) -> str:
     # 3. Base voice prompt
     parts.append(base)
 
+    # R34-S48 — hard language pin. The Piper voice is RU; UA TTS
+    # sounds awful. Tell the model in unmistakable terms that input
+    # may be Ukrainian but output MUST be Russian. We prepend this
+    # to the language-lock block built later in ``_call_ollama``;
+    # keeping it here ensures even cached prompts carry the rule.
+    ru_only_rule = (
+        "ВАЖНО: пользователь иногда говорит по-украински, но ты ВСЕГДА "
+        "отвечаешь ТОЛЬКО по-русски. Никогда не используй украинские "
+        "слова, буквы (і, ї, є, ґ) или окончания. Понимай украинский — "
+        "отвечай по-русски."
+    )
+    parts.append(ru_only_rule)
+
     # 3b. R34-S47 — Nexus Brain awareness. We don't dump the whole
     # vault into context (that's 5+ MB of markdown), but we DO tell
     # the LLM the brain exists, where it lives, and how to ask for a
@@ -616,6 +629,124 @@ def _register_bot_utterance(text: str) -> None:
         _BOT_HISTORY[:] = [(t, f) for (t, f) in _BOT_HISTORY if t > cutoff]
         if len(_BOT_HISTORY) > _BOT_HISTORY_MAX:
             del _BOT_HISTORY[: len(_BOT_HISTORY) - _BOT_HISTORY_MAX]
+
+
+# R34-S48 — Russian-only reply guard.
+#
+# User feedback: "відключи українську розмовну!! нехай відповідає
+# завжди російською но українську просто розуміє коли я говорю".
+#
+# The Piper voice we ship (``ru_RU-ruslan-medium``) is a Russian
+# model trained on Russian phonemes. When given Ukrainian text it
+# falls back to grapheme-by-grapheme pronunciation that mangles the
+# UA-specific letters (і / ї / є / ґ → odd vowel substitutions),
+# producing a jarring half-Russian half-Polish accent the user
+# explicitly called "ужасну українську мову розмовну".
+#
+# Solution: keep STT multilingual (Whisper happily transcribes UA),
+# keep the user free to SPEAK Ukrainian, but EVERY outbound TTS
+# string is normalised through a UA→RU lexical map before reaching
+# Piper. The LLM is also locked to ``lang="ru"`` regardless of the
+# detected input language, so chat replies never come back in UA.
+
+# Compact UA→RU table covering all the verbs / nouns the fast-path
+# actions, confirmation prompts, and direct-chat scaffolding actually
+# emit. Order matters — multi-word phrases must precede their
+# single-word components (e.g. "не вдалося" → "не получилось" runs
+# before any bare "не" substitution).
+_UA_TO_RU_TRANSLATIONS: list[tuple[str, str]] = [
+    # Confirmation gate phrasing (R34-S43/47).
+    ("Підтверджуєш", "Подтверждаешь"),
+    ("підтверджуєш", "подтверждаешь"),
+    ("Скажи «так» щоб виконати", "Скажи «да» чтобы выполнить"),
+    ("«так» щоб виконати", "«да» чтобы выполнить"),
+    ("«ні» щоб скасувати", "«нет» чтобы отменить"),
+    ("щоб виконати", "чтобы выполнить"),
+    ("щоб скасувати", "чтобы отменить"),
+    ("Скасовано", "Отменено"),
+    ("скасовано", "отменено"),
+    ("Зараз ", "Сейчас "),
+    ("Не вдалося", "Не получилось"),
+    ("не вдалося", "не получилось"),
+    ("Я вже відповідав на це", "Я уже отвечал на это"),
+    # Fast-path action descriptions.
+    ("Відкриваю", "Открываю"),
+    ("відкриваю", "открываю"),
+    ("Закриваю", "Закрываю"),
+    ("закриваю", "закрываю"),
+    ("Дивлюся час", "Смотрю время"),
+    ("Дивлюся", "Смотрю"),
+    ("Записую у Brain", "Записываю в Brain"),
+    ("Записую", "Записываю"),
+    ("Записав нотатку", "Записал заметку"),
+    ("Записав", "Записал"),
+    ("Знайшов у Brain", "Нашёл в Brain"),
+    ("Знайшов", "Нашёл"),
+    ("Шукаю у Brain", "Ищу в Brain"),
+    ("Шукаю", "Ищу"),
+    ("Перевіряю", "Проверяю"),
+    ("Ховаю", "Скрываю"),
+    ("ховаю", "скрываю"),
+    ("Перемикаю вікно", "Переключаю окно"),
+    ("Показую робочий стіл", "Показываю рабочий стол"),
+    ("Показую", "Показываю"),
+    ("Дивлюся пошту", "Смотрю почту"),
+    ("Слухаю", "Слушаю"),
+    ("Записую ідею", "Записываю идею"),
+    ("ідею", "идею"),
+    ("Не зміг", "Не смог"),
+    ("не зміг", "не смог"),
+    ("додатка", "приложения"),
+    ("додаток", "приложение"),
+    # Common weekday names (used by say_time / say_date).
+    ("четвер", "четверг"),
+    ("п'ятниця", "пятница"),
+    ("середа", "среда"),
+    ("вівторок", "вторник"),
+    ("неділя", "воскресенье"),
+    # R34-S48 — extra connectives + nouns that slipped through the
+    # initial sweep on live verification.
+    ("або", "или"),
+    ("дію", "действие"),
+    ("дія", "действие"),
+    ("Підтверджуєш дію", "Подтверждаешь действие"),
+    # Ukrainian-only glyphs as last-resort phoneme guards. These
+    # never appear in legit Russian text, so a blanket substitution
+    # is safe — and even if a stray UA word slips past the lexical
+    # map, the resulting pronunciation will be "Russian-ish" rather
+    # than the harsh half-vowel sounds Piper produces from ‹і ї є ґ›.
+    ("і", "и"),
+    ("ї", "и"),
+    ("є", "е"),
+    ("ґ", "г"),
+    ("І", "И"),
+    ("Ї", "И"),
+    ("Є", "Е"),
+    ("Ґ", "Г"),
+]
+
+
+def _ru_normalise(text: str) -> str:
+    """Best-effort UA→RU translation for outbound TTS.
+
+    Idempotent on already-RU strings (every replacement either
+    targets a UA-unique form or is a no-op identity). Designed to
+    run on every ``_speak`` / ``_speak_ack`` call so a Ukrainian
+    fast-path description (``Закриваю Safari``) reaches Piper as
+    pure Russian text (``Закрываю Safari``) regardless of the
+    action factory's authoring language.
+
+    NOT a general translator — only handles the vocabulary the
+    codebase actually emits. New UA strings need their pair added
+    to ``_UA_TO_RU_TRANSLATIONS``.
+    """
+    if not text:
+        return text
+    out = text
+    for ua, ru in _UA_TO_RU_TRANSLATIONS:
+        if ua and ua in out:
+            out = out.replace(ua, ru)
+    return out
 
 
 # R34-S47 — repetition guard.
@@ -1689,9 +1820,19 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             phrase we already spoke in the last 90 s AND the user
             didn't say "повтори"/"again", swap to a tiny "вже
             відповідав" line instead of replaying the full reply.
+
+            R34-S48 — UA→RU normalise. The Piper voice is Russian,
+            so any leftover Ukrainian glyph would be mispronounced.
+            We run ``_ru_normalise`` on EVERY outbound TTS string;
+            already-Russian text is a no-op so this is safe.
             """
             if not text:
                 return
+            # R34-S48 — lock outbound speech to Russian phonemes BEFORE
+            # any other processing. Done up front so the repetition
+            # fingerprint compares apples-to-apples (both candidate and
+            # history are normalised).
+            text = _ru_normalise(text)
             if _is_standby():
                 try:
                     self._stream.emit(
@@ -1923,12 +2064,28 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                 # system prompt's language lock matches what the user
                 # actually said. Falls back to cfg.active_language on
                 # any detector failure.
+                #
+                # R34-S48 — FORCE reply language to Russian regardless
+                # of detected input. User explicitly asked: "нехай
+                # відповідає завжди російською но українську просто
+                # розуміє". STT still transcribes UA correctly via
+                # Whisper, so understanding works; only the reply path
+                # is pinned. We detect for diagnostic logging but pass
+                # ``"ru"`` into ``_call_ollama``.
                 try:
                     from ..memory.self_learning import detect_user_language
                     detected_lang = detect_user_language(text)
                 except Exception:
                     detected_lang = cfg.active_language or "ru"
-                reply = await self._call_ollama(text, lang=detected_lang)
+                # Always reply in Russian.
+                reply_lang = "ru"
+                if detected_lang != reply_lang:
+                    debug_log(
+                        f"direct_chat: detected={detected_lang} but "
+                        f"forcing reply_lang={reply_lang} (R34-S48)",
+                        "pipecat",
+                    )
+                reply = await self._call_ollama(text, lang=reply_lang)
                 debug_log(
                     f"direct_chat: reply len={len(reply)}: {reply[:80]!r}",
                     "pipecat",
@@ -2167,9 +2324,16 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
             the daemon into standby, abort the speech entirely. The
             wake-gate will let a wake-word through and clear standby
             before any speak call lands here.
+
+            R34-S48 — UA→RU normalise. Fast-path descriptions are
+            authored in Ukrainian (``Закриваю Safari`` etc.) but the
+            Piper voice is Russian. Normalising here keeps the action
+            factories untouched while making sure Piper only ever
+            sees Russian.
             """
             if not text:
                 return
+            text = _ru_normalise(text)
             if _is_standby():
                 try:
                     self._stream.emit(
@@ -2435,104 +2599,21 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                 if action.name not in _SAFE_ACTIONS_NO_CONFIRM:
                     self._pending_action = (action, _t_conf.monotonic())
                     desc = (action.description or action.name).strip()
-                    # R34-S44 — detect prompt language from the USER's
-                    # transcript ONLY. Action ``desc`` always comes from
-                    # a single regex factory so is UA-biased regardless
-                    # of what the user actually said — using desc would
-                    # force UA prompts even when the user spoke RU.
-                    # Strategy:
-                    #   1) UA-only glyphs in text → "uk"
-                    #   2) RU-only glyphs in text → "ru"
-                    #   3) UA-distinctive verb in text → "uk"
-                    #   4) RU-distinctive verb in text → "ru"
-                    #   5) detect_user_language(text)
-                    #   6) cfg.active_language ("ru" default)
-                    lang_active = "ru"
-                    text_lc = (text or "").lower()
-                    _UA_VERBS = (
-                        "закрий", "відкрий", "ввімкни", "увімкни", "вимкни",
-                        "котра", "покажи", "читай", "напиши",
-                        "закри", "відкри",
+                    # R34-S48 — Russian-only confirmation prompts.
+                    #
+                    # Previously we detected the user's spoken language
+                    # and built a UA-or-RU prompt to match. User now
+                    # asks for pure-Russian output ("він має ужасну
+                    # українську мову розмовну"), so we hard-code RU
+                    # for the prompt scaffolding and pipe ``desc``
+                    # through ``_ru_normalise`` so even UA-authored
+                    # action descriptions ("Закриваю Safari") reach
+                    # Piper as Russian ("Закрываю Safari").
+                    desc_ru = _ru_normalise(desc)
+                    prompt = (
+                        f"{desc_ru}. Подтверждаешь? "
+                        "Скажи «да» чтобы выполнить или «нет» чтобы отменить."
                     )
-                    _RU_VERBS = (
-                        "закрой", "открой", "включи", "выключи",
-                        "котор", "напиши", "сделай",
-                    )
-                    try:
-                        if any(ch in text_lc for ch in "іїєґ"):
-                            lang_active = "uk"
-                        elif any(ch in text_lc for ch in "ыэъё"):
-                            lang_active = "ru"
-                        elif any(v in text_lc for v in _UA_VERBS):
-                            lang_active = "uk"
-                        elif any(v in text_lc for v in _RU_VERBS):
-                            lang_active = "ru"
-                        else:
-                            from ..memory.self_learning import (
-                                detect_user_language,
-                            )
-                            lang_active = (
-                                detect_user_language(text)
-                                or (
-                                    getattr(cfg, "active_language", "ru")
-                                    if cfg else "ru"
-                                )
-                            )
-                    except Exception:
-                        lang_active = (
-                            getattr(cfg, "active_language", "ru")
-                            if cfg else "ru"
-                        )
-                    # R34-S44 — only include ``desc`` in the prompt when
-                    # it's in the SAME language as the rest of the
-                    # prompt. ``desc`` comes from a single UA-biased
-                    # factory and embedding it in a RU prompt sounds
-                    # like two voices. Detect desc language by glyphs
-                    # PLUS by UA-vs-RU verb stems (since action descs
-                    # rarely contain UA-only glyphs but DO contain
-                    # distinctive verb forms — "Закриваю" / "Відкриваю"
-                    # vs RU "Закрываю" / "Открываю").
-                    desc_lc = (desc or "").lower()
-                    _DESC_UA_MARKERS = (
-                        "закриваю", "відкриваю", "вимикаю", "вмикаю",
-                        "роблю", "пишу", "запускаю",
-                    )
-                    _DESC_RU_MARKERS = (
-                        "закрываю", "открываю", "выключаю", "включаю",
-                        "делаю", "пишу", "запускаю",
-                    )
-                    desc_is_uk = (
-                        any(ch in desc_lc for ch in "іїєґ")
-                        or any(m in desc_lc for m in _DESC_UA_MARKERS)
-                    )
-                    desc_is_ru = (
-                        any(ch in desc_lc for ch in "ыэъё")
-                        or any(m in desc_lc for m in _DESC_RU_MARKERS)
-                    )
-                    if lang_active == "uk":
-                        if desc_is_uk or (not desc_is_ru):
-                            prompt = (
-                                f"{desc}. Підтверджуєш? "
-                                "Скажи «так» щоб виконати або «ні» щоб скасувати."
-                            )
-                        else:
-                            # desc is RU-only — drop it.
-                            prompt = (
-                                "Підтверджуєш дію? "
-                                "Скажи «так» щоб виконати або «ні» щоб скасувати."
-                            )
-                    else:
-                        if desc_is_ru or (not desc_is_uk):
-                            prompt = (
-                                f"{desc}. Подтверждаешь? "
-                                "Скажи «да» чтобы выполнить или «нет» чтобы отменить."
-                            )
-                        else:
-                            # desc is UA-only — drop it (would mix voices).
-                            prompt = (
-                                "Подтверждаешь действие? "
-                                "Скажи «да» чтобы выполнить или «нет» чтобы отменить."
-                            )
                     try:
                         self._audit.emit(
                             kind="fast_path_confirm",
@@ -2624,20 +2705,36 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                 duration_ms=duration_ms,
             )
 
-            # Speak the human-friendly description ("Зараз відкрию
-            # Safari") regardless of success — the user still wants
-            # confirmation that the daemon heard them.
-            ack = action.description or ("Готово." if ok else "Не вдалося.")
-            # On failure, append a short error hint so the user knows
-            # WHY it didn't work (e.g. "додаток не знайдено").
-            if not ok and msg and msg.strip():
-                # Keep the spoken hint short — `say` chokes on very
-                # long strings, and the dashboard already shows the
-                # full error message in the tool_call event log.
-                hint = msg.strip()
-                if len(hint) > 80:
-                    hint = hint[:80] + "..."
-                ack = f"{ack}. {hint}"
+            # R34-S48 — speak the RESULT for informational actions
+            # (say_time, say_date, battery, read_clipboard,
+            # nexus_brain_search). Previously we only ever spoke the
+            # action ``description`` ("Дивлюся час") on success, so
+            # the user heard "I'm looking at the time" but never the
+            # actual time — the result string was logged but silent.
+            # For destructive actions we keep the legacy behaviour
+            # (speak the description) but always append a short error
+            # hint on failure so the user knows what went wrong.
+            _RESULT_IS_THE_ANSWER = {
+                "say_time", "say_date", "battery", "read_clipboard",
+                "nexus_brain_search",
+            }
+            if ok and action.name in _RESULT_IS_THE_ANSWER and msg and msg.strip():
+                # The action's msg IS what the user asked for. Cap at
+                # 600 chars so `nexus_brain_search` (which can return
+                # multi-file snippets) doesn't run away.
+                ack = msg.strip()
+                if len(ack) > 600:
+                    ack = ack[:600] + "…"
+            else:
+                ack = action.description or ("Готово." if ok else "Не получилось.")
+                # On failure, append a short error hint so the user
+                # knows WHY it didn't work (e.g. "приложение не
+                # найдено").
+                if not ok and msg and msg.strip():
+                    hint = msg.strip()
+                    if len(hint) > 80:
+                        hint = hint[:80] + "..."
+                    ack = f"{ack}. {hint}"
             await self._speak_ack(ack, direction)
             # DO NOT push the original TranscriptionFrame — that's
             # the whole point of the fast path. The frame stops here.

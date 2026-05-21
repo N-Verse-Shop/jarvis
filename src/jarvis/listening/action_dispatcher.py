@@ -608,9 +608,19 @@ def _nexus_brain_search(query: str) -> tuple[bool, str]:
         except Exception as exc:
             return False, f"Не зміг прочитати vault: {exc}"
         if not hits:
-            return False, "У Nexus-Brain нічого не знайшов"
-        parts = [f"{rel}: {snip}" for rel, snip in hits[:3]]
-        return True, "Знайшов у Brain — " + " ⏤ ".join(parts)
+            return False, "В Nexus-Brain ничего не нашёл"
+        # R34-S48 — voice-friendly: speak file-name list only.
+        names = []
+        for rel, _snip in hits[:5]:
+            stem = os.path.splitext(os.path.basename(rel))[0]
+            parent = os.path.basename(os.path.dirname(rel))
+            if parent and parent not in (".", "Nexus-Brain"):
+                names.append(f"{parent}/{stem}")
+            else:
+                names.append(stem)
+        n = len(hits)
+        listing = ", ".join(names[:5])
+        return True, f"Нашёл {n} {'файл' if n == 1 else 'файлов'}: {listing}"
 
     # ripgrep path — much faster on a 1000-file vault.
     try:
@@ -623,26 +633,36 @@ def _nexus_brain_search(query: str) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=8,
         )
     except subprocess.TimeoutExpired:
-        return False, "Пошук у Brain застряг"
+        return False, "Поиск в Brain застрял"
     except Exception as exc:
         return False, f"rg failed: {exc}"
-    files = [ln for ln in out.stdout.splitlines() if ln.strip()][:3]
+    files = [ln for ln in out.stdout.splitlines() if ln.strip()][:5]
     if not files:
-        return False, "У Nexus-Brain нічого не знайшов"
-    hits = []
+        return False, "В Nexus-Brain ничего не нашёл"
+    # R34-S48 — voice-friendly summary. The user hears a short
+    # phrase ("Нашёл 3 файла: ibons, bauplanung, nexus-studio") and
+    # gets the full content in the dashboard tool_call event. We
+    # deliberately do NOT read the file contents aloud because:
+    #   1. Vault content is in Ukrainian — the RU Piper voice
+    #      mangles it (R34-S48 motivation).
+    #   2. A 600-char file dump played at 200 wpm = ~30 s of
+    #      narration, which is interrupting, not helpful.
+    # The dashboard already shows the snippets; voice just routes.
+    names = []
     for path in files:
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                data = f.read(2048)
-        except Exception:
-            continue
-        snip = data.strip().replace("\n", " ")[:400]
         rel = os.path.relpath(path, vault)
-        hits.append((rel, snip))
-    if not hits:
-        return False, "Знайшов файли але не можу прочитати"
-    parts = [f"{rel}: {snip}" for rel, snip in hits]
-    return True, "Знайшов у Brain — " + " ⏤ ".join(parts)
+        # Use just the basename (no extension) for the spoken list.
+        stem = os.path.splitext(os.path.basename(rel))[0]
+        # If the file is inside a meaningful subfolder, prepend the
+        # subfolder for context ("ibons/MASTER" > bare "MASTER").
+        parent = os.path.basename(os.path.dirname(rel))
+        if parent and parent not in (".", "Nexus-Brain"):
+            names.append(f"{parent}/{stem}")
+        else:
+            names.append(stem)
+    n = len(files)
+    listing = ", ".join(names[:5])
+    return True, f"Нашёл {n} {'файл' if n == 1 else 'файлов'}: {listing}"
 
 
 def _nexus_brain_append(section: str, body: str) -> tuple[bool, str]:
