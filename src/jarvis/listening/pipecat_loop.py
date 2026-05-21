@@ -71,19 +71,29 @@ _VOICE_SYSTEM_PROMPT_RU = (
     "ОЧЕНЬ КРАТКО (1-2 предложения, обычно ≤25 слов), на "
     "русском языке. Никаких префиксов вроде «Хорошо», "
     "«Конечно», «Понял». Никаких эмодзи. Никаких списков. "
-    "Никаких блоков кода. Если открываешь приложение или "
-    "URL — формулируй: «Сейчас открою X. Подтверди моё "
-    "действие, пожалуйста.» Имя Данило склоняй "
-    "грамматически правильно (Данила/Данилу/Даниле). "
+    "Никаких блоков кода. "
+    # R34-S43 — strict confirmation gate.
+    "НИКОГДА не выполняй действия без явного согласия пользователя. "
+    "Любое действие на машине (открыть/закрыть приложение, написать "
+    "файл, отправить письмо, изменить настройки) сначала ОПИШИ "
+    "одним коротким предложением и закончи вопросом «Подтверждаешь?». "
+    "ЖДИ его «да» прежде чем что-то делать. Если он сказал «нет» "
+    "или «стоп» — спокойно подтверди отмену. "
+    "Имя Данило склоняй грамматически правильно (Данила/Данилу/Даниле). "
     "Никогда не сокращай до «Нило» или «Даня»."
 )
 _VOICE_SYSTEM_PROMPT_UK = (
     "Ти — Джарвіс, голосовий асистент Данила. Відповідай "
     "ДУЖЕ КОРОТКО (1-2 речення, зазвичай ≤25 слів), "
     "українською. Без префіксів типу «Добре», «Звичайно», "
-    "«Зрозумів». Без емодзі, списків, блоків коду. Якщо "
-    "відкриваєш додаток або URL — формулюй: «Зараз відкрию "
-    "X. Підтверди мою дію, будь ласка.»"
+    "«Зрозумів». Без емодзі, списків, блоків коду. "
+    # R34-S43 — strict confirmation gate.
+    "НІКОЛИ не виконуй дії без явної згоди користувача. Будь-яку "
+    "дію на машині (відкрити/закрити додаток, написати файл, "
+    "надіслати листа, змінити налаштування) спочатку ОПИШИ одним "
+    "коротким реченням і закінчи питанням «Підтверджуєш?». ЧЕКАЙ "
+    "його «так» перш ніж щось робити. Якщо він каже «ні» або "
+    "«стоп» — спокійно підтверди скасування."
 )
 
 
@@ -278,7 +288,12 @@ def from_settings(cfg) -> PipecatLoopConfig:
         silence_ms = int(getattr(cfg, "endpoint_silence_ms", 700) or 700)
     except (TypeError, ValueError):
         silence_ms = 700
-    silence_ms = max(150, min(2000, silence_ms))
+    # R34-S43 — bumped ceiling 2000→5000ms. User explicitly requested
+    # 2-3s pause-tolerance so natural thinking pauses don't cut off
+    # the utterance. 5000ms gives headroom for thoughtful speech;
+    # `max_utterance_ms` still caps the absolute window from the
+    # other side so a stuck VAD can't lock us up forever.
+    silence_ms = max(150, min(5000, silence_ms))
 
     # R34-S16: resolve voice_device substring → numeric PortAudio
     # index BEFORE handing it to Pipecat. The legacy listener
@@ -1734,7 +1749,7 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
     return JarvisDirectChatProcessor
 
 
-def _make_fast_path_processor():
+def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
     """Build the regex fast-path FrameProcessor.
 
     Wraps ``action_dispatcher.parse_user_command`` in a frame-aware
@@ -1768,6 +1783,35 @@ def _make_fast_path_processor():
     from ..ipc import get_stream
     from .action_dispatcher import Action, parse_user_command
 
+    # R34-S43 — confirmation gate. Invasive actions (open app, close
+    # tab, quit app, lock screen, mute, write clipboard, set volume,
+    # web search, send email…) MUST receive explicit verbal user
+    # confirmation before executing. The user reported "Jarvis виконує
+    # дії без мене" — this gate prevents that class of harm.
+    #
+    # Read-only / informational actions stay zero-friction (telling
+    # the time or reading the clipboard isn't a destructive op).
+    _SAFE_ACTIONS_NO_CONFIRM = {
+        "say_time",      # purely informational
+        "say_date",      # purely informational
+        "battery",       # informational
+        "read_clipboard",# informational (does NOT write)
+    }
+    # Confirmation vocab — keep generous; STT mishearings happen.
+    # All entries lowercased & punctuation-stripped before match.
+    _CONFIRM_YES = {
+        "так", "да", "yes", "yeah", "ага", "ок", "ok", "okay",
+        "підтверджую", "підтверджу", "подтверждаю", "согласен",
+        "давай", "ага давай", "так давай", "погоджуюсь",
+        "звичайно", "конечно", "sure", "go", "go ahead", "доброго",
+        "роби", "сделай", "виконуй", "выполняй",
+    }
+    _CONFIRM_NO = {
+        "ні", "нет", "no", "nope", "відміни", "отмени", "скасуй",
+        "cancel", "abort", "не треба", "не надо",
+        "стоп", "стой", "stop",
+    }
+
     class JarvisFastPathProcessor(FrameProcessor):
         """Direct-execution path for matched regex user commands."""
 
@@ -1778,6 +1822,12 @@ def _make_fast_path_processor():
             # doesn't pay audit init cost when only Pipecat uses it.
             from ..audit import get_audit_store
             self._audit = get_audit_store()
+            # R34-S43 confirmation gate — pending action awaiting
+            # user yes/no. (action, t0_monotonic). Reset on confirm,
+            # cancel, on TTL-expiry (60s), or on any non-yes-no
+            # transcript that arrives before confirmation.
+            self._pending_action: tuple["Action", float] | None = None
+            self._pending_ttl_sec: float = 60.0
 
         async def _speak_ack(
             self, text: str, direction: "FrameDirection"
@@ -1902,27 +1952,106 @@ def _make_fast_path_processor():
                 await self.push_frame(frame, direction)
                 return
 
-            try:
-                action = parse_user_command(text)
-            except Exception as exc:
-                # Regex failure must never break the pipeline — fall
-                # through to the LLM path so the user still gets a
-                # response.
-                try:
-                    from ..debug import debug_log
-                    debug_log(
-                        f"fast-path parse_user_command crashed: {exc!r}",
-                        "pipecat",
-                    )
-                except Exception:
-                    pass
-                await self.push_frame(frame, direction)
-                return
+            # R34-S43 — confirmation gate.
+            # ``action`` is None until we resolve which path applies:
+            #   (a) Yes-answer to a pending confirmation → use the
+            #       saved Action and fall through to execute below.
+            #   (b) No-answer → cancel pending, speak "Скасовано", done.
+            #   (c) Non-yes/no while pending → drop pending and parse
+            #       this transcript as a new command (user moved on).
+            #   (d) No pending state → just parse the transcript.
+            import time as _t_conf
+            action: "Action | None" = None
+            if self._pending_action is not None:
+                pending, t0 = self._pending_action
+                # TTL check — abandon stale prompts so old "так" answers
+                # don't accidentally fire an action the user forgot about.
+                if (_t_conf.monotonic() - t0) > self._pending_ttl_sec:
+                    self._pending_action = None
+                else:
+                    norm = text.lower().strip().strip(".,!?;:-—–").strip()
+                    if norm in _CONFIRM_YES:
+                        action = pending
+                        self._pending_action = None
+                        try:
+                            self._stream.emit(
+                                "log",
+                                level="INFO",
+                                component="fast-path",
+                                message=f"confirmed → execute {action.name}",
+                            )
+                        except Exception:
+                            pass
+                        # Fall through to the execute block below.
+                    elif norm in _CONFIRM_NO:
+                        cancelled = pending.name
+                        self._pending_action = None
+                        try:
+                            self._stream.emit(
+                                "log",
+                                level="INFO",
+                                component="fast-path",
+                                message=f"cancelled pending {cancelled}",
+                            )
+                        except Exception:
+                            pass
+                        await self._speak_ack("Скасовано.", direction)
+                        return
+                    else:
+                        # Non-yes/no while pending — user moved on.
+                        self._pending_action = None
 
             if action is None:
-                # No fast-path match → normal LLM flow.
-                await self.push_frame(frame, direction)
-                return
+                # Path (c) or (d): parse the transcript as a new command.
+                try:
+                    action = parse_user_command(text)
+                except Exception as exc:
+                    try:
+                        from ..debug import debug_log
+                        debug_log(
+                            f"fast-path parse_user_command crashed: {exc!r}",
+                            "pipecat",
+                        )
+                    except Exception:
+                        pass
+                    await self.push_frame(frame, direction)
+                    return
+
+                if action is None:
+                    # No fast-path match → normal LLM flow.
+                    await self.push_frame(frame, direction)
+                    return
+
+                # Invasive action → ask for confirmation, do NOT exec.
+                if action.name not in _SAFE_ACTIONS_NO_CONFIRM:
+                    self._pending_action = (action, _t_conf.monotonic())
+                    desc = (action.description or action.name).strip()
+                    # R34-S43 — ``cfg`` is the closure-captured factory
+                    # arg; the dataclass field is ``active_language``
+                    # (set per-boot in from_settings). Fall back to "uk"
+                    # if the factory was called without cfg.
+                    lang_active = getattr(cfg, "active_language", "uk") if cfg else "uk"
+                    if lang_active == "uk":
+                        prompt = (
+                            f"{desc}. Підтверджуєш? "
+                            "Скажи «так» щоб виконати або «ні» щоб скасувати."
+                        )
+                    else:
+                        prompt = (
+                            f"{desc}. Подтверждаешь? "
+                            "Скажи «да» чтобы выполнить или «нет» чтобы отменить."
+                        )
+                    try:
+                        self._audit.emit(
+                            kind="fast_path_confirm",
+                            tool=action.name,
+                            status="awaiting_user_confirm",
+                            args={"text": text, "desc": desc},
+                        )
+                    except Exception:
+                        pass
+                    await self._speak_ack(prompt, direction)
+                    return  # consume the frame — wait for yes/no.
 
             # R33-S4: capability gate check. If a fast-path action
             # corresponds to a closed-gate tool, fall through to the
@@ -3520,7 +3649,7 @@ def _build_pipeline(cfg: PipecatLoopConfig):
     # that just want to introspect the loop without booting it.
     EventStreamProc, AudioProbeProc = _make_event_stream_processor()
     StateProc = _make_state_processor()
-    FastPathProc = _make_fast_path_processor()
+    FastPathProc = _make_fast_path_processor(cfg)
     WakeWordProc = _make_wake_word_processor(cfg)
     EchoFilterProc = _make_echo_filter_processor()
     audio_probe = AudioProbeProc()         # R34-S26: input-audio RMS heartbeat
