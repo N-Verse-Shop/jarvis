@@ -307,9 +307,15 @@ def from_settings(cfg) -> PipecatLoopConfig:
         stt_language=lang,
         ollama_base_url=getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434"),
         chat_model=str(getattr(cfg, "ollama_chat_model", "qwen3:8b")),
-        chat_temperature=float(getattr(cfg, "ollama_chat_temperature", 0.4)),
-        chat_num_predict=int(getattr(cfg, "ollama_chat_num_predict", 220)),
-        chat_num_ctx=int(getattr(cfg, "ollama_chat_num_ctx", 2048)),
+        # R34-S42 К4 — Settings dataclass doesn't declare
+        # ollama_chat_{num_predict,num_ctx,temperature}, so getattr(cfg,…)
+        # silently returned the fallback ALWAYS. Read the live values
+        # from the raw merged config dict (_raw_cfg is already populated
+        # above from load_config()). Falls back to dataclass defaults
+        # only if the key is genuinely absent.
+        chat_temperature=float(_raw_cfg.get("ollama_chat_temperature", 0.4)),
+        chat_num_predict=int(_raw_cfg.get("ollama_chat_num_predict", 220)),
+        chat_num_ctx=int(_raw_cfg.get("ollama_chat_num_ctx", 2048)),
         piper_voice_id=str(
             _piper_voice_override
             or getattr(cfg, "piper_voice", None)
@@ -346,8 +352,8 @@ def from_settings(cfg) -> PipecatLoopConfig:
     )
 
 
-def _system_prompt_for(lang: str) -> str:
-    """Build the full voice system prompt for the active language.
+def _system_prompt_for(lang: str, *, slim: bool = False) -> str:
+    """Build the voice system prompt for the active language.
 
     Composition (in order, each section optional + best-effort):
 
@@ -368,6 +374,12 @@ def _system_prompt_for(lang: str) -> str:
     Lazy-imports are intentional: ``skills``, ``persona``, ``facts``
     are optional modules and must NEVER break the voice loop on
     import failure.
+
+    R34-S42 К4 — ``slim`` flag (used by JarvisDirectChatProcessor) omits
+    the L1 skills catalog. The direct_chat path bypasses the LLM tool
+    aggregator entirely, so listing skills wastes ~1100 chars of
+    prompt-eval and pushes num_ctx tight on qwen3:8b. The catalog
+    adds nothing to a pure-chat reply but multiplies cold-cache latency.
     """
     base = _VOICE_SYSTEM_PROMPT_UK if lang == "uk" else _VOICE_SYSTEM_PROMPT_RU
     parts: list[str] = []
@@ -393,14 +405,15 @@ def _system_prompt_for(lang: str) -> str:
     # 3. Base voice prompt
     parts.append(base)
 
-    # 4. L1 skill catalog (R32-1)
-    try:
-        from ..skills import get_skill_store
-        catalog = get_skill_store().catalog_block(active_locale=lang)
-        if catalog:
-            parts.append(catalog.lstrip("\n"))
-    except Exception as exc:
-        debug_log(f"skills catalog unavailable: {exc!r}", "pipecat")
+    # 4. L1 skill catalog (R32-1) — skipped in slim mode (R34-S42 К4)
+    if not slim:
+        try:
+            from ..skills import get_skill_store
+            catalog = get_skill_store().catalog_block(active_locale=lang)
+            if catalog:
+                parts.append(catalog.lstrip("\n"))
+        except Exception as exc:
+            debug_log(f"skills catalog unavailable: {exc!r}", "pipecat")
 
     return "\n\n".join(p for p in parts if p)
 
@@ -513,7 +526,10 @@ def _register_bot_utterance(text: str) -> None:
 # We keep the loaded ``PiperVoice`` in module-level cache so we don't
 # pay the 1.6s ONNX load on every reply.
 _PIPER_VOICE_CACHE: dict = {}
-_PLAYBACK_LOCK: object | None = None  # asyncio.Lock created lazily
+# R34-S42 — _PLAYBACK_LOCK is defined ABOVE at line 462 (threading.Lock).
+# The earlier `_PLAYBACK_LOCK: object | None = None` annotation here used
+# to overwrite it with None at module load, which made every `with
+# _PLAYBACK_LOCK:` raise "NoneType has no context manager". Removed.
 _CURRENT_PLAYBACK_PROC: object | None = None  # subprocess.Popen of afplay
 
 
@@ -1261,16 +1277,39 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
         async def _ensure_session(self):
             if self._session is None or self._session.closed:
                 import aiohttp as _ah
-                # R34-S39 — tightened timeouts.
-                # Previously total=60 / sock_read=45 caused 60s hangs when
-                # Tailscale dropped NAT mid-stream. qwen3:8b warm-eval of
-                # ≤140 predict tokens completes in <8s on the Hetzner GPU;
-                # 20s total is generous, 12s sock_read is the tightest
-                # SLA the network reliably meets.
+                # R34-S42 К4 — bumped sock_read 30→60s, total 45→75s.
+                # Worst case (cold model unload after >24h idle):
+                # qwen3:8b on Hetzner GPU under contention pays
+                # ~30-60s model reload + 5-10s prompt eval = ~70s
+                # for the FIRST call. Keep_alive='24h' keeps it warm
+                # after that, but the very first turn post-boot — or
+                # after a multi-day pause — needs this headroom.
+                # 60s catches the realistic worst case; the connect
+                # phase still fails fast in <3s if the host is genuinely
+                # unreachable (DNS / Tailscale down).
                 timeout = _ah.ClientTimeout(
-                    total=20, connect=3, sock_connect=3, sock_read=12,
+                    total=75, connect=3, sock_connect=3, sock_read=60,
                 )
-                self._session = _ah.ClientSession(timeout=timeout)
+                # R34-S42 К4 ROOT CAUSE — Tailscale links silently drop
+                # idle TCP keep-alive connections after ~60-90s, but the
+                # client-side socket stays in ESTABLISHED. aiohttp's
+                # default connection pool reuses these dead sockets;
+                # the next POST hangs waiting for bytes that never come,
+                # producing exactly the SocketTimeoutError we observed.
+                # ``force_close=True`` opens a fresh TCP connection per
+                # request (one extra handshake ≈ 30-80ms over Tailscale),
+                # eliminating the dead-socket reuse class of failure.
+                # ``enable_cleanup_closed`` reaps connections whose
+                # transport already died on the kernel side. Together
+                # they bring real-daemon latency parity with raw curl
+                # (~2-3s warm vs ∞ hang on stale pool).
+                connector = _ah.TCPConnector(
+                    force_close=True,
+                    enable_cleanup_closed=True,
+                )
+                self._session = _ah.ClientSession(
+                    timeout=timeout, connector=connector,
+                )
             return self._session
 
         async def cleanup(self) -> None:
@@ -1296,6 +1335,7 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                 pass
 
         async def _call_ollama(self, text: str, lang: str = "ru") -> str:
+            import time as _time
             session = await self._ensure_session()
             # R34-S39/40 — system prompt cached per-language. Re-validated
             # against ~/.config/jarvis/persona.md mtime so dashboard
@@ -1307,25 +1347,41 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             if cache is None:
                 cache = {}
                 self._sys_prompt_cache = cache
-            # Cheap stat call — ~10µs. If persona.md changed, drop cache.
+            # R34-S42 — invalidate cache when ANY of persona.md, facts.db,
+            # or 30s TTL expires. Without facts.db tracking, newly-learned
+            # facts wouldn't appear in the prompt until next daemon
+            # restart. The 30s TTL is a backstop for skill/config edits.
             try:
                 from pathlib import Path as _Path
+                import time as _t_cache
                 persona_path = _Path.home() / ".config/jarvis/persona.md"
+                facts_path = _Path.home() / "Library/Application Support/jarvis/facts.db"
+                stamps = []
                 if persona_path.exists():
-                    new_mtime = persona_path.stat().st_mtime
-                    if new_mtime != cache_mtime:
-                        cache.clear()
-                        self._sys_prompt_cache_mtime = new_mtime
+                    stamps.append(persona_path.stat().st_mtime)
+                if facts_path.exists():
+                    stamps.append(facts_path.stat().st_mtime)
+                new_mtime = max(stamps) if stamps else 0.0
+                last_built = getattr(self, "_sys_prompt_cache_built_at", 0.0)
+                age = _t_cache.monotonic() - last_built
+                if new_mtime != cache_mtime or age > 30.0:
+                    cache.clear()
+                    self._sys_prompt_cache_mtime = new_mtime
+                    self._sys_prompt_cache_built_at = _t_cache.monotonic()
             except Exception:
                 pass
             sys_prompt = cache.get(lang)
             if sys_prompt is None:
                 # Use the FULL system prompt builder (persona + facts +
-                # base + skills + time block) — NOT just _base_system_prompt
+                # base + time block) — NOT just _base_system_prompt
                 # which omits the persona block (R34-S37 bug). Then append
                 # the per-turn language lock.
+                # R34-S42 К4 — ``slim=True`` drops the L1 skill catalog
+                # (~1100 chars). direct_chat bypasses the LLM tool
+                # aggregator, so the catalog only inflates prompt eval
+                # cost (~5-8s on cold qwen3:8b) without adding value.
                 try:
-                    full_prompt = _system_prompt_for(lang)
+                    full_prompt = _system_prompt_for(lang, slim=True)
                 except Exception:
                     full_prompt = _base_system_prompt
                 try:
@@ -1366,19 +1422,44 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                     "temperature": float(getattr(cfg, "chat_temperature", 0.3)),
                 },
             }
+            # R34-S42 К4 — diagnostic so future timeouts can be triaged
+            # quickly. Logs sys-prompt size, user-text len, model + ctx
+            # settings + start time. Visible in jarvis-assistant.err.log
+            # when JARVIS_VOICE_DEBUG=true.
+            try:
+                debug_log(
+                    f"direct_chat→ollama: sys={len(sys_prompt)}ch "
+                    f"user={len(text)}ch model={model} "
+                    f"num_predict={num_predict} num_ctx={num_ctx} lang={lang}",
+                    "pipecat",
+                )
+            except Exception:
+                pass
+            t0_call = _time.monotonic()
             try:
                 async with session.post(ollama_url, json=payload) as resp:
                     if resp.status != 200:
                         body = await resp.text()
                         debug_log(
-                            f"direct_chat: ollama {resp.status}: {body[:200]}",
+                            f"direct_chat: ollama {resp.status} after "
+                            f"{_time.monotonic()-t0_call:.2f}s: {body[:200]}",
                             "pipecat",
                         )
                         return ""
                     data = await resp.json()
-                    return str(data.get("message", {}).get("content", "") or "")
+                    reply = str(data.get("message", {}).get("content", "") or "")
+                    debug_log(
+                        f"direct_chat: ollama OK in "
+                        f"{_time.monotonic()-t0_call:.2f}s reply_len={len(reply)}",
+                        "pipecat",
+                    )
+                    return reply
             except Exception as exc:
-                debug_log(f"direct_chat: ollama call failed: {exc!r}", "pipecat")
+                debug_log(
+                    f"direct_chat: ollama call failed after "
+                    f"{_time.monotonic()-t0_call:.2f}s: {exc!r}",
+                    "pipecat",
+                )
                 return ""
 
         async def _speak(self, text: str, direction: "FrameDirection") -> None:
@@ -1759,10 +1840,16 @@ def _make_fast_path_processor():
                 def _run_say() -> None:
                     import subprocess as _sp
                     try:
+                        # R34-S42 — DEVNULL all streams (same fix as
+                        # DirectChat path) to prevent SIGTTIN under
+                        # foreground daemon launches.
                         _sp.run(
                             ["say", "-v", "Milena", "-r", "210", text],
                             check=False,
                             timeout=30,
+                            stdin=_sp.DEVNULL,
+                            stdout=_sp.DEVNULL,
+                            stderr=_sp.DEVNULL,
                         )
                     except Exception as exc:
                         debug_log(
@@ -3034,6 +3121,42 @@ def _make_echo_filter_processor():
                 if getattr(frame, "user_id", "") == "dashboard":
                     await self.push_frame(frame, direction)
                     return
+                # R34-S42 — UNIVERSAL STOP must run BEFORE the echo
+                # blocking window, otherwise "стоп" said mid-TTS gets
+                # dropped here and never reaches wake-gate to barge-in.
+                # Check tokenised first-word so "стоп, джарвіс" / "хватит уже"
+                # all match without depending on whole-string equality.
+                if self._speaking:
+                    _STOP_KEYS = {
+                        "стоп", "стой", "тихо", "хватит",
+                        "досить", "тиша", "вистачить",
+                        "stop", "silence", "quiet", "enough",
+                    }
+                    _ftext = (frame.text or "").lower()
+                    # Strip all leading punct and look at first token
+                    _tokens = _re.findall(r"[\wа-щьюяїієґА-ЩЬЮЯЇІЄҐ']+", _ftext)
+                    if _tokens and _tokens[0] in _STOP_KEYS:
+                        try:
+                            _stop_current_playback()
+                        except Exception:
+                            pass
+                        try:
+                            from pathlib import Path as _P
+                            import time as _t_stop
+                            _flag = _P.home() / "Library/Application Support/jarvis/interrupt.flag"
+                            _flag.write_text(str(int(_t_stop.time())))
+                        except Exception:
+                            pass
+                        try:
+                            self._stream.emit(
+                                "log",
+                                level="INFO",
+                                component="echo-filter",
+                                message=f"universal stop honoured pre-echo-window: {frame.text!r}",
+                            )
+                        except Exception:
+                            pass
+                        return  # consume — never reaches wake-gate
                 # 1. Echo gate (time window after BotStoppedSpeaking)
                 if self._is_blocking_window():
                     try:
@@ -3508,10 +3631,33 @@ def _build_pipeline(cfg: PipecatLoopConfig):
             whisper_repo = _get_mlx_model_repo(normalised)
         except Exception:
             pass
+        # R34-S42 К4 — pass the SLIM prompt (same as direct_chat uses)
+        # plus the language lock & clarify glue, so the warmup eval
+        # primes the exact KV-cache prefix the first real turn will
+        # reuse. Otherwise the warmup populates one prefix and the
+        # first user turn pays a full re-eval. Build the same prompt
+        # the JarvisDirectChatProcessor builds at line ~1380.
+        try:
+            from ..memory.self_learning import language_lock_block
+            lock_ = language_lock_block(cfg.active_language)
+        except Exception:
+            lock_ = ""
+        clarify_ = (
+            "Якщо запит незрозумілий, нечіткий або схожий на безглуздий — "
+            "перепитай одним коротким реченням, НЕ вигадуй відповідь."
+            if cfg.active_language == "uk"
+            else "Если запрос неясный, нечёткий или похож на бессмыслицу — "
+                 "переспроси одним коротким предложением, НЕ выдумывай ответ."
+        )
+        try:
+            slim_prompt_ = _system_prompt_for(cfg.active_language, slim=True)
+        except Exception:
+            slim_prompt_ = system_prompt
+        warmup_sys = "\n\n".join(p for p in (slim_prompt_, clarify_, lock_) if p)
         warmup_voice_stack(
             ollama_base_url=cfg.ollama_base_url,
             chat_model=cfg.chat_model,
-            system_prompt=system_prompt,
+            system_prompt=warmup_sys,
             whisper_mlx_repo=whisper_repo,
             piper_voice_id=cfg.piper_voice_id,
             piper_dir=piper_dir,

@@ -98,6 +98,11 @@ def _warmup_ollama(
         return
 
     url = base_url.rstrip("/") + "/api/chat"
+    # R34-S42 К4 — warmup payload MUST match direct_chat's payload
+    # exactly so Ollama doesn't spawn a NEW runner on first real turn.
+    # Ollama keys its runners by (model, num_ctx) — mismatched ctx
+    # between warmup and the real call forces a full reload (~30-60s
+    # on CPU-only Hetzner) defeating the purpose of warmup entirely.
     body = {
         "model": model,
         "messages": [
@@ -105,8 +110,10 @@ def _warmup_ollama(
             {"role": "user", "content": "ok"},
         ],
         "stream": False,
+        "think": False,
         "options": {
             "num_predict": 1,    # we throw the reply away
+            "num_ctx": 2048,     # MUST match direct_chat's num_ctx
             "temperature": 0.0,
         },
         "keep_alive": "24h",   # match the daemon's chat policy
@@ -231,6 +238,40 @@ def _warmup_piper(voice_id: str, piper_dir: Optional[Path] = None) -> None:
         _log(f"Piper warmup failed: {exc}", "warning")
 
 
+def _keepwarm_ollama_loop(
+    *,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    interval_s: float = 240.0,
+) -> None:
+    """Run ``_warmup_ollama`` on a 4-minute loop forever.
+
+    R34-S42 К4 — Ollama on the Hetzner CPU box silently evicts
+    qwen3:8b after a few minutes even with ``keep_alive='24h'`` set
+    (memory pressure: 4 cores / 15 GiB RAM and 3 other models loaded).
+    A re-evicted model pays a 30-60 s cold reload on the next turn.
+
+    Pinging every 4 minutes (well under any observed eviction window)
+    keeps the runner hot AND keeps the system-prompt KV cache prefix
+    primed — so real user turns hit pure-warm 1-4 s latency.
+
+    Pure daemon thread: any failure logs + continues; we never want
+    keep-warm noise to leak into the user-facing voice path.
+    """
+    while True:
+        try:
+            time.sleep(interval_s)
+            _warmup_ollama(
+                base_url=base_url,
+                model=model,
+                system_prompt=system_prompt,
+                timeout_s=120.0,
+            )
+        except Exception as exc:
+            _log(f"Ollama keep-warm tick failed: {exc!r}", "warning")
+
+
 def warmup_voice_stack(
     *,
     ollama_base_url: str,
@@ -257,6 +298,18 @@ def warmup_voice_stack(
             "system_prompt": system_prompt,
         },
         name="warmup-ollama",
+        daemon=True,
+    ))
+    # R34-S42 К4 — periodic keep-warm so qwen3:8b on the CPU box
+    # doesn't get evicted between user turns.
+    threads.append(threading.Thread(
+        target=_keepwarm_ollama_loop,
+        kwargs={
+            "base_url": ollama_base_url,
+            "model": chat_model,
+            "system_prompt": system_prompt,
+        },
+        name="keepwarm-ollama",
         daemon=True,
     ))
     if whisper_mlx_repo:
