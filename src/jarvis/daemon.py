@@ -228,7 +228,12 @@ def _check_and_update_diary(
     """
     global _global_dialogue_memory, _diary_update_callbacks
 
-    debug_log(f"diary update check: force={force}, verbose={verbose}", "memory")
+    # R34-S49 OPT — silence the no-op "check" line. This runs every
+    # ~30s in the daemon's diary-poll loop and accounted for ~20% of
+    # all debug-log volume in the err log. Keep it for verbose=True
+    # (manual / forced diary updates surface diagnostics).
+    if verbose or force:
+        debug_log(f"diary update check: force={force}, verbose={verbose}", "memory")
 
     # Helper to safely call callbacks and/or emit IPC events
     def _notify(event_type: str, data):
@@ -261,7 +266,11 @@ def _check_and_update_diary(
 
     try:
         should_update = force or _global_dialogue_memory.should_update_diary()
-        debug_log(f"diary update: should_update={should_update}, force={force}", "memory")
+        # R34-S49 OPT — only log the no-op case when verbose. The
+        # interesting branch (should_update=True) is logged via the
+        # "found N pending chunks" line below.
+        if verbose or should_update or force:
+            debug_log(f"diary update: should_update={should_update}, force={force}", "memory")
 
         if should_update:
             # Display-only: get a snapshot of pending chunks to notify the UI.

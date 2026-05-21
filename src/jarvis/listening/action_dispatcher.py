@@ -540,6 +540,113 @@ def _write_note(text: str) -> tuple[bool, str]:
         return False, f"Не зміг записати: {e}"
 
 
+# R34-S49 REC 3 — Self-skill-add voice flow.
+#
+# User: "якщо немає якогось скіла, говорив про це і просив щоб я
+# підтвердив йому додавання цього скілла і він сам додавав та
+# налаштовував цей скіл для самого себе". The plumbing exists in
+# ``agent/self_upgrade.py`` (write_upgrade_brief + spawn_claude); this
+# action is the thin voice wrapper that turns a confirmed
+# "Джарвіс, навчись робити X" into a Claude CLI invocation.
+#
+# Flow (caller drives the confirmation gate via the fast-path):
+#   1. User says "Джарвіс, навчись закривати всі вкладки Chrome".
+#   2. Fast-path matches → "Создаю навык: …. Подтверждаешь?".
+#   3. User says "да".
+#   4. ``_self_add_skill`` writes a brief, spawns ``claude`` in the
+#      background, returns immediately so TTS can speak "Учусь, через
+#      пару минут перезапущусь". The background thread polls the
+#      Claude process; on success it kicks launchctl and the daemon
+#      reloads. On failure it just logs — Jarvis stays alive on the
+#      old skill set.
+#
+# Why a separate action (not just reuse the existing ``is_upgrade_request``
+# hook in pipecat_loop)?
+#   - The existing path is for OPEN-ENDED upgrade requests ("оновись",
+#     "виправ собі", "покращ роботу") and is parsed in the LLM-reply
+#     branch — too late if the user wants the request gated by the
+#     fast-path confirmation policy (which is what they explicitly
+#     asked for: "я підтвердив йому додавання цього скілла").
+#   - This action lives in the fast-path with a tight regex anchor,
+#     so it can only fire when the user said the magic phrase. It
+#     piggybacks on ``write_upgrade_brief`` for the heavy lifting.
+def _self_add_skill(description: str) -> tuple[bool, str]:
+    """Spawn Claude CLI to add a new skill. Returns immediately.
+
+    The brief is the user's spoken description, verbatim — wrapped in
+    the UNTRUSTED-USER-REQUEST fence ``write_upgrade_brief`` already
+    uses, so even a malicious utterance like "delete all files" lands
+    in the brief as data, not instructions. Claude's auto-accepted
+    permissions were dropped in audit round 8 — risky tool use
+    requires manual approval in the spawned terminal session.
+    """
+    safe = (description or "").strip()
+    if not safe:
+        return False, "Пустое описание навыка"
+    if len(safe) > 600:
+        safe = safe[:600] + "…"
+
+    # Lazy import — keep cold-start fast and avoid pulling the
+    # self_upgrade module (which transitively imports utils.env_scrub)
+    # on every voice call.
+    try:
+        from ..agent.self_upgrade import (
+            write_upgrade_brief,
+            spawn_claude,
+            wait_for_completion_and_restart,
+        )
+    except Exception as exc:
+        return False, f"Модуль самообучения недоступен: {exc}"
+
+    try:
+        # Frame the request so Claude knows this is a SKILL addition,
+        # not a generic bug fix. Direct it to action_dispatcher.py.
+        framed = (
+            f"Я хочу научить тебя новому навыку:\n\n"
+            f"{safe}\n\n"
+            f"Реализуй этот навык как новую запись в "
+            f"`src/jarvis/listening/action_dispatcher.py`:\n"
+            f"1) Добавь приватную функцию `_skill_<name>(...)` рядом "
+            f"с другими handler-ами.\n"
+            f"2) Добавь regex pattern в USER_COMMAND_PATTERNS "
+            f"(анкор `^\\s*`, IGNORECASE, голос RU+UA).\n"
+            f"3) Если навык read-only — добавь имя action-а в "
+            f"`_SAFE_ACTIONS_NO_CONFIRM` (pipecat_loop.py) и в "
+            f"`_RESULT_IS_THE_ANSWER` если return-message сам по себе "
+            f"является ответом пользователю.\n"
+            f"4) Минимальный unit-test в tests/ (если runnable).\n"
+            f"5) Коммить только изменённые файлы."
+        )
+        brief = write_upgrade_brief(framed)
+    except Exception as exc:
+        return False, f"Не получилось записать brief: {exc}"
+
+    proc = spawn_claude(brief)
+    if proc is None:
+        return False, "Claude CLI недоступен или уже запущен"
+
+    # Background poller — must not block the voice loop.
+    def _poll() -> None:
+        try:
+            ok, summary = wait_for_completion_and_restart(proc, max_wait_sec=1800)
+            try:
+                from ..debug import debug_log as _dl
+                _dl(f"self_add_skill done: ok={ok} summary={summary[:200]}", "voice")
+            except Exception:
+                pass
+        finally:
+            try:
+                from ..agent.self_upgrade import release_upgrade_lock
+                release_upgrade_lock()
+            except Exception:
+                pass
+
+    threading.Thread(target=_poll, daemon=True, name="jarvis-self-skill-add").start()
+
+    short = safe[:60] + ("…" if len(safe) > 60 else "")
+    return True, f"Учусь делать «{short}». Через пару минут перезапущусь — позови меня снова."
+
+
 def _nexus_brain_search(query: str) -> tuple[bool, str]:
     """Search the Nexus-Brain Obsidian vault for ``query`` and read top hits.
 
@@ -774,6 +881,124 @@ def _web_search(query: str) -> tuple[bool, str]:
         return True, f"Шукаю в Google: {query[:60]}"
     except Exception as e:
         return False, f"Помилка: {e}"
+
+
+# R34-S49 REC 2 — Web fact-check via DuckDuckGo HTML scrape.
+#
+# Why DDG, not Google?
+#   - Google blocks plain-`User-Agent` HTTP scrapes within a few requests.
+#   - DDG's `https://html.duckduckgo.com/html/?q=...` endpoint serves a
+#     bot-friendly HTML page (no JS, no captcha at low volume) — safe for
+#     a voice assistant that fires ~10-30 queries/day.
+#   - Zero API key, zero rate-limit on this volume, zero ToS issues.
+#
+# Strategy:
+#   1. urllib GET with realistic browser UA + 5s timeout.
+#   2. Regex over the result HTML (no BeautifulSoup dep — we already
+#      avoid heavy parsers everywhere else).
+#   3. Extract top 3 result snippets, strip HTML, return a single
+#      voice-friendly paragraph (~200 chars).
+#
+# Read-only: never visits the underlying pages, never writes anything to
+# disk. Safe to enroll in ``_SAFE_ACTIONS_NO_CONFIRM`` (no destructive
+# side effect) — see fast-path site in ``pipecat_loop.py``.
+_DDG_RESULT_RE = re.compile(
+    r'<a[^>]+class="result__a"[^>]*>(?P<title>.*?)</a>.*?'
+    r'<a[^>]+class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_ENTITY_MAP = {
+    "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+    "&#39;": "'", "&apos;": "'", "&nbsp;": " ",
+    "&laquo;": "«", "&raquo;": "»", "&mdash;": "—", "&ndash;": "–",
+    "&hellip;": "…",
+}
+
+
+def _strip_html(text: str) -> str:
+    """Strip HTML tags + decode common entities (no external deps)."""
+    if not text:
+        return ""
+    text = _HTML_TAG_RE.sub("", text)
+    for ent, ch in _HTML_ENTITY_MAP.items():
+        text = text.replace(ent, ch)
+    # Numeric entities (&#1234;)
+    text = re.sub(
+        r"&#(\d+);",
+        lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x10ffff else m.group(0),
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _web_fact_check(query: str) -> tuple[bool, str]:
+    """Fetch top DDG results and return a voice-friendly summary.
+
+    R34-S49 — the user asked for Jarvis to verify claims via the
+    internet ("щоб джарвіс перевіряв всю інформацію через інтернет
+    підключення на правдивість"). This is the offline-safe primitive:
+    scrape DDG HTML, pull the top 3 snippets, return a single
+    paragraph short enough for TTS (< 400 chars).
+
+    Failure modes are explicit — no network / no results / parse fail
+    all return ``ok=False`` with a Russian explanation. The caller
+    (fast-path → ``_SAFE_ACTIONS_NO_CONFIRM``) speaks the success path
+    aloud; the LLM never sees this output, so we don't need to be
+    structured — readability for Piper > machine-readability.
+    """
+    from urllib.parse import quote_plus
+    from urllib.request import Request, urlopen
+
+    q = (query or "").strip()
+    if not q:
+        return False, "Пустой запрос для поиска"
+    if len(q) > 200:
+        q = q[:200]
+
+    url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+    headers = {
+        # Pretend to be a desktop Safari — DDG returns its lightweight
+        # HTML variant for any UA, but realistic UA reduces the chance
+        # of a soft-block from a shared cloud egress.
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.4 Safari/605.1.15"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8,uk;q=0.7",
+    }
+    try:
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=5.0) as resp:  # noqa: S310 — trusted host
+            raw = resp.read(120_000)  # cap at 120 KB; DDG SERP is ~30 KB
+        body = raw.decode("utf-8", errors="replace")
+    except Exception as exc:
+        return False, f"Поиск недоступен: {type(exc).__name__}"
+
+    hits: list[tuple[str, str]] = []
+    for m in _DDG_RESULT_RE.finditer(body):
+        title = _strip_html(m.group("title"))[:120]
+        snip = _strip_html(m.group("snippet"))[:240]
+        if title and snip:
+            hits.append((title, snip))
+        if len(hits) >= 3:
+            break
+
+    if not hits:
+        return False, "Ничего не нашёл в интернете"
+
+    # Voice-friendly: concatenate the top-1 snippet with a hint that
+    # more sources exist. 250 chars ≈ 12s of Piper at 1.0 length scale.
+    title0, snip0 = hits[0]
+    extra = ""
+    if len(hits) > 1:
+        extra = f" Ещё {len(hits) - 1} источник{'а' if len(hits) - 1 < 5 else 'ов'}."
+    summary = f"{snip0}{extra}"
+    # Hard cap so a runaway HTML doesn't blow up TTS latency.
+    if len(summary) > 400:
+        summary = summary[:397] + "…"
+    return True, summary
 
 
 def _set_volume(level: int) -> tuple[bool, str]:
@@ -2309,6 +2534,57 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             created_ts=time.time(),
         ),
     ),
+    # ── R34-S49 REC 2: web fact-check (DDG HTML, voice-only) ──
+    # User: "джарвіс повинен перевіряти всю інформацію через інтернет
+    # на правдивість". This pattern catches the verbal cues that mean
+    # "please check this online and tell me what you found" — distinct
+    # from "open Google" (web_search, browser-opening) above. The
+    # action returns spoken text, not a browser window.
+    #
+    # Two sub-patterns:
+    #   A) UNAMBIGUOUS verbs that are intrinsically about web search
+    #      (загугли/погугли/google/look up) — keyword optional. The
+    #      verb itself implies "online".
+    #   B) GENERIC verbs (перевір/проверь/пошукай/поищи) — require an
+    #      explicit "в інтернеті / в гуглі / онлайн / в мережі / on
+    #      the web" keyword. Otherwise these verbs collide with the
+    #      nexus_brain_search pattern below ("перевір у мозку X") and
+    #      with the "знайди" general-purpose verb. Negative lookahead
+    #      blocks "мозок|brain" tokens from leaking through.
+    (
+        re.compile(
+            r"^\s*(?:загугли[те]?|погугли[те]?|look\s+up|google\s+(?:it|that)?)\s+"
+            r"(?!(?:у\s+|в\s+)?(?:мозок|мозку|мозг|мозге|brain|нексус))"
+            r"(?:в\s+|у\s+|на\s+|in\s+|on\s+)?"
+            r"(?:інтернет[іе]?|интернет[е]?|онлайн|online|"
+            r"гугл[іе]?|google|мережі|сети|web)?\s*[:,]?\s*"
+            r"(.{2,200})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="web_fact_check",
+            description=f"Проверяю в интернете: {m.group(1).strip()[:50]}",
+            fn=lambda: _web_fact_check(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    (
+        re.compile(
+            r"^\s*(?:перевір|перевірь|проверь|пошукай|поищи|поищу|"
+            r"знайди\s+мені|найди\s+мне|пошукай\s+мені)\s+"
+            r"(?:в\s+|у\s+|на\s+|in\s+|on\s+)?"
+            r"(?:інтернет[іе]?|интернет[е]?|онлайн|online|"
+            r"гугл[іе]?|google|мережі|сети|web)\s*[:,]?\s*"
+            r"(.{2,200})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="web_fact_check",
+            description=f"Проверяю в интернете: {m.group(1).strip()[:50]}",
+            fn=lambda: _web_fact_check(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
     # Round 29 (F82): duplicate URL pattern removed. Previously this
     # identical UA "відкрий <URL>" regex appeared twice (here and at
     # the top of USER_COMMAND_PATTERNS line ~1543). The second copy
@@ -2497,6 +2773,28 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             name="show_desktop",
             description="Показую робочий стіл",
             fn=_show_desktop,
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S49 REC 3: self-skill-add ──
+    # User: "якщо немає якогось скіла, говорив про це і просив щоб я
+    # підтвердив... і він сам додавав та налаштовував цеей скіл". This
+    # pattern catches voice requests of the form
+    #   "Джарвіс, навчись робити X" / "научись X" / "learn how to X".
+    # The action is NOT in _SAFE_ACTIONS_NO_CONFIRM — every skill add
+    # spawns Claude with file-write access, so we ALWAYS take the
+    # confirmation round-trip.
+    (
+        re.compile(
+            r"^\s*(?:навчись|научись|вивчи|выучи|"
+            r"learn(?:\s+(?:how\s+)?to)?)\s+"
+            r"(.{5,400})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="self_add_skill",
+            description=f"Создаю новый навык: {m.group(1).strip()[:60]}",
+            fn=lambda: _self_add_skill(m.group(1).strip()),
             created_ts=time.time(),
         ),
     ),

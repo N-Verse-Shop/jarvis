@@ -100,6 +100,11 @@ class Settings:
     ollama_base_url: str
     ollama_embed_model: str
     ollama_chat_model: str
+    # R34-S49 REC1 — optional light/fast model for tiered routing.
+    # Empty string means the router is disabled; all chat calls go to
+    # ``ollama_chat_model``. See ``intent_complexity_router_enabled``.
+    ollama_chat_model_light: str
+    intent_complexity_router_enabled: bool
     llm_chat_timeout_sec: float
     llm_tools_timeout_sec: float
     # Tight deadline for the cheap distil passes used by memory_digest and
@@ -595,6 +600,10 @@ def get_default_config() -> Dict[str, Any]:
         # Intent Judge (LLM-based intent classification)
         # Always used when available, falls back to simple wake word detection
         "llm_thinking_enabled": False,  # Enable thinking/reasoning mode for chat (slower but may improve quality)
+        # R34-S49 REC1 — see comment block in config.json. Defaults keep
+        # the legacy single-model behaviour.
+        "ollama_chat_model_light": "",
+        "intent_complexity_router_enabled": False,
         "intent_judge_model": "gemma4:e2b",  # Model for intent judging (needs reasoning ability)
         "intent_judge_timeout_sec": 15.0,  # Max time to wait for intent judge response
         "intent_judge_thinking_enabled": False,  # Enable thinking for intent judge (adds latency to wake detection)
@@ -743,6 +752,11 @@ def load_settings() -> Settings:
     ollama_base_url = str(merged.get("ollama_base_url"))
     ollama_embed_model = str(merged.get("ollama_embed_model"))
     ollama_chat_model = str(merged.get("ollama_chat_model"))
+    # R34-S49 REC1 — optional second model for tiered routing.
+    ollama_chat_model_light = str(merged.get("ollama_chat_model_light", "") or "")
+    intent_complexity_router_enabled = bool(
+        merged.get("intent_complexity_router_enabled", False)
+    )
     use_stdin = bool(merged.get("use_stdin", False))
     active_profiles = _ensure_list(merged.get("active_profiles"))
     tts_enabled = bool(merged.get("tts_enabled", True))
@@ -982,6 +996,8 @@ def load_settings() -> Settings:
         ollama_base_url=ollama_base_url,
         ollama_embed_model=ollama_embed_model,
         ollama_chat_model=ollama_chat_model,
+        ollama_chat_model_light=ollama_chat_model_light,
+        intent_complexity_router_enabled=intent_complexity_router_enabled,
         llm_chat_timeout_sec=llm_chat_timeout_sec,
         llm_tools_timeout_sec=llm_tools_timeout_sec,
         llm_digest_timeout_sec=llm_digest_timeout_sec,

@@ -2234,6 +2234,13 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
         # Asking for confirmation on every "знайди у мозку X" would
         # be friction with no safety benefit.
         "nexus_brain_search",
+        # R34-S49 REC 2 — Web fact-check is read-only HTTP GET to DDG.
+        # No browser tab is opened, no state mutates; the action just
+        # returns a short summary string. Treating it as safe means
+        # voice "перевір в інтернеті X" gives an immediate spoken
+        # answer (the whole point of the skill) without an annoying
+        # "Подтверждаешь?" round-trip.
+        "web_fact_check",
     }
     # Confirmation vocab — keep generous; STT mishearings happen.
     # All entries lowercased & punctuation-stripped before match.
@@ -2717,6 +2724,14 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
             _RESULT_IS_THE_ANSWER = {
                 "say_time", "say_date", "battery", "read_clipboard",
                 "nexus_brain_search",
+                # R34-S49 REC 2 — DDG snippet IS the answer the user
+                # asked for ("перевір в інтернеті X" → spoken summary).
+                "web_fact_check",
+                # R34-S49 REC 3 — speak the "Учусь делать X" status
+                # message (the action's return value) instead of the
+                # generic description, so the user immediately knows
+                # the skill add is in progress.
+                "self_add_skill",
             }
             if ok and action.name in _RESULT_IS_THE_ANSWER and msg and msg.strip():
                 # The action's msg IS what the user asked for. Cap at
@@ -4732,6 +4747,16 @@ class PipecatLoop:
             runner = PipelineRunner(handle_sigint=False)
             self._runner = runner
             debug_log("PipecatLoop starting PipelineRunner", "pipecat")
+            # R34-S49 REC 4 — start the cron-style background scheduler.
+            # Tasks (events.jsonl rotate, audit.db vacuum, briefs prune,
+            # Brain inventory, Ollama keepwarm) run in their own daemon
+            # thread, so a slow task can never block the voice pipeline.
+            # See loop_workers.py docstring for the registry.
+            try:
+                from . import loop_workers as _lw
+                _lw.start()
+            except Exception as exc:
+                debug_log(f"loop_workers: start failed: {exc!r}", "pipecat")
             # R34-S29: poll the dashboard's interrupt flag in a side
             # task so the user can stop TTS / abort the current turn
             # without waiting for VAD to detect their voice.
