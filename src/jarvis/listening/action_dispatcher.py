@@ -540,6 +540,166 @@ def _write_note(text: str) -> tuple[bool, str]:
         return False, f"Не зміг записати: {e}"
 
 
+def _nexus_brain_search(query: str) -> tuple[bool, str]:
+    """Search the Nexus-Brain Obsidian vault for ``query`` and read top hits.
+
+    R34-S47 — the user (Danylo Molyanko, CEO Nexus Studio) keeps the
+    company's full operational knowledge in
+    ``~/Documents/Nexus-Brain/`` (clients, partners, finance,
+    knowledge base, daily notes). Without read access Jarvis was a
+    Wikipedia-with-extra-steps; with it Jarvis can answer "What's
+    Ibons' Hydrogen stack?" or "Who's our Bitrix24 contact?"
+    confidently from on-disk truth.
+
+    Strategy:
+      1. ``ripgrep`` the vault for the query (case-insensitive,
+         markdown + text files only, max 20 hits).
+      2. Read the matched files (cap at 3 best hits, 800 chars each)
+         so the spoken reply has actual content to summarise.
+      3. Return a short paragraph: "Знайшов у Brain: <file1>: <snippet>
+         …" — voice-friendly and bounded.
+
+    Failure modes — no rg installed / vault missing / no hits — all
+    degrade to ``ok=False`` with an explanatory message so the LLM
+    can fall back to its parametric knowledge.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    vault = os.path.expanduser("~/Documents/Nexus-Brain")
+    if not os.path.isdir(vault):
+        return False, "Nexus-Brain не знайдено локально"
+
+    q = (query or "").strip()
+    if not q:
+        return False, "Порожній запит до Nexus-Brain"
+    if len(q) > 200:
+        q = q[:200]
+
+    rg = shutil.which("rg") or "/opt/homebrew/bin/rg"
+    if not os.path.exists(rg):
+        # No ripgrep → fall back to a Python-only walk that grep's
+        # the first 4 KB of each .md file. Slower but always works.
+        hits: list[tuple[str, str]] = []
+        try:
+            ql = q.lower()
+            for root, _dirs, files in os.walk(vault):
+                # Skip Obsidian / git / DS_Store dot-folders.
+                if "/.obsidian" in root or "/.git" in root:
+                    continue
+                for name in files:
+                    if not (name.endswith(".md") or name.endswith(".txt")):
+                        continue
+                    path = os.path.join(root, name)
+                    try:
+                        with open(path, "r", encoding="utf-8", errors="replace") as f:
+                            data = f.read(4096)
+                    except Exception:
+                        continue
+                    if ql in data.lower():
+                        snip = data.strip().replace("\n", " ")[:400]
+                        rel = os.path.relpath(path, vault)
+                        hits.append((rel, snip))
+                        if len(hits) >= 3:
+                            break
+                if len(hits) >= 3:
+                    break
+        except Exception as exc:
+            return False, f"Не зміг прочитати vault: {exc}"
+        if not hits:
+            return False, "У Nexus-Brain нічого не знайшов"
+        parts = [f"{rel}: {snip}" for rel, snip in hits[:3]]
+        return True, "Знайшов у Brain — " + " ⏤ ".join(parts)
+
+    # ripgrep path — much faster on a 1000-file vault.
+    try:
+        out = subprocess.run(
+            [
+                rg, "-i", "-l", "--type", "md", "--type", "txt",
+                "--max-count", "1", "--no-messages",
+                q, vault,
+            ],
+            capture_output=True, text=True, timeout=8,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Пошук у Brain застряг"
+    except Exception as exc:
+        return False, f"rg failed: {exc}"
+    files = [ln for ln in out.stdout.splitlines() if ln.strip()][:3]
+    if not files:
+        return False, "У Nexus-Brain нічого не знайшов"
+    hits = []
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                data = f.read(2048)
+        except Exception:
+            continue
+        snip = data.strip().replace("\n", " ")[:400]
+        rel = os.path.relpath(path, vault)
+        hits.append((rel, snip))
+    if not hits:
+        return False, "Знайшов файли але не можу прочитати"
+    parts = [f"{rel}: {snip}" for rel, snip in hits]
+    return True, "Знайшов у Brain — " + " ⏤ ".join(parts)
+
+
+def _nexus_brain_append(section: str, body: str) -> tuple[bool, str]:
+    """Append ``body`` under a date-stamped heading in a Brain file.
+
+    Used for "запиши в мозок що …" — automatically pipes new facts
+    about Nexus Studio (or clients / partners) into the vault so
+    the next session has them. ``section`` selects the destination:
+
+      ``nexus-studio`` → 04-KNOWLEDGE/nexus-studio.md  (default)
+      ``ideas``        → 00-INBOX/ideas/jarvis.md
+      ``daily``        → 06-DAILY/<YYYY-MM-DD>.md
+
+    Sanitisation is the same conservative set ``_write_note`` uses
+    (HTML-comment stripping, scheme bleach, length cap).
+    """
+    import os
+    from datetime import datetime
+    from ..utils.redact import scrub_secrets as _scrub
+
+    safe = (body or "").strip()
+    if not safe:
+        return False, "Порожній зміст для запису"
+    try:
+        safe = _scrub(safe)
+    except Exception:
+        pass
+    safe = (
+        safe.replace("<!--", "")
+            .replace("-->", "")
+            .replace("javascript:", "")
+            .replace("data:", "")
+    )
+    if len(safe) > 2000:
+        safe = safe[:2000] + "…"
+
+    vault = os.path.expanduser("~/Documents/Nexus-Brain")
+    today = datetime.now().strftime("%Y-%m-%d")
+    section_l = (section or "").strip().lower()
+    if section_l in ("ideas", "ідеї", "идеи"):
+        target = os.path.join(vault, "00-INBOX/ideas/jarvis.md")
+    elif section_l in ("daily", "щоденник", "дневник"):
+        target = os.path.join(vault, "06-DAILY", f"{today}.md")
+    else:
+        target = os.path.join(vault, "04-KNOWLEDGE/nexus-studio.md")
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n## {datetime.now():%Y-%m-%d %H:%M} — Jarvis\n\n{safe}\n"
+            )
+        rel = os.path.relpath(target, vault)
+        return True, f"Записав у Brain: {rel}"
+    except Exception as exc:
+        return False, f"Не зміг записати в Brain: {exc}"
+
+
 def _say_time() -> tuple[bool, str]:
     """Return current local time."""
     from datetime import datetime
@@ -2317,6 +2477,61 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             name="show_desktop",
             description="Показую робочий стіл",
             fn=_show_desktop,
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S47: Nexus-Brain search ──
+    # "Подивись/знайди/перевір у мозку <запит>" / "поищи в мозге …"
+    # / "загугли по brain …" — read-only, never destructive, so this
+    # one is in _SAFE_ACTIONS_NO_CONFIRM at the fast-path site.
+    (
+        re.compile(
+            r"^\s*(?:подивись|перевір|перевірь|знайди|пошукай|пошук|search|find|"
+            r"посмотри|проверь|найди|поищи|поиск)\s+"
+            r"(?:у\s+|в\s+|по\s+|in\s+)?(?:мозку|мозок|мозге|мозг|brain|вашему\s+мозгу|"
+            r"моєму\s+мозку|нексус[- ]?брейн|nexus[- ]?brain)\s+"
+            r"(.{2,200})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="nexus_brain_search",
+            description=f"Шукаю у Brain: {m.group(1).strip()}",
+            fn=lambda: _nexus_brain_search(m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S47: Nexus-Brain write — Nexus Studio knowledge ──
+    # "Запам'ятай / запиши в мозок: <факт>" / "запомни в мозге …"
+    # Targets 04-KNOWLEDGE/nexus-studio.md by default. Destructive
+    # (writes to disk) so it goes through the confirmation gate.
+    (
+        re.compile(
+            r"^\s*(?:запам['']ятай|запам['']ятай|запиши|запиши[те]?|"
+            r"запомни|сохрани|remember|save)\s+"
+            r"(?:у\s+|в\s+|to\s+)?(?:мозок|мозку|мозг|мозге|brain|нексус[- ]?брейн|"
+            r"nexus[- ]?brain)\s*[:,]?\s*"
+            r"(.{3,500})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="nexus_brain_write",
+            description=f"Записую у Brain (Nexus Studio): {m.group(1).strip()[:60]}",
+            fn=lambda: _nexus_brain_append("nexus-studio", m.group(1).strip()),
+            created_ts=time.time(),
+        ),
+    ),
+    # ── R34-S47: Nexus-Brain write — ideas inbox ──
+    (
+        re.compile(
+            r"^\s*(?:додай|записати|запиши|запомни|save)\s+"
+            r"(?:в\s+|до\s+|to\s+)?(?:ідеї|идею|ideas?|inbox)\s*[:,]?\s*"
+            r"(.{3,500})\s*[!\.\?]?\s*$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(
+            name="nexus_brain_write",
+            description=f"Записую ідею: {m.group(1).strip()[:60]}",
+            fn=lambda: _nexus_brain_append("ideas", m.group(1).strip()),
             created_ts=time.time(),
         ),
     ),

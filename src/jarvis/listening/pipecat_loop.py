@@ -420,6 +420,37 @@ def _system_prompt_for(lang: str, *, slim: bool = False) -> str:
     # 3. Base voice prompt
     parts.append(base)
 
+    # 3b. R34-S47 — Nexus Brain awareness. We don't dump the whole
+    # vault into context (that's 5+ MB of markdown), but we DO tell
+    # the LLM the brain exists, where it lives, and how to ask for a
+    # search. Without this hint, the model never volunteers "хочеш
+    # щоб я подивився в Brain?" — it just hallucinates from
+    # parametric training. A 250-char nudge is enough to teach the
+    # behaviour without breaking the prompt budget.
+    if lang == "uk":
+        brain_hint = (
+            "Користувач веде базу знань Nexus Studio у "
+            "~/Documents/Nexus-Brain (Obsidian vault: 01-CLIENTS, "
+            "02-PROJECTS, 04-KNOWLEDGE, 08-PARTNERS …). Якщо запит "
+            "стосується клієнтів, проектів, партнерів чи внутрішніх "
+            "процесів — попроси користувача сказати «знайди у мозку …» "
+            "щоб ти зміг прочитати реальний файл, замість того щоб "
+            "вгадувати. Нові факти про Nexus Studio користувач може "
+            "зафіксувати фразою «запиши в мозок: …»."
+        )
+    else:
+        brain_hint = (
+            "Пользователь ведёт базу знаний Nexus Studio в "
+            "~/Documents/Nexus-Brain (Obsidian vault: 01-CLIENTS, "
+            "02-PROJECTS, 04-KNOWLEDGE, 08-PARTNERS …). Если вопрос "
+            "касается клиентов, проектов, партнёров или внутренних "
+            "процессов — попроси пользователя сказать «найди в мозге …» "
+            "чтобы ты прочитал реальный файл, а не выдумывал. Новые "
+            "факты о Nexus Studio пользователь может зафиксировать "
+            "фразой «запиши в мозг: …»."
+        )
+    parts.append(brain_hint)
+
     # 4. L1 skill catalog (R32-1) — skipped in slim mode (R34-S42 К4)
     if not slim:
         try:
@@ -506,12 +537,45 @@ _PLAYBACK_LOCK = _threading.Lock()
 _STANDBY = False
 _STANDBY_LOCK = _threading.Lock()
 
+# R34-S47 — callbacks invoked whenever standby flips to True. Used by
+# JarvisFastPathProcessor to wipe its ``_pending_action`` so a HUD
+# Close mid-confirmation doesn't leave the next wake-word turn stuck
+# in the "pending-lock: dropped non-yes/no transcript" branch.
+_STANDBY_CALLBACKS: "list[Any]" = []
+_STANDBY_CALLBACKS_LOCK = _threading.Lock()
+
+
+def register_standby_callback(fn: "Any") -> None:
+    """Register a function to be called the moment standby engages.
+
+    Idempotent — registering the same callable twice is a no-op so
+    processors that get recreated in tests don't pile up duplicates.
+    """
+    with _STANDBY_CALLBACKS_LOCK:
+        if fn not in _STANDBY_CALLBACKS:
+            _STANDBY_CALLBACKS.append(fn)
+
 
 def _set_standby(value: bool) -> None:
-    """Atomically flip the standby flag."""
+    """Atomically flip the standby flag.
+
+    When transitioning OFF → ON, also fan out to every registered
+    callback so subsystems (fast-path confirmation gate, repetition
+    guard, etc.) can clear ephemeral state. Callbacks must be
+    fast + exception-safe; we swallow any errors so a single broken
+    handler can't block standby from engaging.
+    """
     global _STANDBY
     with _STANDBY_LOCK:
-        _STANDBY = value
+        was, _STANDBY = _STANDBY, value
+    if value and not was:
+        with _STANDBY_CALLBACKS_LOCK:
+            handlers = list(_STANDBY_CALLBACKS)
+        for fn in handlers:
+            try:
+                fn()
+            except Exception:
+                pass
 
 
 def _is_standby() -> bool:
@@ -552,6 +616,69 @@ def _register_bot_utterance(text: str) -> None:
         _BOT_HISTORY[:] = [(t, f) for (t, f) in _BOT_HISTORY if t > cutoff]
         if len(_BOT_HISTORY) > _BOT_HISTORY_MAX:
             del _BOT_HISTORY[: len(_BOT_HISTORY) - _BOT_HISTORY_MAX]
+
+
+# R34-S47 — repetition guard.
+#
+# The user reported "Jarvis повторюється в розмові" — the LLM
+# (qwen3:8b) sometimes regenerates the same reply for two consecutive
+# turns, or echoes a phrase verbatim across turn boundaries. The user
+# explicitly asked: "ніколи не повторювався (може тільки якщо я
+# попрошу повторити!!)".
+#
+# Strategy: before TTS-ing any reply, fingerprint it and compare
+# against the last few entries in ``_BOT_HISTORY``. If the new reply
+# is byte-identical to anything spoken in the last 90 s AND the user
+# DID NOT explicitly ask for a repeat, swap the reply for a short
+# "вже відповідав на це" line. The user knows the answer is the
+# same; we save 4 s of cringe-worthy verbatim repetition.
+#
+# We pick 90 s (vs the 30 s echo TTL) because the legitimate echo
+# window only needs to catch mic-captured echo of just-spoken audio,
+# whereas repetition can happen 60+ s apart when the LLM forgets it
+# already answered.
+
+_REPEAT_GUARD_TTL_SEC = 90.0
+
+# Phrases that signal "yes I want a repeat" — when the user says any
+# of these, ``would_be_repeat`` is suppressed so the bot DOES repeat.
+_REPEAT_REQUEST_PHRASES = (
+    "повтори", "повторите", "повторіть",
+    "ще раз", "еще раз", "знову", "снова",
+    "again", "repeat",
+)
+
+
+def _is_repeat_request(user_text: str | None) -> bool:
+    """True if the user explicitly asked to hear the previous reply again."""
+    if not user_text:
+        return False
+    low = user_text.lower()
+    return any(p in low for p in _REPEAT_REQUEST_PHRASES)
+
+
+def would_be_repeat(text: str) -> bool:
+    """True if ``text`` matches a phrase the bot already spoke in the last 90s.
+
+    Uses the same ``_bot_history_fingerprint`` normalisation as the
+    echo filter so wording-level whitespace / punctuation differences
+    don't accidentally bypass the guard.
+    """
+    import time as _time
+    if not text:
+        return False
+    fp = _bot_history_fingerprint(text)
+    if not fp:
+        return False
+    now = _time.monotonic()
+    cutoff = now - _REPEAT_GUARD_TTL_SEC
+    with _BOT_HISTORY_LOCK:
+        for ts, hist_fp in _BOT_HISTORY:
+            if ts < cutoff:
+                continue
+            if hist_fp == fp:
+                return True
+    return False
 
 
 # R34-S34: Piper voice cache + interruptable playback state.
@@ -1327,6 +1454,21 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             # Reusable aiohttp session — single connection pool,
             # finite keepalive so stale-NAT problems are bounded.
             self._session = None
+            # R34-S47 — remember the latest user turn so the
+            # repetition guard in ``_speak`` can tell whether the
+            # user explicitly asked for a repeat ("повтори", "ще раз")
+            # vs the LLM spontaneously regenerating the same answer.
+            self._last_user_text: str | None = None
+            # R34-S47 — rolling conversation history fed to Ollama
+            # alongside the system prompt. Audit finding: previously
+            # each turn was sent as ``[system, user]`` only, so the
+            # LLM had no memory of the previous user turn and
+            # frequently re-answered the same question or contradicted
+            # itself. We carry the last 8 messages (≈4 user/assistant
+            # pairs) which is enough for natural follow-ups without
+            # blowing past num_ctx=2048 on qwen3:8b.
+            self._messages_history: list[dict[str, str]] = []
+            self._messages_history_max: int = 8
 
         async def _ensure_session(self):
             if self._session is None or self._session.closed:
@@ -1458,12 +1600,20 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                     parts.append(lock)
                 sys_prompt = "\n\n".join(p for p in parts if p)
                 cache[lang] = sys_prompt
+            # R34-S47 — build the messages list with rolling history.
+            # ``_messages_history`` holds the last few user/assistant
+            # pairs; appending the current user turn happens HERE so the
+            # LLM sees `[system, …prior pairs…, current_user]`. The
+            # assistant reply is appended in process_frame after Ollama
+            # returns so the next turn has the context.
+            history_msgs: list[dict[str, str]] = list(self._messages_history)
             payload = {
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": text},
-                ],
+                "messages": (
+                    [{"role": "system", "content": sys_prompt}]
+                    + history_msgs
+                    + [{"role": "user", "content": text}]
+                ),
                 "stream": False,
                 "think": False,
                 # R34-S39 — pass keep_alive so the model stays in VRAM
@@ -1534,6 +1684,11 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             R34-S45 — standby gate. If the HUD's Close button placed
             the daemon into standby, abort the speech entirely. Same
             policy as ``JarvisFastPathProcessor._speak_ack``.
+
+            R34-S47 — repetition guard. If the LLM regenerated a
+            phrase we already spoke in the last 90 s AND the user
+            didn't say "повтори"/"again", swap to a tiny "вже
+            відповідав" line instead of replaying the full reply.
             """
             if not text:
                 return
@@ -1548,6 +1703,27 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                 except Exception:
                     pass
                 return
+            # R34-S47 — repetition guard. ``self._last_user_text`` is
+            # set in ``process_frame`` from the incoming TranscriptionFrame
+            # before we call ``_speak``. If the user explicitly asked
+            # for a repeat, allow it; otherwise mutate.
+            try:
+                if (
+                    would_be_repeat(text)
+                    and not _is_repeat_request(getattr(self, "_last_user_text", None))
+                ):
+                    self._stream.emit(
+                        "log",
+                        level="INFO",
+                        component="direct-chat",
+                        message=(
+                            f"repetition guard: would repeat "
+                            f"{text[:60]!r} — substituting"
+                        ),
+                    )
+                    text = "Я вже відповідав на це."
+            except Exception:
+                pass
             # R34-S32: register phrase before speaking for echo filter.
             try:
                 _register_bot_utterance(text)
@@ -1637,6 +1813,11 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             if not text:
                 await self.push_frame(frame, direction)
                 return
+            # R34-S47 — remember the latest user turn for the
+            # repetition guard (see ``_speak``). Set this BEFORE the
+            # standby drop so the next post-resume turn correctly
+            # tracks "повтори" requests.
+            self._last_user_text = text
             # R34-S45 — standby gate. Drop transcript entirely instead
             # of wasting an Ollama call and TTS round-trip we'd just
             # silence in _speak() anyway. Wake-gate upstream already
@@ -1752,6 +1933,30 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                     f"direct_chat: reply len={len(reply)}: {reply[:80]!r}",
                     "pipecat",
                 )
+                # R34-S47 — append BOTH user + assistant to the rolling
+                # history so the NEXT turn sees the dialogue. We only
+                # append if the reply is non-empty (Ollama timeout =
+                # empty string → we don't want to teach the LLM that
+                # silence is a valid assistant reply).
+                if reply and reply.strip():
+                    try:
+                        self._messages_history.append(
+                            {"role": "user", "content": text[:800]}
+                        )
+                        self._messages_history.append(
+                            {"role": "assistant", "content": reply[:800]}
+                        )
+                        # Trim from the front so we never exceed the
+                        # max — keeps the window O(8) regardless of
+                        # session length.
+                        excess = (
+                            len(self._messages_history)
+                            - self._messages_history_max
+                        )
+                        if excess > 0:
+                            del self._messages_history[:excess]
+                    except Exception:
+                        pass
                 self._stream.emit(
                     "direct_chat_reply", text=reply[:500], model=model,
                 )
@@ -1867,6 +2072,11 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
         "say_date",      # purely informational
         "battery",       # informational
         "read_clipboard",# informational (does NOT write)
+        # R34-S47 — Nexus-Brain read is non-destructive: ripgrep over
+        # the user's own vault, no side effects beyond Jarvis's RAM.
+        # Asking for confirmation on every "знайди у мозку X" would
+        # be friction with no safety benefit.
+        "nexus_brain_search",
     }
     # Confirmation vocab — keep generous; STT mishearings happen.
     # All entries lowercased & punctuation-stripped before match.
@@ -1895,10 +2105,51 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
             self._audit = get_audit_store()
             # R34-S43 confirmation gate — pending action awaiting
             # user yes/no. (action, t0_monotonic). Reset on confirm,
-            # cancel, on TTL-expiry (60s), or on any non-yes-no
-            # transcript that arrives before confirmation.
+            # cancel, on TTL-expiry (15s — R34-S47 tightened from 60),
+            # on STANDBY engage, or on any non-yes-no transcript that
+            # arrives before confirmation.
             self._pending_action: tuple["Action", float] | None = None
-            self._pending_ttl_sec: float = 60.0
+            # R34-S47 — TTL slashed 60 → 15 s. Real users say "так"
+            # within ~2 s of the prompt; anything longer almost always
+            # means they walked away / got distracted / decided no.
+            # Holding pending for 60 s caused the symptom the user
+            # reported: random video-call cross-talk landing in the
+            # confirmation slot ages after the prompt was forgotten.
+            self._pending_ttl_sec: float = 15.0
+            # R34-S47 — register a standby callback that wipes any
+            # pending confirmation. Without this, pressing the HUD
+            # Close button mid-prompt left ``_pending_action`` set;
+            # the next wake-word turn was then silently dropped by
+            # the ambient-lock branch ("pending-lock: dropped non-
+            # yes/no transcript 'Джарвіс, котра година'") instead of
+            # parsing the fresh command.
+            register_standby_callback(self._clear_pending_on_standby)
+
+        def _clear_pending_on_standby(self) -> None:
+            """Wipe pending confirmation when standby engages.
+
+            Runs on the standby-fanout thread, so we keep it cheap
+            and exception-safe. Emits a log so the user/dashboard can
+            see WHY the next turn isn't ambient-locked.
+            """
+            if self._pending_action is None:
+                return
+            try:
+                cancelled = self._pending_action[0].name
+            except Exception:
+                cancelled = "?"
+            self._pending_action = None
+            try:
+                self._stream.emit(
+                    "log",
+                    level="INFO",
+                    component="fast-path",
+                    message=(
+                        f"STANDBY engaged → cleared pending {cancelled}"
+                    ),
+                )
+            except Exception:
+                pass
 
         async def _speak_ack(
             self, text: str, direction: "FrameDirection"
@@ -2088,28 +2339,76 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                         await self._speak_ack("Скасовано.", direction)
                         return
                     else:
-                        # R34-S44 — ambient lock. Drop and keep
-                        # waiting; the user explicitly asked Jarvis to
-                        # do something risky and we don't want a
-                        # passing Whisper hallucination (or a family
-                        # member's voice across the room) to silently
-                        # cancel that pending confirmation, OR — worse
-                        # — push the transcript to direct_chat where
-                        # the LLM might confuse it with a new command.
+                        # R34-S44/R34-S47 — softened ambient lock.
+                        #
+                        # Old behaviour locked out ALL non-yes/no turns
+                        # for the entire 60 s TTL. In practice the user
+                        # often:
+                        #   • Walks away mid-prompt → 60 s later wants
+                        #     to start a fresh request, but every wake
+                        #     word "Джарвіс, котра година" got dropped
+                        #     as "pending-lock". Reported by Danylo.
+                        #   • Decides on a different command without
+                        #     saying "ні" first — the pending stays
+                        #     and the new command never reaches the
+                        #     parser.
+                        #
+                        # New behaviour: if the new transcript LOOKS LIKE
+                        # an explicit new command — i.e. it parses to a
+                        # different fast-path Action — implicitly cancel
+                        # the old pending and treat the new utterance as
+                        # the live command. Otherwise (random ambient
+                        # chatter, Whisper hallucinations) we still
+                        # drop, preserving the protective behaviour
+                        # against family members talking nearby.
+                        new_action = None
                         try:
-                            self._stream.emit(
-                                "log",
-                                level="INFO",
-                                component="fast-path",
-                                message=(
-                                    f"pending-lock: dropped non-yes/no "
-                                    f"transcript {text[:80]!r} "
-                                    f"(waiting on {pending.name})"
-                                ),
-                            )
+                            new_action = parse_user_command(text)
                         except Exception:
-                            pass
-                        return  # consume, keep pending
+                            new_action = None
+                        if new_action is not None and (
+                            new_action.name != pending.name
+                            or (new_action.description or "") != (pending.description or "")
+                        ):
+                            try:
+                                self._stream.emit(
+                                    "log",
+                                    level="INFO",
+                                    component="fast-path",
+                                    message=(
+                                        f"pending {pending.name} superseded by "
+                                        f"new command {new_action.name}: "
+                                        f"{text[:60]!r}"
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                            # Drop the old pending, then fall through to
+                            # the normal "fresh command" branch below by
+                            # leaving ``action`` None — that branch will
+                            # re-parse (cheap, deterministic) and then
+                            # apply the SAFE/invasive policy correctly.
+                            # The new fast-path's confirmation prompt
+                            # (if invasive) will be asked just like a
+                            # cold-start command, so we never bypass the
+                            # confirmation step for destructive ops.
+                            self._pending_action = None
+                            # Intentionally do NOT set ``action`` here.
+                        else:
+                            try:
+                                self._stream.emit(
+                                    "log",
+                                    level="INFO",
+                                    component="fast-path",
+                                    message=(
+                                        f"pending-lock: dropped non-yes/no "
+                                        f"transcript {text[:80]!r} "
+                                        f"(waiting on {pending.name})"
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                            return  # consume, keep pending
 
             if action is None:
                 # Path (c) or (d): parse the transcript as a new command.
@@ -3088,9 +3387,27 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
             # R34-S45 — Order matters: standby is checked above. If
             # we reached here, either standby is off or the inject
             # contained the wake-word (which already cleared it).
+            #
+            # R34-S47 — strip the wake-word from dashboard injects too
+            # (mirroring the hot-window stripping path). Without this,
+            # "Джарвіс, котра година" reached the fast-path verbatim
+            # and ``parse_user_command`` returned None because the
+            # say_time regex anchors on ``^\s*котра``, not on a wake-
+            # prefixed phrase. The user-visible symptom: trivial fast-
+            # path queries fell through to a 30-60 s Ollama call.
             try:
                 if getattr(frame, "user_id", "") == "dashboard":
                     self._open_hot_window()
+                    if wake_hit:
+                        query = extract_query_after_wake(
+                            text_lower, wake_word, wake_aliases,
+                        )
+                        if query:
+                            from dataclasses import replace as _replace
+                            try:
+                                frame = _replace(frame, text=query)
+                            except Exception:
+                                pass
                     await self.push_frame(frame, direction)
                     return
             except Exception:
