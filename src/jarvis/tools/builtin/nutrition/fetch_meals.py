@@ -130,12 +130,14 @@ class FetchMealsTool(Tool):
     
     def run(self, args: Optional[Dict[str, Any]], context: ToolContext) -> ToolExecutionResult:
         """Execute the fetch meals tool."""
-        context.user_print("📖 Retrieving your meals…")
+        # R34-S52 H: RU-only TTS policy.
+        context.user_print("📖 Получаю твои приёмы пищи…")
         since, until = _normalize_time_range(args if isinstance(args, dict) else None)
         debug_log(f"fetchMeals: range since={since} until={until}", "nutrition")
         meals = context.db.get_meals_between(since, until)
         debug_log(f"fetchMeals: count={len(meals)}", "nutrition")
         summary = summarize_meals([dict(r) for r in meals])
         # Return raw meal summary for profile processing
-        context.user_print("✅ Meals retrieved.")
+        # R34-S52 H: RU-only.
+        context.user_print("✅ Приёмы пищи получены.")
         return ToolExecutionResult(success=True, reply_text=summary)

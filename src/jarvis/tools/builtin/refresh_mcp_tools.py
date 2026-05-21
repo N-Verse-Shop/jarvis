@@ -38,7 +38,8 @@ class RefreshMCPToolsTool(Tool):
         try:
             from ..registry import refresh_mcp_tools, get_cached_mcp_tools
 
-            context.user_print("🔄 Refreshing MCP tools...")
+            # R34-S52 H: RU-only TTS policy.
+            context.user_print("🔄 Обновляю инструменты MCP…")
 
             # Refresh the cache
             mcp_tools, mcp_errors = refresh_mcp_tools(verbose=False)
@@ -47,10 +48,12 @@ class RefreshMCPToolsTool(Tool):
                 error_details = ""
                 if mcp_errors:
                     error_lines = [f"  {srv}: {err}" for srv, err in mcp_errors.items()]
-                    error_details = "\nServer errors:\n" + "\n".join(error_lines)
+                    # R34-S52 H: RU header.
+                    error_details = "\nОшибки серверов:\n" + "\n".join(error_lines)
                 return ToolExecutionResult(
                     success=True,
-                    reply_text=f"No MCP tools discovered. Check that MCP servers are configured and running.{error_details}",
+                    # R34-S52 H: RU-only.
+                    reply_text=f"Инструменты MCP не найдены. Проверь, что MCP-серверы настроены и работают.{error_details}",
                     error_message=None
                 )
 
@@ -63,18 +66,19 @@ class RefreshMCPToolsTool(Tool):
                         tools_by_server[server_name] = []
                     tools_by_server[server_name].append(tool_short_name)
 
-            # Format result
-            lines = [f"✅ Discovered {len(mcp_tools)} MCP tools:"]
+            # Format result. R34-S52 H: RU-only.
+            lines = [f"✅ Найдено {len(mcp_tools)} инструментов MCP:"]
             for server_name, tools in tools_by_server.items():
-                lines.append(f"\n{server_name} ({len(tools)} tools):")
+                lines.append(f"\n{server_name} ({len(tools)} инструментов):")
                 # Show first few tools
                 preview = tools[:5]
                 for tool in preview:
                     lines.append(f"  • {tool}")
                 if len(tools) > 5:
-                    lines.append(f"  • ... and {len(tools) - 5} more")
+                    lines.append(f"  • … и ещё {len(tools) - 5}")
 
-            context.user_print(f"✅ Discovered {len(mcp_tools)} MCP tools")
+            # R34-S52 H: RU-only.
+            context.user_print(f"✅ Найдено {len(mcp_tools)} инструментов MCP")
             debug_log(f"MCP tools manually refreshed: {len(mcp_tools)} tools", "mcp")
 
             return ToolExecutionResult(
@@ -88,6 +92,7 @@ class RefreshMCPToolsTool(Tool):
             return ToolExecutionResult(
                 success=False,
                 reply_text=None,
-                error_message=f"Failed to refresh MCP tools: {e}"
+                # R34-S52 H: RU-only.
+                error_message=f"Не получилось обновить инструменты MCP: {e}"
             )
 

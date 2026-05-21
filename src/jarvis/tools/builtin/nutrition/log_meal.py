@@ -202,7 +202,8 @@ class LogMealTool(Tool):
 
     def run(self, args: Optional[Dict[str, Any]], context: ToolContext) -> ToolExecutionResult:
         """Execute the log meal tool."""
-        context.user_print("🥗 Logging your meal…")
+        # R34-S52 H: RU-only TTS policy.
+        context.user_print("🥗 Записываю приём пищи…")
 
         # Prefer the 'meal' argument if provided (direct planner dispatch);
         # fall back to the full redacted utterance for the LLM extractor.
@@ -213,8 +214,9 @@ class LogMealTool(Tool):
 
         if not extract_text:
             debug_log("logMeal: no meal text (meal arg empty and redacted_text empty)", "nutrition")
-            context.user_print("⚠️ I didn't catch what you ate. Please describe the meal.")
-            return ToolExecutionResult(success=False, reply_text="No meal description provided")
+            # R34-S52 H: RU-only.
+            context.user_print("⚠️ Не разобрал, что ты ел. Опиши блюдо.")
+            return ToolExecutionResult(success=False, reply_text="Описание приёма пищи не задано")
 
         for attempt in range(context.max_retries + 1):
             try:
@@ -227,5 +229,6 @@ class LogMealTool(Tool):
                 debug_log(f"logMeal extract_and_log_meal attempt {attempt+1} raised: {e!r}", "nutrition")
 
         debug_log("logMeal: failed", "nutrition")
-        context.user_print("⚠️ I couldn't log that meal automatically.")
-        return ToolExecutionResult(success=False, reply_text="Failed to log meal")
+        # R34-S52 H: RU-only.
+        context.user_print("⚠️ Не получилось записать приём пищи автоматически.")
+        return ToolExecutionResult(success=False, reply_text="Не получилось записать приём пищи")

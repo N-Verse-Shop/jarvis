@@ -52,7 +52,8 @@ class FetchWebPageTool(Tool):
         redirects") reaches the LLM so it can decide to retry differently
         or report honestly to the user.
         """
-        context.user_print("🌐 Fetching page content…")
+        # R34-S52 H: RU-only TTS policy.
+        context.user_print("🌐 Загружаю страницу…")
         try:
             if not (args and isinstance(args, dict)):
                 return ToolExecutionResult(success=False, reply_text=None, error_message="fetchWebPage requires a JSON object with 'url'.")
@@ -230,19 +231,23 @@ class FetchWebPageTool(Tool):
                 if len(reply_text) > max_chars:
                     reply_text = f"[Truncated to {max_chars} chars]\n\n" + reply_text[:max_chars]
                 debug_log(f"fetchWebPage: extracted {len(content)} chars of content", "web")
-                context.user_print("✅ Page content fetched.")
+                # R34-S52 H: RU-only.
+                context.user_print("✅ Страница загружена.")
                 return ToolExecutionResult(success=True, reply_text=reply_text)
             except ImportError:
                 text = response_text[:10000]
                 reply_text = f"**URL:** {url}\n**Raw Content:**\n{text}"
                 debug_log("fetchWebPage: BeautifulSoup not available, returning raw text", "web")
-                context.user_print("✅ Page content fetched (raw).")
+                # R34-S52 H: RU-only.
+                context.user_print("✅ Страница загружена (raw).")
                 return ToolExecutionResult(success=True, reply_text=reply_text)
         except requests.exceptions.RequestException as e:
             debug_log(f"fetchWebPage: request failed: {e}", "web")
-            context.user_print("⚠️ Failed to fetch page.")
-            return ToolExecutionResult(success=False, reply_text=None, error_message=f"Failed to fetch page: {e}")
+            # R34-S52 H: RU-only.
+            context.user_print("⚠️ Не получилось загрузить страницу.")
+            return ToolExecutionResult(success=False, reply_text=None, error_message=f"Не получилось загрузить страницу: {e}")
         except Exception as e:  # pragma: no cover (safety net)
             debug_log(f"fetchWebPage: error: {e}", "web")
-            context.user_print("⚠️ Error fetching page.")
-            return ToolExecutionResult(success=False, reply_text=None, error_message=f"Error fetching page: {e}")
+            # R34-S52 H: RU-only.
+            context.user_print("⚠️ Ошибка при загрузке страницы.")
+            return ToolExecutionResult(success=False, reply_text=None, error_message=f"Ошибка при загрузке страницы: {e}")

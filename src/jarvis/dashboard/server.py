@@ -1155,16 +1155,19 @@ class DashboardServer:
         out = {k: raw.get(k) for k in self._SETTINGS_READ_KEYS}
         # Piper voice catalog — let the UI populate a dropdown without
         # the user typing a magic string.
+        # R34-S52 H: gender labels were UA "чоловічий"/"жіночий" —
+        # for a RU-speaking user the dropdown UI should also be RU.
+        # Proper-noun voice names (Микита, Lada, Руслан, etc.) stay.
         out["_piper_voice_catalog"] = [
-            {"id": "uk_UA-mykyta-high", "label": "Микита (UA, чоловічий, high)"},
-            {"id": "uk_UA-oleksa-high", "label": "Олекса (UA, чоловічий, high)"},
-            {"id": "uk_UA-ukrainian_tts-medium", "label": "Lada (UA, жіночий, medium)"},
-            {"id": "uk_UA-lada-x_low", "label": "Lada (UA, жіночий, x_low)"},
-            {"id": "uk_UA-tetiana-high", "label": "Тетяна (UA, жіночий, high)"},
-            {"id": "ru_RU-ruslan-medium", "label": "Руслан (RU, чоловічий, medium)"},
-            {"id": "ru_RU-dmitri-medium", "label": "Дмитро (RU, чоловічий, medium)"},
-            {"id": "ru_RU-denis-medium", "label": "Денис (RU, чоловічий, medium)"},
-            {"id": "ru_RU-irina-medium", "label": "Ірина (RU, жіночий, medium)"},
+            {"id": "uk_UA-mykyta-high", "label": "Микита (UA, мужской, high)"},
+            {"id": "uk_UA-oleksa-high", "label": "Олекса (UA, мужской, high)"},
+            {"id": "uk_UA-ukrainian_tts-medium", "label": "Lada (UA, женский, medium)"},
+            {"id": "uk_UA-lada-x_low", "label": "Lada (UA, женский, x_low)"},
+            {"id": "uk_UA-tetiana-high", "label": "Тетяна (UA, женский, high)"},
+            {"id": "ru_RU-ruslan-medium", "label": "Руслан (RU, мужской, medium)"},
+            {"id": "ru_RU-dmitri-medium", "label": "Дмитрий (RU, мужской, medium)"},
+            {"id": "ru_RU-denis-medium", "label": "Денис (RU, мужской, medium)"},
+            {"id": "ru_RU-irina-medium", "label": "Ирина (RU, женский, medium)"},
         ]
         out["_writable_keys"] = list(self._SETTINGS_WRITE_KEYS)
         return web.json_response(out)

@@ -259,7 +259,8 @@ def _op_new_note(title: str = "", body: str = "") -> tuple[bool, str]:
         'end run'
     )
     ok, out = _run_osascript(script, t, b)
-    return (True, f"Створив нотатку «{t or b[:40]}»") if ok else (False, out)
+    # R34-S52 H: was UA "Створив нотатку". RU-only policy.
+    return (True, f"Создал заметку «{t or b[:40]}»") if ok else (False, out)
 
 
 def _op_new_reminder(text: str = "", list_name: str = "") -> tuple[bool, str]:
@@ -291,7 +292,8 @@ def _op_new_reminder(text: str = "", list_name: str = "") -> tuple[bool, str]:
             'end run'
         )
         ok, out = _run_osascript(script, t)
-    return (True, f"Додав нагадування: {t[:60]}") if ok else (False, out)
+    # R34-S52 H: was UA "Додав нагадування".
+    return (True, f"Добавил напоминание: {t[:60]}") if ok else (False, out)
 
 
 def _op_reveal_in_finder(path: str) -> tuple[bool, str]:
@@ -304,9 +306,11 @@ def _op_reveal_in_finder(path: str) -> tuple[bool, str]:
         return False, f"Path not found: {expanded}"
     try:
         subprocess.run(["open", "-R", expanded], timeout=5, check=True)
-        return True, f"Показав у Finder: {expanded}"
+        # R34-S52 H: was UA "Показав у Finder".
+        return True, f"Показал в Finder: {expanded}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        # R34-S52 H: was UA "Помилка".
+        return False, f"Ошибка: {e}"
 
 
 def _op_open_url(url: str) -> tuple[bool, str]:
@@ -339,9 +343,11 @@ def _op_open_url(url: str) -> tuple[bool, str]:
         return False, "Only http(s) URLs allowed"
     try:
         subprocess.run(["open", u], timeout=5, check=True)
-        return True, f"Відкрив: {u[:80]}"
+        # R34-S52 H: was UA "Відкрив".
+        return True, f"Открыл: {u[:80]}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        # R34-S52 H: was UA "Помилка".
+        return False, f"Ошибка: {e}"
 
 
 # ─────────────────────────── round 21 — accessibility ────────────────────────
@@ -449,7 +455,8 @@ def _op_type_text(text: str) -> tuple[bool, str]:
         'end run'
     )
     ok, out = _run_osascript(script, t)
-    return (True, f"Typed {len(t)} chars") if ok else (False, out)
+    # R34-S52 H: was EN "Typed N chars". RU-only.
+    return (True, f"Напечатал {len(t)} символов") if ok else (False, out)
 
 
 def _op_key(key_name: str = "", modifiers: Any = None) -> tuple[bool, str]:
@@ -508,7 +515,8 @@ def _op_key(key_name: str = "", modifiers: Any = None) -> tuple[bool, str]:
         )
         ok, out = _run_osascript(script, k)
     label = ("+".join(mods + [k])) if mods else k
-    return (True, f"Pressed {label}") if ok else (False, out)
+    # R34-S52 H: was EN "Pressed {label}".
+    return (True, f"Нажал {label}") if ok else (False, out)
 
 
 def _op_click_at(x: int, y: int) -> tuple[bool, str]:
@@ -536,7 +544,8 @@ def _op_click_at(x: int, y: int) -> tuple[bool, str]:
         'end run'
     )
     ok, out = _run_osascript(script, str(cx), str(cy))
-    return (True, f"Clicked at ({cx}, {cy})") if ok else (False, out)
+    # R34-S52 H: was EN "Clicked at (cx, cy)".
+    return (True, f"Кликнул по ({cx}, {cy})") if ok else (False, out)
 
 
 def _op_read_menubar(app: str = "") -> tuple[bool, str]:
@@ -666,7 +675,8 @@ def _op_send_message(to: str, body: str) -> tuple[bool, str]:
         'end run'
     )
     ok, out = _run_osascript(script, recipient, msg)
-    return (True, f"Sent message to {recipient}") if ok else (False, out)
+    # R34-S52 H: was EN "Sent message to {recipient}".
+    return (True, f"Отправил сообщение: {recipient}") if ok else (False, out)
 
 
 # ─────────────────────────── round 25 — clipboard + sysinfo ──────────────────

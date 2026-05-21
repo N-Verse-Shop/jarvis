@@ -141,21 +141,25 @@ class LocalFilesTool(Tool):
                 raise PermissionError(f"Path not allowed: {resolved}")
 
             if not (args and isinstance(args, dict)):
-                return ToolExecutionResult(success=False, reply_text="localFiles requires a JSON object with at least 'operation' and 'path'.")
+                # R34-S52 H: RU-only TTS policy.
+                return ToolExecutionResult(success=False, reply_text="localFiles требует JSON-объект с минимум 'operation' и 'path'.")
 
             operation = str(args.get("operation") or "").strip().lower()
             path_arg = args.get("path")
             if not operation or not path_arg:
-                return ToolExecutionResult(success=False, reply_text="localFiles requires 'operation' and 'path'.")
+                # R34-S52 H: RU-only.
+                return ToolExecutionResult(success=False, reply_text="localFiles требует 'operation' и 'path'.")
 
             target = _resolve_safe(str(path_arg))
 
             # list
             if operation == "list":
                 if not target.exists():
-                    return ToolExecutionResult(success=False, reply_text=f"Path not found: {target}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Путь не найден: {target}")
                 if target.is_file():
-                    return ToolExecutionResult(success=True, reply_text=f"File: {target.name}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=True, reply_text=f"Файл: {target.name}")
 
                 glob_pattern = args.get("glob", "*")
                 recursive = bool(args.get("recursive", False))
@@ -178,26 +182,31 @@ class LocalFilesTool(Tool):
                             break
 
                     if not files:
-                        return ToolExecutionResult(success=True, reply_text=f"No files found matching '{glob_pattern}' in {target}")
+                        # R34-S52 H: RU-only.
+                        return ToolExecutionResult(success=True, reply_text=f"Файлы по шаблону «{glob_pattern}» не найдены в {target}")
 
                     file_list = []
                     for f in sorted(files)[:50]:  # Limit to 50 files
                         relative_path = f.relative_to(target)
-                        file_type = "DIR" if f.is_dir() else "FILE"
+                        # R34-S52 H: RU labels — DIR/FILE → ПАПКА/ФАЙЛ.
+                        file_type = "ПАПКА" if f.is_dir() else "ФАЙЛ"
                         file_list.append(f"  {file_type}: {relative_path}")
 
-                    result = f"Contents of {target}:\n" + "\n".join(file_list)
+                    # R34-S52 H: RU-only.
+                    result = f"Содержимое {target}:\n" + "\n".join(file_list)
                     if len(files) > 50:
-                        result += f"\n... and {len(files) - 50} more files"
+                        result += f"\n… и ещё {len(files) - 50} файлов"
 
                     return ToolExecutionResult(success=True, reply_text=result)
                 except Exception as e:
-                    return ToolExecutionResult(success=False, reply_text=f"List failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка списка: {e}")
 
             # read
             if operation == "read":
                 if not target.exists() or not target.is_file():
-                    return ToolExecutionResult(success=False, reply_text=f"File not found: {target}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Файл не найден: {target}")
                 try:
                     # Audit round 20 SECURITY P1: O_NOFOLLOW guard
                     # against symlink TOCTOU. ``_resolve_safe`` walked
@@ -220,7 +229,8 @@ class LocalFilesTool(Tool):
                         raise
                     max_chars = 10000
                     if len(data) > max_chars:
-                        data = data[:max_chars] + f"\n... (truncated, showing first {max_chars} chars)"
+                        # R34-S52 H: RU-only.
+                        data = data[:max_chars] + f"\n… (обрезано, показано первые {max_chars} символов)"
                     return ToolExecutionResult(success=True, reply_text=data)
                 except OSError as e:
                     # ``ELOOP`` (40) is the kernel rejecting a symlink
@@ -230,17 +240,21 @@ class LocalFilesTool(Tool):
                     if e.errno == _errno.ELOOP:
                         return ToolExecutionResult(
                             success=False,
-                            reply_text=f"Refusing to read symlink at {target}",
+                            # R34-S52 H: RU-only.
+                            reply_text=f"Не читаю символьную ссылку: {target}",
                         )
-                    return ToolExecutionResult(success=False, reply_text=f"Read failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка чтения: {e}")
                 except Exception as e:
-                    return ToolExecutionResult(success=False, reply_text=f"Read failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка чтения: {e}")
 
             # write
             if operation == "write":
                 content = args.get("content")
                 if not isinstance(content, str):
-                    return ToolExecutionResult(success=False, reply_text="Write requires string 'content'.")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text="Запись требует строку 'content'.")
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     # Audit round 20 P2 — atomic write via tmp+replace
@@ -274,23 +288,28 @@ class LocalFilesTool(Tool):
                     # itself (not its target) — which is the desired
                     # behaviour after the parent-walk check.
                     os.replace(str(tmp_path), str(target))
-                    return ToolExecutionResult(success=True, reply_text=f"Wrote {len(content)} characters to {target}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=True, reply_text=f"Записал {len(content)} символов в {target}")
                 except OSError as e:
                     import errno as _errno
                     if e.errno == _errno.ELOOP:
                         return ToolExecutionResult(
                             success=False,
-                            reply_text=f"Refusing to write through symlink at {target}",
+                            # R34-S52 H: RU-only.
+                            reply_text=f"Не пишу через символьную ссылку: {target}",
                         )
-                    return ToolExecutionResult(success=False, reply_text=f"Write failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка записи: {e}")
                 except Exception as e:
-                    return ToolExecutionResult(success=False, reply_text=f"Write failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка записи: {e}")
 
             # append
             if operation == "append":
                 content = args.get("content")
                 if not isinstance(content, str):
-                    return ToolExecutionResult(success=False, reply_text="Append requires string 'content'.")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text="Дописывание требует строку 'content'.")
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     # Audit round 20 P1 — O_NOFOLLOW on the append path
@@ -302,17 +321,21 @@ class LocalFilesTool(Tool):
                     fd = os.open(str(target), flags, 0o600)
                     with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as f:
                         f.write(content)
-                    return ToolExecutionResult(success=True, reply_text=f"Appended {len(content)} characters to {target}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=True, reply_text=f"Дописал {len(content)} символов в {target}")
                 except OSError as e:
                     import errno as _errno
                     if e.errno == _errno.ELOOP:
                         return ToolExecutionResult(
                             success=False,
-                            reply_text=f"Refusing to append through symlink at {target}",
+                            # R34-S52 H: RU-only.
+                            reply_text=f"Не дописываю через символьную ссылку: {target}",
                         )
-                    return ToolExecutionResult(success=False, reply_text=f"Append failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка дописывания: {e}")
                 except Exception as e:
-                    return ToolExecutionResult(success=False, reply_text=f"Append failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка дописывания: {e}")
 
             # delete
             if operation == "delete":
@@ -331,12 +354,14 @@ class LocalFilesTool(Tool):
                 # good; voice commands should never be terminal.
                 try:
                     if not (target.exists() and target.is_file()):
-                        return ToolExecutionResult(success=False, reply_text=f"File not found: {target}")
+                        # R34-S52 H: RU-only.
+                        return ToolExecutionResult(success=False, reply_text=f"Файл не найден: {target}")
                     trashed_to: Optional[str] = None
                     try:
                         from send2trash import send2trash  # type: ignore
                         send2trash(str(target))
-                        trashed_to = "system Trash"
+                        # R34-S52 H: RU-only.
+                        trashed_to = "системную корзину"
                     except Exception:
                         # Fallback: managed trash under home so the file
                         # is recoverable even without send2trash.
@@ -357,16 +382,22 @@ class LocalFilesTool(Tool):
                             i += 1
                             dest = trash_root / f"{target.name}.{ts}-{i}"
                         _shutil.move(str(target), str(dest))
-                        trashed_to = f"recoverable trash at {dest}"
+                        # R34-S52 H: RU-only.
+                        trashed_to = f"восстанавливаемую корзину {dest}"
                     return ToolExecutionResult(
                         success=True,
-                        reply_text=f"Moved {target} to {trashed_to} (recoverable).",
+                        # R34-S52 H: RU-only.
+                        reply_text=f"Переместил {target} в {trashed_to} (восстановимо).",
                     )
                 except Exception as e:
-                    return ToolExecutionResult(success=False, reply_text=f"Delete failed: {e}")
+                    # R34-S52 H: RU-only.
+                    return ToolExecutionResult(success=False, reply_text=f"Ошибка удаления: {e}")
 
-            return ToolExecutionResult(success=False, reply_text=f"Unknown localFiles operation: {operation}")
+            # R34-S52 H: RU-only.
+            return ToolExecutionResult(success=False, reply_text=f"Неизвестная операция localFiles: {operation}")
         except PermissionError as pe:
-            return ToolExecutionResult(success=False, reply_text=f"Permission error: {pe}")
+            # R34-S52 H: RU-only.
+            return ToolExecutionResult(success=False, reply_text=f"Ошибка доступа: {pe}")
         except Exception as e:
-            return ToolExecutionResult(success=False, reply_text=f"localFiles error: {e}")
+            # R34-S52 H: RU-only.
+            return ToolExecutionResult(success=False, reply_text=f"Ошибка localFiles: {e}")

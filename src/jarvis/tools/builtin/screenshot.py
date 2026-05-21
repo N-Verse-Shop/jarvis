@@ -30,7 +30,8 @@ class ScreenshotTool(Tool):
 
     def run(self, args: Optional[Dict[str, Any]], context: ToolContext) -> ToolExecutionResult:
         """Execute the screenshot tool."""
-        context.user_print("📸 Capturing a screenshot for OCR…")
+        # R34-S52 H: RU-only TTS policy.
+        context.user_print("📸 Делаю скриншот для OCR…")
         debug_log("screenshot: capturing OCR...", "screenshot")
         # Inline OCR capture logic (previously in separate helper)
         ocr_text: str = ""
@@ -105,12 +106,14 @@ class ScreenshotTool(Tool):
         # the agent — a confusing failure mode for a user-initiated
         # cancel. Now: distinguish empty OCR from a real read.
         if not ocr_text:
-            context.user_print("⚠️ Screenshot cancelled or OCR produced no text.")
+            # R34-S52 H: RU-only.
+            context.user_print("⚠️ Скриншот отменён или OCR не нашёл текст.")
             return ToolExecutionResult(
                 success=False,
                 reply_text=None,
-                error_message="Screenshot was cancelled or returned no readable text.",
+                error_message="Скриншот отменён или не вернул читаемого текста.",
             )
-        context.user_print("✅ Screenshot processed.")
+        # R34-S52 H: RU-only.
+        context.user_print("✅ Скриншот обработан.")
         # Return raw OCR text as tool result (no LLM processing here)
         return ToolExecutionResult(success=True, reply_text=ocr_text)

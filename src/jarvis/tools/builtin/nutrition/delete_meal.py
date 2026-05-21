@@ -30,7 +30,8 @@ class DeleteMealTool(Tool):
     
     def run(self, args: Optional[Dict[str, Any]], context: ToolContext) -> ToolExecutionResult:
         """Execute the delete meal tool."""
-        context.user_print("🗑️ Deleting the meal…")
+        # R34-S52 H: RU-only TTS policy.
+        context.user_print("🗑️ Удаляю приём пищи…")
         mid = None
         if args and isinstance(args, dict):
             try:
@@ -52,15 +53,19 @@ class DeleteMealTool(Tool):
         # so the failure path passes the human message through
         # ``error_message=`` (the engine reads ``error_text`` for it).
         if is_deleted:
-            context.user_print("✅ Meal deleted.")
-            return ToolExecutionResult(success=True, reply_text="Meal deleted.")
-        context.user_print("⚠️ I couldn't delete that meal.")
+            # R34-S52 H: RU-only.
+            context.user_print("✅ Приём пищи удалён.")
+            return ToolExecutionResult(success=True, reply_text="Приём пищи удалён.")
+        # R34-S52 H: RU-only.
+        context.user_print("⚠️ Не получилось удалить этот приём пищи.")
         return ToolExecutionResult(
             success=False,
             reply_text=None,
+            # R34-S52 H: error_message in RU for consistency with reply_text.
             error_message=(
-                "Could not delete meal "
-                f"id={mid if mid is not None else '(missing)'} — "
-                "row not found or DB error. Ask the user to confirm the id."
+                "Не получилось удалить приём пищи "
+                f"id={mid if mid is not None else '(не указан)'} — "
+                "запись не найдена или ошибка БД. Попроси пользователя "
+                "подтвердить id."
             ),
         )

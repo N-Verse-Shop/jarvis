@@ -659,14 +659,17 @@ class WebSearchTool(Tool):
             if not getattr(cfg, "web_search_enabled", True):
                 return ToolExecutionResult(
                     success=False,
-                    reply_text="Web search is currently disabled in your configuration. To enable it, set 'web_search_enabled': true in your config.json file."
+                    # R34-S52 H: RU-only TTS policy.
+                    reply_text="Поиск в интернете отключён в конфигурации. Чтобы включить, поставь 'web_search_enabled': true в config.json."
                 )
 
             search_query = ""
             if args and isinstance(args, dict):
                 search_query = str(args.get("search_query", "")).strip()
             if not search_query:
-                return ToolExecutionResult(success=False, reply_text=None, error_message="Please provide a search query for the web search.")
+                # R34-S52 H: error_message reaches LLM, not TTS, but
+                # keep consistent — RU.
+                return ToolExecutionResult(success=False, reply_text=None, error_message="Поисковый запрос не указан.")
 
             # Audit round 12 fix: scrub credentials before sending the
             # query upstream. Whisper happily transcribes "search my
@@ -701,7 +704,8 @@ class WebSearchTool(Tool):
                     ),
                 )
 
-            context.user_print(f"🌐 Searching the web for '{search_query}'…")
+            # R34-S52 H: RU-only TTS policy.
+            context.user_print(f"🌐 Ищу в интернете «{search_query}»…")
             debug_log(f"    🌐 searching for '{search_query}'", "web")
 
             # Overall wall-clock deadline across the full provider chain.
@@ -822,12 +826,14 @@ class WebSearchTool(Tool):
             # result case, which previously produced no output between
             # "🌐 Searching…" and "📚 Searching Wikipedia…".
             if ddg_rate_limited and not instant_results:
+                # R34-S52 H: RU-only.
                 context.user_print(
-                    "🚧 DuckDuckGo served a bot-challenge page — "
-                    "search blocked, no results retrieved."
+                    "🚧 DuckDuckGo показал капчу — "
+                    "поиск заблокирован, результатов нет."
                 )
             elif not result_urls and not instant_results:
-                context.user_print("⚠️ No DuckDuckGo results found.")
+                # R34-S52 H: RU-only.
+                context.user_print("⚠️ В DuckDuckGo ничего не найдено.")
 
             # Auto-fetch content from top results to provide actual data.
             # Cascade through the first 3 results in PARALLEL under a shared
@@ -843,7 +849,8 @@ class WebSearchTool(Tool):
             fetched_content: Optional[str] = None
             fetch_attempted_any = False
             if result_urls and not instant_results:
-                context.user_print("📄 Reading top result...")
+                # R34-S52 H: RU-only.
+                context.user_print("📄 Читаю первый результат…")
                 fetch_attempted_any = True
                 fetched_content = _cascade_fetch(
                     result_urls[:3],
@@ -868,7 +875,8 @@ class WebSearchTool(Tool):
             if need_fallback and _budget_left() > 0:
                 brave_key = getattr(cfg, "brave_search_api_key", "") or ""
                 if brave_key:
-                    context.user_print("🦁 Falling back to Brave Search…")
+                    # R34-S52 H: RU-only.
+                    context.user_print("🦁 Переключаюсь на Brave Search…")
                     brave_pairs = _brave_search(search_query, brave_key)
                     if brave_pairs:
                         # Replace the DDG link list with Brave's — provenance
@@ -925,8 +933,9 @@ class WebSearchTool(Tool):
                         "web",
                     )
                     lang = "en"
+                # R34-S52 H: RU-only.
                 context.user_print(
-                    f"📚 Searching Wikipedia ({lang}) for '{search_query}'…"
+                    f"📚 Ищу в Wikipedia ({lang}): «{search_query}»…"
                 )
                 # Forward the chain deadline so the helper's three sequential
                 # API calls cannot stretch past the overall wall-clock cap on
@@ -1119,18 +1128,19 @@ class WebSearchTool(Tool):
                     pass
             try:
                 count_results = len([r for r in (search_results or []) if r.strip() and not r.startswith("   ")])
+                # R34-S52 H: all user-facing strings — RU-only.
                 if used_source == "brave":
                     context.user_print(
-                        f"✅ Answered via Brave Search ({count_results} results)."
+                        f"✅ Ответил через Brave Search ({count_results} результатов)."
                     )
                 elif used_source == "wikipedia":
                     context.user_print(
-                        "✅ Answered via Wikipedia fallback."
+                        "✅ Ответил через Wikipedia."
                     )
                 elif count_results > 0:
-                    context.user_print(f"✅ Found {count_results} results.")
+                    context.user_print(f"✅ Нашёл {count_results} результатов.")
                 else:
-                    context.user_print("⚠️ No web results found.")
+                    context.user_print("⚠️ Ничего не найдено в интернете.")
                 # Surface whether we actually pulled page content for the top
                 # link. Without this line, "📄 Reading top result..." alone
                 # doesn't tell you if the fetch succeeded — a silent TLS /
@@ -1147,14 +1157,16 @@ class WebSearchTool(Tool):
                             if ln:
                                 snippet = ln[:80] + ("…" if len(ln) > 80 else "")
                                 break
+                        # R34-S52 H: RU-only.
                         context.user_print(
-                            f"   📰 Top-result content: {len(fetched_content)} chars"
-                            + (f' — "{snippet}"' if snippet else "")
+                            f"   📰 Содержимое: {len(fetched_content)} символов"
+                            + (f' — «{snippet}»' if snippet else "")
                         )
                     else:
+                        # R34-S52 H: RU-only.
                         context.user_print(
-                            "   ⚠️ Top-result content not fetched — reply will "
-                            "be links-only."
+                            "   ⚠️ Содержимое не загрузилось — отвечу только "
+                            "ссылками."
                         )
             except Exception:
                 pass
@@ -1164,8 +1176,11 @@ class WebSearchTool(Tool):
             debug_log(f"search failed: {search_error}", "web")
             return ToolExecutionResult(
                 success=False,
-                reply_text=f"I wasn't able to perform a web search for '{search_query}' at the moment. This could be due to network issues or search service limitations. Please try again later or search manually."
+                # R34-S52 H: this reply_text may reach TTS directly on
+                # tool failure — RU-only.
+                reply_text=f"Не удалось выполнить поиск «{search_query}». Возможны проблемы с сетью или сервисом. Попробуй позже или поищи вручную."
             )
         except Exception as e:  # pragma: no cover (safety net)
             debug_log(f"error {e}", "web")
-            return ToolExecutionResult(success=False, reply_text="Sorry, I had trouble performing the web search.")
+            # R34-S52 H: RU-only TTS fallback.
+            return ToolExecutionResult(success=False, reply_text="Не получилось выполнить поиск в интернете.")

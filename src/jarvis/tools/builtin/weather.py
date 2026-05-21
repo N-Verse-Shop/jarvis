@@ -193,7 +193,8 @@ class WeatherTool(Tool):
 
     def run(self, args: Optional[Dict[str, Any]], context: ToolContext) -> ToolExecutionResult:
         """Get current weather for a location."""
-        context.user_print("🌤️ Checking weather...")
+        # R34-S52 H: RU-only TTS policy.
+        context.user_print("🌤️ Проверяю погоду…")
 
         try:
             # Get location from args, or fall back to user's detected location
@@ -246,9 +247,10 @@ class WeatherTool(Tool):
                         # a place in this utterance. Asking is the right move.
                         return ToolExecutionResult(
                             success=False,
+                            # R34-S52 H: RU-only.
                             reply_text=(
-                                "I couldn't auto-detect your location. "
-                                "Please tell me which city to check the weather for."
+                                "Не получилось определить твоё местоположение. "
+                                "Скажи, для какого города проверить погоду."
                             ),
                         )
 
@@ -277,7 +279,8 @@ class WeatherTool(Tool):
                 if not geo_data.get("results"):
                     return ToolExecutionResult(
                         success=False,
-                        reply_text=f"Could not find location '{location_str}'. Try a different city name or spelling."
+                        # R34-S52 H: RU-only.
+                        reply_text=f"Не нашёл город «{location_str}». Попробуй другое название или написание."
                     )
 
                 place = geo_data["results"][0]
@@ -318,7 +321,8 @@ class WeatherTool(Tool):
             if not current:
                 return ToolExecutionResult(
                     success=False,
-                    reply_text=f"Weather data temporarily unavailable for {location_display}."
+                    # R34-S52 H: RU-only.
+                    reply_text=f"Данные о погоде временно недоступны для {location_display}."
                 )
 
             # Extract current weather values
@@ -407,28 +411,32 @@ class WeatherTool(Tool):
             debug_log(f"    ✅ weather retrieved: {weather_desc}, {temp_c}°C", "tools")
             # Use first part of location_display for concise output
             short_name = location_display.split(",")[0].strip()
-            context.user_print(f"✅ Weather for {short_name}: {weather_desc}, {temp_c}°C")
+            # R34-S52 H: RU-only.
+            context.user_print(f"✅ Погода в {short_name}: {weather_desc}, {temp_c}°C")
 
             return ToolExecutionResult(success=True, reply_text=reply_text)
 
         except requests.exceptions.Timeout:
             debug_log("weather request timed out", "tools")
-            context.user_print("⚠️ Weather service timeout.")
+            # R34-S52 H: RU-only.
+            context.user_print("⚠️ Сервис погоды не ответил.")
             return ToolExecutionResult(
                 success=False,
-                reply_text="Weather service is taking too long to respond. Please try again."
+                reply_text="Сервис погоды слишком долго отвечает. Попробуй ещё раз."
             )
         except requests.exceptions.RequestException as e:
             debug_log(f"weather request failed: {e}", "tools")
-            context.user_print("⚠️ Weather service unavailable.")
+            # R34-S52 H: RU-only.
+            context.user_print("⚠️ Сервис погоды недоступен.")
             return ToolExecutionResult(
                 success=False,
-                reply_text="Weather service is temporarily unavailable. Please try again later."
+                reply_text="Сервис погоды временно недоступен. Попробуй позже."
             )
         except Exception as e:
             debug_log(f"weather error: {e}", "tools")
-            context.user_print("⚠️ Error getting weather.")
+            # R34-S52 H: RU-only.
+            context.user_print("⚠️ Ошибка получения погоды.")
             return ToolExecutionResult(
                 success=False,
-                reply_text=f"Error getting weather: {e}"
+                reply_text=f"Ошибка получения погоды: {e}"
             )
