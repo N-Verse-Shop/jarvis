@@ -1183,7 +1183,16 @@ def _make_state_processor():
                 self._transition(self.S_SPEAKING, level=1.0)
                 return
             if isinstance(frame, (TTSStoppedFrame, BotStoppedSpeakingFrame)):
-                self._transition(self.S_IDLE, level=0.0)
+                # R34-S44 — when the bot finishes speaking, the VAD is
+                # immediately ready for the next user utterance. The
+                # HUD should reflect that (LISTENING with a visible
+                # wave indicator) instead of falling to IDLE=0% which
+                # made the user think Jarvis had switched off after
+                # asking a confirmation question. The pipeline keeps
+                # the mic open in either state; this is purely a UX
+                # signal. IDLE is only reached via CancelFrame /
+                # EndFrame / explicit end_session below.
+                self._transition(self.S_LISTENING, level=1.0)
                 return
             if isinstance(frame, (CancelFrame, EndFrame)):
                 self._transition(self.S_IDLE, level=0.0)
@@ -1952,13 +1961,16 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                 await self.push_frame(frame, direction)
                 return
 
-            # R34-S43 — confirmation gate.
+            # R34-S43/S44 — confirmation gate.
             # ``action`` is None until we resolve which path applies:
             #   (a) Yes-answer to a pending confirmation → use the
             #       saved Action and fall through to execute below.
             #   (b) No-answer → cancel pending, speak "Скасовано", done.
-            #   (c) Non-yes/no while pending → drop pending and parse
-            #       this transcript as a new command (user moved on).
+            #   (c) Non-yes/no while pending → DROP (ambient lock), so
+            #       background voices / Whisper hallucinations during
+            #       the 60s pending window don't blow away the
+            #       confirmation state. User must say wake-word
+            #       ("Джарвіс …") to explicitly start a new command.
             #   (d) No pending state → just parse the transcript.
             import time as _t_conf
             action: "Action | None" = None
@@ -1998,8 +2010,28 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                         await self._speak_ack("Скасовано.", direction)
                         return
                     else:
-                        # Non-yes/no while pending — user moved on.
-                        self._pending_action = None
+                        # R34-S44 — ambient lock. Drop and keep
+                        # waiting; the user explicitly asked Jarvis to
+                        # do something risky and we don't want a
+                        # passing Whisper hallucination (or a family
+                        # member's voice across the room) to silently
+                        # cancel that pending confirmation, OR — worse
+                        # — push the transcript to direct_chat where
+                        # the LLM might confuse it with a new command.
+                        try:
+                            self._stream.emit(
+                                "log",
+                                level="INFO",
+                                component="fast-path",
+                                message=(
+                                    f"pending-lock: dropped non-yes/no "
+                                    f"transcript {text[:80]!r} "
+                                    f"(waiting on {pending.name})"
+                                ),
+                            )
+                        except Exception:
+                            pass
+                        return  # consume, keep pending
 
             if action is None:
                 # Path (c) or (d): parse the transcript as a new command.
@@ -2026,21 +2058,104 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                 if action.name not in _SAFE_ACTIONS_NO_CONFIRM:
                     self._pending_action = (action, _t_conf.monotonic())
                     desc = (action.description or action.name).strip()
-                    # R34-S43 — ``cfg`` is the closure-captured factory
-                    # arg; the dataclass field is ``active_language``
-                    # (set per-boot in from_settings). Fall back to "uk"
-                    # if the factory was called without cfg.
-                    lang_active = getattr(cfg, "active_language", "uk") if cfg else "uk"
+                    # R34-S44 — detect prompt language from the USER's
+                    # transcript ONLY. Action ``desc`` always comes from
+                    # a single regex factory so is UA-biased regardless
+                    # of what the user actually said — using desc would
+                    # force UA prompts even when the user spoke RU.
+                    # Strategy:
+                    #   1) UA-only glyphs in text → "uk"
+                    #   2) RU-only glyphs in text → "ru"
+                    #   3) UA-distinctive verb in text → "uk"
+                    #   4) RU-distinctive verb in text → "ru"
+                    #   5) detect_user_language(text)
+                    #   6) cfg.active_language ("ru" default)
+                    lang_active = "ru"
+                    text_lc = (text or "").lower()
+                    _UA_VERBS = (
+                        "закрий", "відкрий", "ввімкни", "увімкни", "вимкни",
+                        "котра", "покажи", "читай", "напиши",
+                        "закри", "відкри",
+                    )
+                    _RU_VERBS = (
+                        "закрой", "открой", "включи", "выключи",
+                        "котор", "напиши", "сделай",
+                    )
+                    try:
+                        if any(ch in text_lc for ch in "іїєґ"):
+                            lang_active = "uk"
+                        elif any(ch in text_lc for ch in "ыэъё"):
+                            lang_active = "ru"
+                        elif any(v in text_lc for v in _UA_VERBS):
+                            lang_active = "uk"
+                        elif any(v in text_lc for v in _RU_VERBS):
+                            lang_active = "ru"
+                        else:
+                            from ..memory.self_learning import (
+                                detect_user_language,
+                            )
+                            lang_active = (
+                                detect_user_language(text)
+                                or (
+                                    getattr(cfg, "active_language", "ru")
+                                    if cfg else "ru"
+                                )
+                            )
+                    except Exception:
+                        lang_active = (
+                            getattr(cfg, "active_language", "ru")
+                            if cfg else "ru"
+                        )
+                    # R34-S44 — only include ``desc`` in the prompt when
+                    # it's in the SAME language as the rest of the
+                    # prompt. ``desc`` comes from a single UA-biased
+                    # factory and embedding it in a RU prompt sounds
+                    # like two voices. Detect desc language by glyphs
+                    # PLUS by UA-vs-RU verb stems (since action descs
+                    # rarely contain UA-only glyphs but DO contain
+                    # distinctive verb forms — "Закриваю" / "Відкриваю"
+                    # vs RU "Закрываю" / "Открываю").
+                    desc_lc = (desc or "").lower()
+                    _DESC_UA_MARKERS = (
+                        "закриваю", "відкриваю", "вимикаю", "вмикаю",
+                        "роблю", "пишу", "запускаю",
+                    )
+                    _DESC_RU_MARKERS = (
+                        "закрываю", "открываю", "выключаю", "включаю",
+                        "делаю", "пишу", "запускаю",
+                    )
+                    desc_is_uk = (
+                        any(ch in desc_lc for ch in "іїєґ")
+                        or any(m in desc_lc for m in _DESC_UA_MARKERS)
+                    )
+                    desc_is_ru = (
+                        any(ch in desc_lc for ch in "ыэъё")
+                        or any(m in desc_lc for m in _DESC_RU_MARKERS)
+                    )
                     if lang_active == "uk":
-                        prompt = (
-                            f"{desc}. Підтверджуєш? "
-                            "Скажи «так» щоб виконати або «ні» щоб скасувати."
-                        )
+                        if desc_is_uk or (not desc_is_ru):
+                            prompt = (
+                                f"{desc}. Підтверджуєш? "
+                                "Скажи «так» щоб виконати або «ні» щоб скасувати."
+                            )
+                        else:
+                            # desc is RU-only — drop it.
+                            prompt = (
+                                "Підтверджуєш дію? "
+                                "Скажи «так» щоб виконати або «ні» щоб скасувати."
+                            )
                     else:
-                        prompt = (
-                            f"{desc}. Подтверждаешь? "
-                            "Скажи «да» чтобы выполнить или «нет» чтобы отменить."
-                        )
+                        if desc_is_ru or (not desc_is_uk):
+                            prompt = (
+                                f"{desc}. Подтверждаешь? "
+                                "Скажи «да» чтобы выполнить или «нет» чтобы отменить."
+                            )
+                        else:
+                            # desc is UA-only — drop it (would mix voices).
+                            prompt = (
+                                "Подтверждаешь действие? "
+                                "Скажи «да» чтобы выполнить или «нет» чтобы отменить."
+                            )
                     try:
                         self._audit.emit(
                             kind="fast_path_confirm",
@@ -3178,6 +3293,17 @@ def _make_echo_filter_processor():
             return True
         return False
 
+    # R34-S44 — short yes/no answers must NEVER be treated as bot echo,
+    # even if they appear as substrings inside a recent bot prompt like
+    # "Скажи «так» щоб виконати". Without this carve-out the confirmation
+    # gate becomes unanswerable: the bot speaks the word "так" inside the
+    # prompt, registers the whole sentence as a bot utterance, and then
+    # drops the user's literal "так" reply via substring match.
+    _CONFIRMATION_RESERVED = {
+        "так", "да", "yes", "ага", "ок", "ok",
+        "ні", "нет", "no", "стоп", "stop",
+    }
+
     def _looks_like_bot_echo(text: str) -> bool:
         """True if ``text`` is plausibly a mic-capture of a recent bot
         phrase (registered via ``_register_bot_utterance``).
@@ -3190,6 +3316,11 @@ def _make_echo_filter_processor():
         """
         fp = _bot_history_fingerprint(text)
         if not fp or len(fp) < 3:
+            return False
+        # R34-S44 — never drop confirmation answers as echo. ``fp`` is
+        # already normalised (lowercased, punctuation stripped, single-
+        # spaced) so this check matches "так" / "ага" / "ок" cleanly.
+        if fp in _CONFIRMATION_RESERVED:
             return False
         # R34-S41 — monotonic clock + snapshot under lock so we
         # don't iterate a list being mutated by the producer thread.
