@@ -991,7 +991,10 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
             llm_model=resolve_tool_router_model(cfg),
             llm_timeout_sec=float(getattr(cfg, "llm_tools_timeout_sec", 8.0)),
             embed_model=getattr(cfg, "ollama_embed_model", "nomic-embed-text"),
-            embed_timeout_sec=float(getattr(cfg, "llm_embed_timeout_sec", 10.0)),
+            # R34-S52 C-6: typo — config field is
+            # ``llm_embedding_timeout_sec``. Was silently falling back
+            # to 10.0s and masking the user's 60s setting.
+            embed_timeout_sec=float(getattr(cfg, "llm_embedding_timeout_sec", 10.0)),
             context_hint=context_hint,
         )
         # Don't cache the router's "fall open to all tools" fallback. That
@@ -1252,7 +1255,8 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
                 to_time=to_time,
                 ollama_base_url=cfg.ollama_base_url,
                 ollama_embed_model=cfg.ollama_embed_model,
-                timeout_sec=float(getattr(cfg, 'llm_embed_timeout_sec', 10.0)),
+                # R34-S52 C-6: typo — see above.
+                timeout_sec=float(getattr(cfg, 'llm_embedding_timeout_sec', 10.0)),
                 voice_debug=cfg.voice_debug,
                 max_results=cfg.memory_enrichment_max_results
             )
@@ -1494,14 +1498,15 @@ def run_reply_engine(db: "Database", cfg, tts: Optional[Any],
         # Add model-size-appropriate prompt components
         guidance.extend(prompts.to_list())
 
-        # Both current TTS engines (Piper, Chatterbox) only support English.
-        # Responding in another language would produce garbled audio.
-        # Remove this constraint when a multilingual TTS engine is added.
-        tts_engine = getattr(cfg, 'tts_engine', 'piper')
-        if tts_engine in ('piper', 'chatterbox'):
-            guidance.append(
-                "Always respond in English regardless of the language the user speaks in."
-            )
+        # R34-S52 C-1: REMOVED — the prior comment falsely claimed Piper is
+        # English-only. Piper ships `ru_RU-ruslan-medium`, `ru_RU-irina-medium`,
+        # `uk_UA-ukrainian_tts-medium`, plus DE/FR/ES/IT voices. The hardcoded
+        # "Always respond in English" override was injected into EVERY agentic
+        # reply, directly contradicting the Russian-first persona and the
+        # R34-S48/S51 language_lock_block. This was the root cause of the
+        # user's months-long complaint that Jarvis kept dropping into English
+        # despite the persona-level Russian lock. The language is now governed
+        # solely by the persona prompt + language_lock_block.
 
         if warm_profile_block:
             # Pre-query, query-agnostic user context. Lives OUTSIDE the

@@ -36,6 +36,7 @@ from .updater import (
     UpdateStatus,
     install_update,
     save_installed_asset_id,
+    verify_download_sha256,
 )
 
 # ---------------------------------------------------------------------------
@@ -615,6 +616,16 @@ class UpdateProgressDialog(QDialog):
         QTimer.singleShot(500, lambda: self._install(Path(path)))
 
     def _install(self, download_path: Path):
+        # R34-S52 C-4: defense-in-depth SHA256 verification BEFORE
+        # chmod+exec of the downloaded payload. Fail-closed on
+        # mismatch / unfetchable sidecar.
+        if not verify_download_sha256(download_path, self.release):
+            self._on_error(
+                "Update integrity check failed. The download could not "
+                "be verified against the release's SHA256 hash. Aborting "
+                "install. Please update manually from the releases page."
+            )
+            return
         if install_update(download_path):
             save_installed_asset_id(self.release.asset_id)
 

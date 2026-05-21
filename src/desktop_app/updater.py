@@ -6,6 +6,7 @@ Checks GitHub Releases for new versions and handles the update process.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -163,6 +164,22 @@ class ReleaseInfo:
     asset_name: str
     asset_size: int
     release_notes: str
+    # R34-S52 C-4: Defense-in-depth SHA256 verification. Populated from a
+    # companion `<asset_name>.sha256` asset on the same release (if
+    # present). When present, the installer verifies the downloaded
+    # payload against this hash BEFORE chmod+exec — fail-closed on
+    # mismatch. When absent (legacy releases that haven't published a
+    # sidecar yet), the installer logs a warning and proceeds — until
+    # the release pipeline is upgraded to always publish .sha256, this
+    # is back-compat soft-fail. Future hard-fail toggle lives in
+    # `REQUIRE_SHA256_VERIFICATION` below.
+    sha256_url: Optional[str] = None
+
+
+# R34-S52 C-4: When True, refuse to install an update without a verified
+# SHA256 sidecar. Enable this AFTER all live releases publish .sha256
+# files. Today: default False (warn-only) to preserve back-compat.
+REQUIRE_SHA256_VERIFICATION = False
 
 
 @dataclass
@@ -226,6 +243,21 @@ def parse_version(tag: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _find_sha256_sidecar(release: dict, asset_name: str) -> Optional[str]:
+    """Look for a `<asset_name>.sha256` companion asset on the same release.
+
+    R34-S52 C-4: defense-in-depth SHA256 verification. The release
+    pipeline is expected to publish a `.sha256` text file alongside
+    each platform asset. Returns the download URL of that sidecar, or
+    None when the release hasn't published one (legacy releases).
+    """
+    sha_name = f"{asset_name}.sha256"
+    for asset in release.get("assets", []):
+        if asset.get("name") == sha_name:
+            return asset.get("browser_download_url")
+    return None
+
+
 def _make_release_info(release: dict, asset: dict) -> ReleaseInfo:
     return ReleaseInfo(
         asset_id=asset["id"],
@@ -238,7 +270,105 @@ def _make_release_info(release: dict, asset: dict) -> ReleaseInfo:
         asset_name=asset["name"],
         asset_size=asset["size"],
         release_notes=release.get("body", ""),
+        sha256_url=_find_sha256_sidecar(release, asset["name"]),
     )
+
+
+def _fetch_expected_sha256(sha256_url: str) -> Optional[str]:
+    """Fetch and parse a `.sha256` sidecar.
+
+    Accepts two formats:
+    - bare hex: `abc123...` (64 lowercase hex chars)
+    - `sha256sum` output: `abc123...  <filename>`
+
+    Returns the lowercased 64-char hex hash, or None if the fetch /
+    parse failed.
+    """
+    try:
+        response = requests.get(sha256_url, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        debug_log(f"sha256 sidecar fetch failed: {e}", "updater")
+        return None
+    content = response.text.strip()
+    # Take the first whitespace-separated token of the first non-empty line
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        token = line.split()[0].strip().lower()
+        # sha256 hex is exactly 64 characters
+        if len(token) == 64 and all(c in "0123456789abcdef" for c in token):
+            return token
+        debug_log(
+            f"sha256 sidecar line did not parse as hex digest: {line!r}",
+            "updater",
+        )
+        return None
+    return None
+
+
+def _compute_file_sha256(path: Path) -> str:
+    """Stream-compute SHA256 of a local file. Bounded memory."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)  # 1 MiB
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def verify_download_sha256(
+    download_path: Path,
+    release: ReleaseInfo,
+) -> bool:
+    """Verify a downloaded asset against its `.sha256` sidecar.
+
+    R34-S52 C-4: defense-in-depth check. Returns True iff:
+    - sidecar exists AND hash matches, OR
+    - sidecar absent AND ``REQUIRE_SHA256_VERIFICATION`` is False (legacy
+      release back-compat — warns but allows).
+
+    Returns False to abort install when:
+    - sidecar present but fetch/parse failed,
+    - sidecar present but hash mismatched,
+    - sidecar absent AND ``REQUIRE_SHA256_VERIFICATION`` is True.
+    """
+    if not release.sha256_url:
+        if REQUIRE_SHA256_VERIFICATION:
+            debug_log(
+                "Refusing to install: release has no .sha256 sidecar "
+                "and REQUIRE_SHA256_VERIFICATION is True",
+                "updater",
+            )
+            return False
+        debug_log(
+            f"WARNING: no .sha256 sidecar for {release.asset_name} — "
+            "installing without hash verification. Future releases "
+            "should publish a .sha256 file alongside each platform asset.",
+            "updater",
+        )
+        return True
+    expected = _fetch_expected_sha256(release.sha256_url)
+    if not expected:
+        debug_log(
+            "Refusing to install: .sha256 sidecar present but could not "
+            "be fetched or parsed",
+            "updater",
+        )
+        return False
+    actual = _compute_file_sha256(download_path)
+    if actual != expected:
+        debug_log(
+            f"SHA256 MISMATCH: expected {expected}, got {actual} — "
+            f"refusing to install {release.asset_name}",
+            "updater",
+        )
+        return False
+    debug_log(f"SHA256 verified: {actual} matches sidecar", "updater")
+    return True
 
 
 def check_for_updates(channel: Optional[UpdateChannel] = None) -> UpdateStatus:

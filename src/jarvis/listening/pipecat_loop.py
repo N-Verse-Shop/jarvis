@@ -82,19 +82,11 @@ _VOICE_SYSTEM_PROMPT_RU = (
     "Имя Данило склоняй грамматически правильно (Данила/Данилу/Даниле). "
     "Никогда не сокращай до «Нило» или «Даня»."
 )
-_VOICE_SYSTEM_PROMPT_UK = (
-    "Ти — Джарвіс, голосовий асистент Данила. Відповідай "
-    "ДУЖЕ КОРОТКО (1-2 речення, зазвичай ≤25 слів), "
-    "українською. Без префіксів типу «Добре», «Звичайно», "
-    "«Зрозумів». Без емодзі, списків, блоків коду. "
-    # R34-S43 — strict confirmation gate.
-    "НІКОЛИ не виконуй дії без явної згоди користувача. Будь-яку "
-    "дію на машині (відкрити/закрити додаток, написати файл, "
-    "надіслати листа, змінити налаштування) спочатку ОПИШИ одним "
-    "коротким реченням і закінчи питанням «Підтверджуєш?». ЧЕКАЙ "
-    "його «так» перш ніж щось робити. Якщо він каже «ні» або "
-    "«стоп» — спокійно підтверди скасування."
-)
+# R34-S52 C-9: _VOICE_SYSTEM_PROMPT_UK removed. R34-S48/S51 made
+# Russian the only outbound language; this constant was dead under the
+# RU pin in _system_prompt_for() but kept tempting future regressions
+# every time someone touched language gating. Voice pipeline is now
+# RU-only end-to-end.
 
 
 @dataclass
@@ -396,7 +388,18 @@ def _system_prompt_for(lang: str, *, slim: bool = False) -> str:
     prompt-eval and pushes num_ctx tight on qwen3:8b. The catalog
     adds nothing to a pure-chat reply but multiplies cold-cache latency.
     """
-    base = _VOICE_SYSTEM_PROMPT_UK if lang == "uk" else _VOICE_SYSTEM_PROMPT_RU
+    # R34-S52 C-8 / C-9: hard-pin Russian regardless of ``lang``. The
+    # user enforced RU-only output project-wide in R34-S48/S51. Keeping
+    # the UA branch active meant any user who once flipped
+    # ``active_language`` to "uk" (config edit, voice command, test
+    # fixture) got 100% Ukrainian system prompt — which we then
+    # post-hoc normalised at TTS time. That left the LLM context
+    # itself Ukrainian-tainted across turns. By overriding here we
+    # keep the entire prompt chain in Russian. The ``lang`` argument
+    # is preserved in the signature for callers but no longer
+    # influences the prompt selection.
+    lang = "ru"
+    base = _VOICE_SYSTEM_PROMPT_RU
     parts: list[str] = []
 
     # 1. Persona (R33-S1)
@@ -440,28 +443,20 @@ def _system_prompt_for(lang: str, *, slim: bool = False) -> str:
     # щоб я подивився в Brain?" — it just hallucinates from
     # parametric training. A 250-char nudge is enough to teach the
     # behaviour without breaking the prompt budget.
-    if lang == "uk":
-        brain_hint = (
-            "Користувач веде базу знань Nexus Studio у "
-            "~/Documents/Nexus-Brain (Obsidian vault: 01-CLIENTS, "
-            "02-PROJECTS, 04-KNOWLEDGE, 08-PARTNERS …). Якщо запит "
-            "стосується клієнтів, проектів, партнерів чи внутрішніх "
-            "процесів — попроси користувача сказати «знайди у мозку …» "
-            "щоб ти зміг прочитати реальний файл, замість того щоб "
-            "вгадувати. Нові факти про Nexus Studio користувач може "
-            "зафіксувати фразою «запиши в мозок: …»."
-        )
-    else:
-        brain_hint = (
-            "Пользователь ведёт базу знаний Nexus Studio в "
-            "~/Documents/Nexus-Brain (Obsidian vault: 01-CLIENTS, "
-            "02-PROJECTS, 04-KNOWLEDGE, 08-PARTNERS …). Если вопрос "
-            "касается клиентов, проектов, партнёров или внутренних "
-            "процессов — попроси пользователя сказать «найди в мозге …» "
-            "чтобы ты прочитал реальный файл, а не выдумывал. Новые "
-            "факты о Nexus Studio пользователь может зафиксировать "
-            "фразой «запиши в мозг: …»."
-        )
+    # R34-S52 C-8: was UA-conditional. R34-S48/S51 made RU the only
+    # outbound language, so the UA branch became dead code that still
+    # tainted the prompt chain if anyone toggled ``active_language`` to
+    # ``"uk"``. Collapsed to the RU branch unconditionally.
+    brain_hint = (
+        "Пользователь ведёт базу знаний Nexus Studio в "
+        "~/Documents/Nexus-Brain (Obsidian vault: 01-CLIENTS, "
+        "02-PROJECTS, 04-KNOWLEDGE, 08-PARTNERS …). Если вопрос "
+        "касается клиентов, проектов, партнёров или внутренних "
+        "процессов — попроси пользователя сказать «найди в мозге …» "
+        "чтобы ты прочитал реальный файл, а не выдумывал. Новые "
+        "факты о Nexus Studio пользователь может зафиксировать "
+        "фразой «запиши в мозг: …»."
+    )
     parts.append(brain_hint)
 
     # 4. L1 skill catalog (R32-1) — skipped in slim mode (R34-S42 К4)
@@ -2475,11 +2470,22 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                 # silence is a valid assistant reply).
                 if reply and reply.strip():
                     try:
+                        # R34-S52 C-2: normalise the assistant text BEFORE
+                        # storing into history. Without this, the LLM sees
+                        # its own UA-tainted prior reply on the next turn
+                        # and treats UA tokens as in-distribution → keeps
+                        # answering UA despite the language_lock_block.
+                        # The TTS-side normaliser only fixes audio, not
+                        # context. Both sides must be RU-pinned.
+                        try:
+                            _hist_reply = _ru_normalise(reply)[:800]
+                        except Exception:
+                            _hist_reply = reply[:800]
                         self._messages_history.append(
                             {"role": "user", "content": text[:800]}
                         )
                         self._messages_history.append(
-                            {"role": "assistant", "content": reply[:800]}
+                            {"role": "assistant", "content": _hist_reply}
                         )
                         # Trim from the front so we never exceed the
                         # max — keeps the window O(8) regardless of
@@ -4230,6 +4236,16 @@ def _make_echo_filter_processor():
         normalised = _NORMALISE_RE.sub("", text).lower().strip()
         if not normalised:
             return True  # punctuation-only = drop
+        # R34-S52 C-3: never drop a bare confirmation/denial token as a
+        # hallucination — these are EXACTLY the words the user says to
+        # answer a "Подтверждаешь?" prompt. `_HALLUCINATION_PHRASES`
+        # contains "да", "нет", "так", "ні", "ага", "ок" because they're
+        # also common Whisper-on-silence outputs, but dropping them here
+        # silently breaks the confirmation flow. The downstream fast-path
+        # already routes these to `_handle_pending_confirmation` when an
+        # action is armed, and the EchoFilter handles bot-echo separately.
+        if normalised in _CONFIRMATION_RESERVED:
+            return False
         if normalised in _HALLUCINATION_PHRASES:
             return True
         # Whisper sometimes repeats a single token N times — "ого ого ого ого".
@@ -4848,12 +4864,14 @@ def _build_pipeline(cfg: PipecatLoopConfig):
             lock_ = language_lock_block(cfg.active_language)
         except Exception:
             lock_ = ""
+        # R34-S52 C-8: was UA-conditional. With R34-S48/S51 RU-only
+        # policy the UA branch poisoned the warmup KV-cache prefix when
+        # ``active_language == "uk"`` — the first real turn then built
+        # a Russian prefix, so the cache reuse missed entirely, hurting
+        # latency AND tainting context with UA tokens. Russian-only now.
         clarify_ = (
-            "Якщо запит незрозумілий, нечіткий або схожий на безглуздий — "
-            "перепитай одним коротким реченням, НЕ вигадуй відповідь."
-            if cfg.active_language == "uk"
-            else "Если запрос неясный, нечёткий или похож на бессмыслицу — "
-                 "переспроси одним коротким предложением, НЕ выдумывай ответ."
+            "Если запрос неясный, нечёткий или похож на бессмыслицу — "
+            "переспроси одним коротким предложением, НЕ выдумывай ответ."
         )
         try:
             slim_prompt_ = _system_prompt_for(cfg.active_language, slim=True)

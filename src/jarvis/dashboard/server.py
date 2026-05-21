@@ -1263,16 +1263,32 @@ class DashboardServer:
             # window (we show a toast immediately).
             await asyncio.sleep(1.2)
             if plist_path:
-                # Spawn a detached shell that survives our own death:
-                # unload → small wait → load. We never await it; we're
-                # about to be killed by the first unload anyway.
+                # R34-S52 C-5: was previously
+                #   _sp.Popen(["/bin/sh", "-c", f'launchctl unload "{plist_path}" ...'])
+                # which interpolates ``plist_path`` into a shell string.
+                # The path was gated by ``plist.exists()`` above so the
+                # known instance was safe, but the construction is the
+                # kind of pattern a future refactor accidentally
+                # neuters. Switched to a detached Python orchestrator
+                # invoked via argv — ``plist`` arrives as ``sys.argv[1]``
+                # and is passed to launchctl as an argv element, never
+                # interpreted by a shell. Eliminates the whole class.
+                import sys as _sys
+                _orchestrator = (
+                    "import subprocess, time, sys;"
+                    "plist = sys.argv[1];"
+                    "subprocess.run("
+                    "    ['launchctl', 'unload', plist],"
+                    "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL"
+                    ");"
+                    "time.sleep(2);"
+                    "subprocess.run("
+                    "    ['launchctl', 'load', plist],"
+                    "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL"
+                    ")"
+                )
                 _sp.Popen(
-                    [
-                        "/bin/sh", "-c",
-                        f'launchctl unload "{plist_path}" >/dev/null 2>&1; '
-                        f'sleep 2; '
-                        f'launchctl load "{plist_path}" >/dev/null 2>&1',
-                    ],
+                    [_sys.executable, "-c", _orchestrator, plist_path],
                     start_new_session=True,
                     stdin=_sp.DEVNULL,
                     stdout=_sp.DEVNULL,
