@@ -489,6 +489,36 @@ _BOT_HISTORY_LOCK = _threading.Lock()
 # _play_audio_interruptable's finally clears it from the executor.
 _PLAYBACK_LOCK = _threading.Lock()
 
+# R34-S45 — persistent standby. When the HUD's Close (✕) button is
+# pressed, the renderer writes ``control.json {"action":"end_session"}``
+# plus ``interrupt.flag``. The flag cancels the current turn, but the
+# pipeline keeps the mic open and would speak again on the next
+# transcript that survives the wake-gate (background voices, ambient
+# Whisper hallucinations). Persistent standby blocks ALL bot speech
+# (fast-path acks + direct_chat replies + tool dispatch) until the
+# user explicitly says the wake word — at which point the wake-word
+# gate calls ``_clear_standby()`` and the daemon resumes.
+#
+# This is module-level (not per-processor) so every speaking site
+# can cheaply check ``_is_standby()`` before generating audio. Uses
+# a plain bool + lock — no monotonic clock needed because there's no
+# TTL; the only exit path is an explicit wake.
+_STANDBY = False
+_STANDBY_LOCK = _threading.Lock()
+
+
+def _set_standby(value: bool) -> None:
+    """Atomically flip the standby flag."""
+    global _STANDBY
+    with _STANDBY_LOCK:
+        _STANDBY = value
+
+
+def _is_standby() -> bool:
+    """True if the HUD has put the daemon into Close-to-standby mode."""
+    with _STANDBY_LOCK:
+        return _STANDBY
+
 
 def _bot_history_fingerprint(text: str) -> str:
     """Normalise text for echo comparison (lower, strip punct, collapse ws)."""
@@ -1500,8 +1530,23 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             HUD overlay (the coin) watches. Without these frames the
             coin stays stuck on LISTENING even though Jarvis is
             actively talking.
+
+            R34-S45 — standby gate. If the HUD's Close button placed
+            the daemon into standby, abort the speech entirely. Same
+            policy as ``JarvisFastPathProcessor._speak_ack``.
             """
             if not text:
+                return
+            if _is_standby():
+                try:
+                    self._stream.emit(
+                        "log",
+                        level="DEBUG",
+                        component="direct-chat",
+                        message=f"STANDBY: skipped speak {text[:60]!r}",
+                    )
+                except Exception:
+                    pass
                 return
             # R34-S32: register phrase before speaking for echo filter.
             try:
@@ -1591,6 +1636,23 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             text = (frame.text or "").strip()
             if not text:
                 await self.push_frame(frame, direction)
+                return
+            # R34-S45 — standby gate. Drop transcript entirely instead
+            # of wasting an Ollama call and TTS round-trip we'd just
+            # silence in _speak() anyway. Wake-gate upstream already
+            # filters non-wake transcripts during standby, but this
+            # belt-and-braces check guards against dashboard-injected
+            # frames that bypass the wake-gate (user_id="dashboard").
+            if _is_standby():
+                try:
+                    self._stream.emit(
+                        "log",
+                        level="DEBUG",
+                        component="direct-chat",
+                        message=f"STANDBY: dropped frame {text[:60]!r}",
+                    )
+                except Exception:
+                    pass
                 return
             # R34-S38: drop wake-word-only utterances BEFORE LLM call.
             # When STT transcribes only the wake-word (often mis-heard:
@@ -1849,8 +1911,24 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
             bypass was created to avoid (wedges after warmup, never
             emits ``TTSStartedFrame``). Direct ``say`` + atomic
             ``state.json`` writes keep the HUD coin in sync.
+
+            R34-S45 — standby gate. If the HUD's Close button placed
+            the daemon into standby, abort the speech entirely. The
+            wake-gate will let a wake-word through and clear standby
+            before any speak call lands here.
             """
             if not text:
+                return
+            if _is_standby():
+                try:
+                    self._stream.emit(
+                        "log",
+                        level="DEBUG",
+                        component="fast-path",
+                        message=f"STANDBY: skipped speak {text[:60]!r}",
+                    )
+                except Exception:
+                    pass
                 return
             # R34-S32: register the phrase BEFORE speaking so the
             # echo filter has the fingerprint when mic-captured echo
@@ -2941,12 +3019,60 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
                 await self.push_frame(frame, direction)
                 return
 
+            text_lower = text.lower()
+            wake_hit = is_wake_word_detected(
+                text_lower, wake_word, wake_aliases, fuzzy_ratio
+            )
+
+            # R34-S45 — standby gate runs FIRST, before any other
+            # bypass. If the HUD's Close button put the daemon into
+            # standby, ONLY an explicit wake-word resumes it.
+            # Everything else (ambient mic speech, hallucinated
+            # transcripts, AND dashboard-injected requests) is
+            # consumed silently. We check this above the dashboard
+            # bypass because otherwise a dashboard inject during
+            # standby would skip the gate entirely and the daemon
+            # would respond to text the user can't see / didn't
+            # authorise verbally.
+            if _is_standby():
+                if wake_hit:
+                    _set_standby(False)
+                    try:
+                        self._stream.emit(
+                            "log",
+                            level="INFO",
+                            component="wake-gate",
+                            message="wake-word during STANDBY — resuming",
+                        )
+                    except Exception:
+                        pass
+                    # Fall through — wake-word in dashboard or mic
+                    # frame clears standby and proceeds normally.
+                else:
+                    try:
+                        self._stream.emit(
+                            "log",
+                            level="DEBUG",
+                            component="wake-gate",
+                            message=(
+                                f"STANDBY: dropped non-wake transcript "
+                                f"{text[:60]!r}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return  # consume — daemon stays silent
+
             # R34-S31: dashboard-injected transcripts bypass the wake
             # gate entirely — the user already explicitly asked via
             # /api/voice/inject or the chat UI, so requiring a wake
             # word would be redundant friction. We ALSO open the hot
             # window so any natural follow-up doesn't need a wake
             # word either.
+            #
+            # R34-S45 — Order matters: standby is checked above. If
+            # we reached here, either standby is off or the inject
+            # contained the wake-word (which already cleared it).
             try:
                 if getattr(frame, "user_id", "") == "dashboard":
                     self._open_hot_window()
@@ -2954,11 +3080,6 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
                     return
             except Exception:
                 pass
-
-            text_lower = text.lower()
-            wake_hit = is_wake_word_detected(
-                text_lower, wake_word, wake_aliases, fuzzy_ratio
-            )
 
             # R34-S34: barge-in — if Jarvis is currently speaking AND
             # the new transcript contains the wake-word, kill the
@@ -3977,6 +4098,17 @@ async def _interrupt_flag_poller(task: Any) -> None:
     # through the microphone (used for end-to-end smoke tests
     # when the audio device is busy or the user is debugging).
     inject_flag = base / "inject_transcription.flag"
+    # R34-S45 — control.json carries persistent action verbs from the
+    # HUD (Close button writes {"action":"end_session"}). The legacy
+    # listener.py path consumes this file; the Pipecat path didn't,
+    # so end_session only cancelled the current turn and the daemon
+    # would speak again on the next surviving transcript. We now read
+    # the same file, set the standby flag, and unlink so re-entry
+    # writes are honoured. ``_seen_ctl_ts`` deduplicates against the
+    # millisecond-stamp HUD puts in the JSON so we don't loop on
+    # the same end_session multiple times.
+    ctrl_file = base / "control.json"
+    _seen_ctl_ts: float = 0.0
     try:
         # Use late import so a missing pipecat install doesn't break
         # the whole module — _amain only runs when pipecat is loaded.
@@ -3993,6 +4125,52 @@ async def _interrupt_flag_poller(task: Any) -> None:
         return
     while True:
         try:
+            # R34-S45 — control.json end_session goes to persistent
+            # standby. Check FIRST so that the same poll tick also
+            # cancels in-flight TTS via the flag-block below (Close
+            # button writes both atomically).
+            if ctrl_file.exists():
+                try:
+                    import json as _json_ctl
+                    raw = ctrl_file.read_text(encoding="utf-8")
+                    ctl = _json_ctl.loads(raw) if raw.strip() else {}
+                    action_ = str(ctl.get("action") or "").lower()
+                    ts_ = float(ctl.get("ts") or 0)
+                    if ts_ > _seen_ctl_ts and action_ in (
+                        "end_session", "stop_session", "session_end",
+                        "standby", "close",
+                    ):
+                        _seen_ctl_ts = ts_
+                        _set_standby(True)
+                        debug_log(
+                            f"control.json: {action_} → STANDBY engaged "
+                            "(say the wake word to resume)",
+                            "pipecat",
+                        )
+                        # Kill any in-flight playback right now.
+                        try:
+                            _stop_current_playback()
+                        except Exception:
+                            pass
+                        try:
+                            await task.queue_frame(InterruptionFrame())
+                        except Exception:
+                            pass
+                        # Flip HUD coin to IDLE so the user sees the
+                        # daemon is truly silent (not just LISTENING
+                        # while waiting). State auto-resets to
+                        # LISTENING the next time a transcript flows
+                        # through, which only happens after wake-word
+                        # clears standby.
+                        try:
+                            _write_hud_state_atomic("IDLE", level=0.0)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    debug_log(
+                        f"control.json poll error: {exc!r}",
+                        "pipecat",
+                    )
             if flag.exists():
                 debug_log("interrupt flag detected → cancelling turn", "pipecat")
                 # R34-S34: ALSO kill any in-flight afplay so the user
