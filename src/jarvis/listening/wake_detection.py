@@ -6,6 +6,51 @@ import difflib
 from ..debug import debug_log
 
 
+def is_wake_word_at_start(
+    text_lower: str,
+    wake_word: str,
+    aliases: List[str],
+    fuzzy_ratio: float = 0.78,
+    *,
+    max_tokens: int = 3,
+) -> bool:
+    """Strict variant: wake-word must appear at the START of the utterance.
+
+    Designed for STANDBY-clearing decisions where the substring match in
+    :func:`is_wake_word_detected` is too lax. Real wake utterances look
+    like "Джарвіс, ..." / "Hey Jarvis ..." — the wake-word is always
+    the first or near-first word. In contrast, a third party saying
+    "джарвис як раз управляє комп'ютером" mid-conversation should NOT
+    bring the daemon back online while the user has paused it.
+
+    Strategy:
+      1. Tokenise the lowercased text the same way the loose detector
+         does (strip surrounding punctuation).
+      2. Run the existing detector against ONLY the first ``max_tokens``
+         tokens — preserving all of its fuzzy / prefix tolerance for
+         genuine Whisper mishearings while bounding position.
+
+    ``max_tokens=3`` is generous enough for natural lead-in patterns
+    ("ok, Jarvis ..." / "Hey, Jarvis ..." / "Так, Джарвіс ...") but
+    tight enough to reject long unrelated paragraphs that merely
+    mention the assistant by name.
+    """
+    if not text_lower or not text_lower.strip():
+        return False
+    try:
+        tokens = [
+            t.strip(".,!?;:()[]{}\"'`).-_/")
+            for t in text_lower.split()
+            if t.strip()
+        ]
+    except Exception:
+        tokens = []
+    if not tokens:
+        return False
+    head = " ".join(tokens[:max_tokens])
+    return is_wake_word_detected(head, wake_word, aliases, fuzzy_ratio)
+
+
 def is_wake_word_detected(text_lower: str, wake_word: str, aliases: List[str], fuzzy_ratio: float = 0.78) -> bool:
     """
     Check if text contains wake word using exact, fuzzy, and prefix matching.

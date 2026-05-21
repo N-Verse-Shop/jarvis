@@ -2955,6 +2955,7 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
     from ..ipc import get_stream
     from .wake_detection import (
         extract_query_after_wake,
+        is_wake_word_at_start,
         is_wake_word_detected,
     )
 
@@ -3034,8 +3035,22 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
             # standby would skip the gate entirely and the daemon
             # would respond to text the user can't see / didn't
             # authorise verbally.
+            #
+            # R34-S46 — STRICT wake-word for resume. The loose
+            # ``wake_hit`` (substring + fuzzy) fires when ANY ambient
+            # transcript mentions "джарвис" — a third party in a
+            # video call saying "джарвис как раз управляет
+            # компьютером" would unlock standby and unleash the
+            # daemon on the rest of the conversation. Standby-resume
+            # now requires the wake-word at the START of the
+            # utterance (first 3 tokens). Genuine commands always
+            # start with the wake-word ("Джарвіс, котра година");
+            # mentions of the assistant mid-paragraph never do.
             if _is_standby():
-                if wake_hit:
+                wake_at_start = is_wake_word_at_start(
+                    text_lower, wake_word, wake_aliases, fuzzy_ratio,
+                )
+                if wake_at_start:
                     _set_standby(False)
                     try:
                         self._stream.emit(
@@ -3046,8 +3061,8 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
                         )
                     except Exception:
                         pass
-                    # Fall through — wake-word in dashboard or mic
-                    # frame clears standby and proceeds normally.
+                    # Fall through — wake-word at start of dashboard
+                    # or mic frame clears standby and proceeds.
                 else:
                     try:
                         self._stream.emit(
