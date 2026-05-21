@@ -655,7 +655,8 @@ def _register_bot_utterance(text: str) -> None:
 # single-word components (e.g. "не вдалося" → "не получилось" runs
 # before any bare "не" substitution).
 _UA_TO_RU_TRANSLATIONS: list[tuple[str, str]] = [
-    # Confirmation gate phrasing (R34-S43/47).
+    # ── Multi-word phrases (must precede single-word components) ──
+    ("Підтверджуєш дію", "Подтверждаешь действие"),
     ("Підтверджуєш", "Подтверждаешь"),
     ("підтверджуєш", "подтверждаешь"),
     ("Скажи «так» щоб виконати", "Скажи «да» чтобы выполнить"),
@@ -663,19 +664,108 @@ _UA_TO_RU_TRANSLATIONS: list[tuple[str, str]] = [
     ("«ні» щоб скасувати", "«нет» чтобы отменить"),
     ("щоб виконати", "чтобы выполнить"),
     ("щоб скасувати", "чтобы отменить"),
-    ("Скасовано", "Отменено"),
-    ("скасовано", "отменено"),
-    ("Зараз ", "Сейчас "),
+    ("щоб не", "чтобы не"),
+    ("щоб ", "чтобы "),
+    ("повтори, будь ласка", "повтори, пожалуйста"),
+    ("Я не зрозумів, повтори, будь ласка", "Я не понял, повтори, пожалуйста"),
+    ("не зрозумів", "не понял"),
+    ("не зрозуміла", "не поняла"),
+    ("не зрозуміло", "не понятно"),
+    ("зрозумів", "понял"),
+    ("зрозуміла", "поняла"),
+    ("зрозуміло", "понятно"),
+    ("Зрозумів", "Понял"),
+    ("Зрозуміло", "Понятно"),
+    ("будь ласка", "пожалуйста"),
+    ("Будь ласка", "Пожалуйста"),
+    ("Я вже відповідав на це", "Я уже отвечал на это"),
+    ("вже відповідав", "уже отвечал"),
+    ("вже ", "уже "),
     ("Не вдалося", "Не получилось"),
     ("не вдалося", "не получилось"),
-    ("Я вже відповідав на це", "Я уже отвечал на это"),
-    # Fast-path action descriptions.
+    ("Скасовано", "Отменено"),
+    ("скасовано", "отменено"),
+    # ── R34-S51 high-frequency LLM emissions ──
+    # The model (qwen3:8b) drifts into UA tokens mid-reply even after
+    # R34-S48's RU-only rule. Each entry below is a token observed
+    # leaking through to TTS during R34-S50 live testing. Order:
+    # longer / capitalised forms first so they win over partial matches.
+    ("допомогти", "помочь"),
+    ("Допомогти", "Помочь"),
+    ("допоможу", "помогу"),
+    ("Допоможу", "Помогу"),
+    ("допоможи", "помоги"),
+    ("Допоможи", "Помоги"),
+    ("допомога", "помощь"),
+    ("Допомога", "Помощь"),
+    ("можу", "могу"),
+    ("Можу", "Могу"),
+    ("треба", "надо"),
+    ("Треба", "Надо"),
+    ("щось", "что-то"),
+    ("Щось", "Что-то"),
+    ("нічого", "ничего"),
+    ("Нічого", "Ничего"),
+    ("тільки", "только"),
+    ("Тільки", "Только"),
+    ("трохи", "немного"),
+    ("Трохи", "Немного"),
+    ("гаразд", "хорошо"),
+    ("Гаразд", "Хорошо"),
+    ("добре", "хорошо"),
+    ("Добре", "Хорошо"),
+    ("вибач", "извини"),
+    ("Вибач", "Извини"),
+    ("вибачте", "извините"),
+    ("Вибачте", "Извините"),
+    ("навіщо", "зачем"),
+    ("Навіщо", "Зачем"),
+    ("чому", "почему"),
+    ("Чому", "Почему"),
+    ("де ", "где "),
+    ("Де ", "Где "),
+    ("куди", "куда"),
+    ("Куди", "Куда"),
+    ("коли ", "когда "),
+    ("Коли ", "Когда "),
+    ("швидко", "быстро"),
+    ("Швидко", "Быстро"),
+    ("багато", "много"),
+    ("Багато", "Много"),
+    ("забув", "забыл"),
+    ("забула", "забыла"),
+    ("Забув", "Забыл"),
+    ("Забула", "Забыла"),
+    ("повтори", "повтори"),  # identical, kept for explicit table coverage
+    ("перепитай", "переспроси"),
+    ("Перепитай", "Переспроси"),
+    ("кажу", "говорю"),
+    ("Кажу", "Говорю"),
+    ("скажу", "скажу"),  # identical
+    ("вікно", "окно"),
+    ("Вікно", "Окно"),
+    ("сьогодні", "сегодня"),
+    ("Сьогодні", "Сегодня"),
+    ("учора", "вчера"),
+    ("Учора", "Вчера"),
+    ("вчора", "вчера"),
+    ("завтра", "завтра"),  # identical
+    ("Завтра", "Завтра"),
+    # UA past-tense be-verb (huge source of leaks)
+    ("був ", "был "),
+    ("була ", "была "),
+    ("було ", "было "),
+    ("Був ", "Был "),
+    ("Була ", "Была "),
+    ("Було ", "Было "),
+    # ── Fast-path action descriptions (existing R34-S48 set) ──
     ("Відкриваю", "Открываю"),
     ("відкриваю", "открываю"),
     ("Закриваю", "Закрываю"),
     ("закриваю", "закрываю"),
     ("Дивлюся час", "Смотрю время"),
     ("Дивлюся", "Смотрю"),
+    ("Дивлюсь", "Смотрю"),
     ("Записую у Brain", "Записываю в Brain"),
     ("Записую", "Записываю"),
     ("Записав нотатку", "Записал заметку"),
@@ -685,36 +775,165 @@ _UA_TO_RU_TRANSLATIONS: list[tuple[str, str]] = [
     ("Шукаю у Brain", "Ищу в Brain"),
     ("Шукаю", "Ищу"),
     ("Перевіряю", "Проверяю"),
+    ("перевіряю", "проверяю"),
     ("Ховаю", "Скрываю"),
     ("ховаю", "скрываю"),
     ("Перемикаю вікно", "Переключаю окно"),
+    ("Перемикаю", "Переключаю"),
+    ("перемикаю", "переключаю"),
     ("Показую робочий стіл", "Показываю рабочий стол"),
     ("Показую", "Показываю"),
     ("Дивлюся пошту", "Смотрю почту"),
     ("Слухаю", "Слушаю"),
+    ("слухаю", "слушаю"),
     ("Записую ідею", "Записываю идею"),
     ("ідею", "идею"),
+    ("ідея", "идея"),
     ("Не зміг", "Не смог"),
     ("не зміг", "не смог"),
     ("додатка", "приложения"),
     ("додаток", "приложение"),
-    # Common weekday names (used by say_time / say_date).
+    # ── R34-S51 action_dispatcher description coverage ──
+    ("Зроблю скріншот екрана", "Сделаю скриншот экрана"),
+    ("Зроблю скріншот", "Сделаю скриншот"),
+    ("Роблю скріншот", "Делаю скриншот"),
+    ("скріншот", "скриншот"),
+    ("Поставлю гучність", "Поставлю громкость"),
+    ("гучність", "громкость"),
+    ("Гучність", "Громкость"),
+    ("Вимкну звук", "Выключу звук"),
+    ("Увімкну звук", "Включу звук"),
+    ("Вимикаю звук", "Выключаю звук"),
+    ("Увімкаю звук", "Включаю звук"),
+    ("Увімкаю", "Включаю"),
+    ("Вимикаю", "Выключаю"),
+    ("Заблокую екран", "Заблокирую экран"),
+    ("Блокую екран", "Блокирую экран"),
+    ("екран", "экран"),
+    ("Перемкну відтворення", "Переключу воспроизведение"),
+    ("відтворення", "воспроизведение"),
+    ("Наступний трек", "Следующий трек"),
+    ("Попередній трек", "Предыдущий трек"),
+    ("Скопіюю в буфер", "Скопирую в буфер"),
+    ("Дивлюся в буфер обміну", "Смотрю в буфер обмена"),
+    ("Дивлюсь буфер", "Смотрю буфер"),
+    ("Дивлюся буфер", "Смотрю буфер"),
+    ("буфер обміну", "буфер обмена"),
+    ("Шукаю на YouTube", "Ищу на YouTube"),
+    ("Шукаю в Google", "Ищу в Google"),
+    ("Шукаю в Spotlight", "Ищу в Spotlight"),
+    ("у Spotlight", "в Spotlight"),
+    ("у Brain", "в Brain"),
+    ("у Google", "в Google"),
+    ("у YouTube", "в YouTube"),
+    ("Відкрию нового листа до", "Открою новое письмо для"),
+    ("Відкрию", "Открою"),
+    ("листа", "письмо"),
+    ("Подивлюся котра година", "Посмотрю который час"),
+    ("Подивлюся котра", "Посмотрю который"),
+    ("Подивлюся", "Посмотрю"),
+    ("Подивлюсь", "Посмотрю"),
+    ("котра година", "который час"),
+    ("Перевіряю рівень батареї", "Проверяю уровень батареи"),
+    ("Перевіряю рівень", "Проверяю уровень"),
+    ("Перевіряю батарею", "Проверяю батарею"),
+    ("рівень батареї", "уровень батареи"),
+    ("батареї", "батареи"),
+    ("Створюю Linear-задачу", "Создаю задачу в Linear"),
+    ("Створюю GitHub issue", "Создаю GitHub issue"),
+    ("Створюю GitLab issue", "Создаю GitLab issue"),
+    ("Створюю", "Создаю"),
+    ("Створив", "Создал"),
+    ("Створено", "Создано"),
+    ("Додаю до Notion", "Добавляю в Notion"),
+    ("Додаю до", "Добавляю в"),
+    ("Додаю", "Добавляю"),
+    ("Додано", "Добавлено"),
+    ("Дивлюсь дату", "Смотрю дату"),
+    ("Записую нотатку", "Записываю заметку"),
+    ("нотатку", "заметку"),
+    ("Закриваю вкладку", "Закрываю вкладку"),
+    ("Нова вкладка у", "Новая вкладка в"),
+    ("Нова вкладка", "Новая вкладка"),
+    ("Пауза", "Пауза"),  # identical
+    ("Вмикаю музику", "Включаю музыку"),
+    ("Вмикаю", "Включаю"),
+    # ── R34-S51 action_dispatcher errors ──
+    ("Помилка", "Ошибка"),
+    ("помилка", "ошибка"),
+    ("Не вказано назву додатка", "Не указано название приложения"),
+    ("Не вказано назву", "Не указано название"),
+    ("Не вказано що шукати", "Не указано что искать"),
+    ("Не вказано", "Не указано"),
+    ("назву", "название"),
+    ("не схоже на назву додатка", "не похоже на название приложения"),
+    ("не схоже на назву", "не похоже на название"),
+    ("не схоже", "не похоже"),
+    ("Не зміг відкрити", "Не смог открыть"),
+    ("Не зміг закрити", "Не смог закрыть"),
+    ("Не зміг записати", "Не смог записать"),
+    ("Не зміг прочитати", "Не смог прочитать"),
+    ("Не зміг визначити", "Не смог определить"),
+    ("Не зміг змінити", "Не смог изменить"),
+    ("Nexus-Brain не знайдено локально", "Nexus-Brain не найден локально"),
+    ("не знайдено локально", "не найден локально"),
+    ("не знайдено", "не найдено"),
+    ("Не знайшов запущений", "Не нашёл запущенный"),
+    ("Не знайшов музичний плеєр", "Не нашёл музыкальный плеер"),
+    ("Не знайшов", "Не нашёл"),
+    ("Порожній запит до Nexus-Brain", "Пустой запрос к Nexus-Brain"),
+    ("Порожній запит", "Пустой запрос"),
+    ("Порожній зміст для запису", "Пустое содержимое для записи"),
+    ("Порожній", "Пустой"),
+    ("прочитати vault", "прочитать vault"),
+    ("записати в Brain", "записать в Brain"),
+    ("Підключи Linear токен", "Подключи Linear токен"),
+    ("Підключи GitHub токен", "Подключи GitHub токен"),
+    ("Підключи GitLab токен", "Подключи GitLab токен"),
+    ("Підключи Notion токен", "Подключи Notion токен"),
+    ("Підключи", "Подключи"),
+    ("Постав JARVIS_LINEAR_TEAM_ID", "Установи JARVIS_LINEAR_TEAM_ID"),
+    ("Невалідний email", "Невалидный email"),
+    ("містить заборонені символи", "содержит запрещённые символы"),
+    ("містить", "содержит"),
+    ("заборонені", "запрещённые"),
+    ("Звук вимкнено", "Звук выключен"),
+    ("Звук увімкнено", "Звук включен"),
+    ("вимкнено", "выключено"),
+    ("увімкнено", "включено"),
+    ("Екран заблоковано", "Экран заблокирован"),
+    ("заблоковано", "заблокировано"),
+    # ── Common weekday names ──
+    ("понеділок", "понедельник"),
+    ("вівторок", "вторник"),
+    ("середа", "среда"),
     ("четвер", "четверг"),
     ("п'ятниця", "пятница"),
-    ("середа", "среда"),
-    ("вівторок", "вторник"),
+    ("субота", "суббота"),
     ("неділя", "воскресенье"),
-    # R34-S48 — extra connectives + nouns that slipped through the
-    # initial sweep on live verification.
+    # ── Common months ──
+    ("січня", "января"),
+    ("лютого", "февраля"),
+    ("березня", "марта"),
+    ("квітня", "апреля"),
+    ("травня", "мая"),
+    ("червня", "июня"),
+    ("липня", "июля"),
+    ("серпня", "августа"),
+    ("вересня", "сентября"),
+    ("жовтня", "октября"),
+    ("листопада", "ноября"),
+    ("грудня", "декабря"),
+    # ── Connectives + small words ──
     ("або", "или"),
     ("дію", "действие"),
     ("дія", "действие"),
-    ("Підтверджуєш дію", "Подтверждаешь действие"),
-    # Ukrainian-only glyphs as last-resort phoneme guards. These
-    # never appear in legit Russian text, so a blanket substitution
-    # is safe — and even if a stray UA word slips past the lexical
-    # map, the resulting pronunciation will be "Russian-ish" rather
-    # than the harsh half-vowel sounds Piper produces from ‹і ї є ґ›.
+    ("Готово", "Готово"),  # identical, kept for visibility
+    # ── Final glyph guards (RUN LAST after lexical map) ──
+    # Ukrainian-only glyphs as last-resort phoneme guards. These never
+    # appear in legit Russian text. The lexical map above should catch
+    # the high-frequency tokens; these rules salvage anything else
+    # so Piper at least pronounces Russian-ish vowels.
     ("і", "и"),
     ("ї", "и"),
     ("є", "е"),
@@ -870,10 +1089,21 @@ def _piper_synthesize(text: str, voice_id: str = "ru_RU-ruslan-medium") -> Path 
     Returns ``None`` if Piper isn't available (caller falls back to
     ``say``). The WAV is written to a per-pid tmp file so concurrent
     daemons don't clobber each other.
+
+    R34-S51 — defense-in-depth UA→RU normaliser. This is the LAST
+    line of defence before Piper sees the text. Even if a caller
+    forgets to call ``_ru_normalise``, mutates ``text`` after the
+    upstream normalise call, or constructs a fallback string the
+    map doesn't cover, the call here guarantees Piper never sees
+    raw Ukrainian glyphs. Idempotent on already-RU strings.
     """
     voice = _get_piper_voice(voice_id)
     if voice is None:
         return None
+    try:
+        text = _ru_normalise(text)
+    except Exception:
+        pass
     import os as _os
     import time as _time
     import wave as _wave
@@ -1723,15 +1953,17 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                     lock = language_lock_block(lang)
                 except Exception:
                     lock = ""
-                # R34-S40 — added clarification instruction so the model
-                # asks "перепитайте" instead of confidently inventing an
-                # answer to a misheard/empty input.
+                # R34-S40 — clarification instruction so the model asks
+                # "переспроси" instead of confidently inventing an answer.
+                # R34-S51 — RU-only. Removed the UA branch entirely;
+                # the model is now NEVER told to clarify in Ukrainian,
+                # which previously caused it to OUTPUT clarifications
+                # like "Я не зрозумів, перепитай..." in Ukrainian and
+                # those phrases reached TTS even with normalise running.
                 clarify = (
-                    "Якщо запит незрозумілий, нечіткий або схожий на безглуздий — "
-                    "перепитай одним коротким реченням, НЕ вигадуй відповідь."
-                    if lang == "uk"
-                    else "Если запрос неясный, нечёткий или похож на бессмыслицу — "
-                         "переспроси одним коротким предложением, НЕ выдумывай ответ."
+                    "Если запрос неясный, нечёткий или похож на "
+                    "бессмыслицу — переспроси одним коротким "
+                    "предложением по-русски, НЕ выдумывай ответ."
                 )
                 parts = [full_prompt, clarify]
                 if lock:
@@ -1902,7 +2134,12 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                             f"{text[:60]!r} — substituting"
                         ),
                     )
-                    text = "Я вже відповідав на це."
+                    # R34-S51 — hard-code Russian directly. Previously
+                    # this assigned the UA literal AFTER ``_ru_normalise``
+                    # had already run on the original text, so the
+                    # substitution leaked to TTS verbatim. The literal
+                    # below skips the table entirely.
+                    text = "Я уже отвечал на это."
             except Exception:
                 pass
             # R34-S32: register phrase before speaking for echo filter.
@@ -1935,6 +2172,9 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             if wav_path is not None:
                 await _play_audio_interruptable(wav_path)
             else:
+                # R34-S51 — final normalise just before ``say``. Piper
+                # path already gets the same guard via _piper_synthesize.
+                _say_text = _ru_normalise(text)
                 def _run_say() -> None:
                     import subprocess as _sp
                     try:
@@ -1942,7 +2182,7 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                         # can't accidentally inherit terminal (would cause
                         # SIGTTIN under some shells).
                         _sp.run(
-                            ["say", "-v", "Milena", "-r", "210", text],
+                            ["say", "-v", "Milena", "-r", "210", _say_text],
                             check=False,
                             timeout=60,
                             stdin=_sp.DEVNULL,
@@ -2065,19 +2305,13 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                     self._busy = True
                     self._last_ack_monotonic = _now_mon
                     try:
-                        # Detect lang for the ack so RU/UK speakers
-                        # both feel native.
-                        try:
-                            from ..memory.self_learning import (
-                                detect_user_language,
-                            )
-                            _ack_lang = detect_user_language(text)
-                        except Exception:
-                            _ack_lang = "ru"
-                        ack = (
-                            "Слухаю." if _ack_lang == "uk" else "Слушаю."
-                        )
-                        self._stream.emit("sentence", text=ack, lang=_ack_lang)
+                        # R34-S51 — RU-only output policy. Wake ack is
+                        # always Russian; the user explicitly demanded
+                        # "відключи українську розмовну". STT still
+                        # transcribes UA, so the user can SAY anything,
+                        # but TTS never echoes UA back.
+                        ack = "Слушаю."
+                        self._stream.emit("sentence", text=ack, lang="ru")
                         await self._speak(ack, direction)
                     finally:
                         self._busy = False
@@ -2192,11 +2426,12 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                 else:
                     # Empty reply — speak a polite fallback so the user
                     # knows we heard them, not silence.
-                    fallback = (
-                        "Я не зрозумів, повтори, будь ласка."
-                        if detected_lang == "uk"
-                        else "Я не понял, повтори, пожалуйста."
-                    )
+                    # R34-S51 — RU-only output. Removed the UA branch
+                    # entirely; user demanded "нехай відповідає завжди
+                    # російською". The phrase below is the EXACT one
+                    # he reported hearing in Ukrainian — now it's only
+                    # ever pronounced in Russian.
+                    fallback = "Я не понял, повтори, пожалуйста."
                     await self._speak(fallback, direction)
                 # R34-S37 — self-learning: extract facts + record turn.
                 # Fire-and-forget; never delays the next turn.
@@ -2436,6 +2671,8 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                 # Fallback: macOS `say` with Milena (female RU). Not
                 # interruptable — user will have to wait for the
                 # current utterance to end.
+                # R34-S51 — final normalise guard.
+                _say_text = _ru_normalise(text)
                 def _run_say() -> None:
                     import subprocess as _sp
                     try:
@@ -2443,7 +2680,7 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                         # DirectChat path) to prevent SIGTTIN under
                         # foreground daemon launches.
                         _sp.run(
-                            ["say", "-v", "Milena", "-r", "210", text],
+                            ["say", "-v", "Milena", "-r", "210", _say_text],
                             check=False,
                             timeout=30,
                             stdin=_sp.DEVNULL,
