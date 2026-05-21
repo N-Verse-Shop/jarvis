@@ -732,11 +732,12 @@ class VoiceListener(threading.Thread):
                 try:
                     ok, msg = pending.fn()
                 except Exception as e:
-                    ok, msg = False, f"Помилка під час дії: {e}"
-                self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+                    # R34-S51 — RU-only TTS policy.
+                    ok, msg = False, f"Ошибка при выполнении действия: {e}"
+                self._speak_and_continue(msg if ok else f"Не получилось. {msg}")
             else:
                 debug_log(f"cancelled pending action via HUD direct: {pending.name}", "voice")
-                self._speak_and_continue("Скасовано.")
+                self._speak_and_continue("Отменено.")
         except Exception as e:
             debug_log(f"_consume_pending_confirmation_from_hud failed: {e}", "voice")
 
@@ -3643,7 +3644,7 @@ class VoiceListener(threading.Thread):
                     self._speak_and_continue(summary)
             except Exception as e:
                 debug_log(f"self-upgrade thread error: {e}", "voice")
-                self._speak_and_continue(f"Помилка самооновлення: {e}")
+                self._speak_and_continue(f"Ошибка самообновления: {e}")
             finally:
                 if acquired:
                     release_upgrade_lock()
@@ -3769,7 +3770,11 @@ class VoiceListener(threading.Thread):
                     return
                 if _id(query):
                     self._pending_lang_switch = None
-                    self._speak_and_continue("Скасовано, залишаюсь на українській.")
+                    # R34-S51 — RU-only TTS policy. Was UA "залишаюсь на
+                    # українській" — the legacy listener path supported
+                    # voice-driven lang switch but the user pinned to RU
+                    # via R34-S48, so this branch now always speaks RU.
+                    self._speak_and_continue("Отменено, остаюсь на русском.")
                     return
                 self._pending_lang_switch = None
         except Exception as e:
@@ -3797,7 +3802,7 @@ class VoiceListener(threading.Thread):
                     return
                 if _is_den(query):
                     self._pending_upgrade = None
-                    self._speak_and_continue("Скасовано.")
+                    self._speak_and_continue("Отменено.")
                     return
                 self._pending_upgrade = None
         except Exception as e:
@@ -3827,23 +3832,24 @@ class VoiceListener(threading.Thread):
                     try:
                         ok, msg = pending.fn()
                     except Exception as e:
-                        ok, msg = False, f"Помилка під час дії: {e}"
-                    self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+                        # R34-S51 — RU-only TTS policy.
+                        ok, msg = False, f"Ошибка при выполнении действия: {e}"
+                    self._speak_and_continue(msg if ok else f"Не получилось. {msg}")
                     return
                 else:  # "no"
                     debug_log(f"cancelled pending action via HUD: {pending.name}", "voice")
-                    self._speak_and_continue("Скасовано.")
+                    self._speak_and_continue("Отменено.")
                     return
             if is_confirmation(query):
                 debug_log(f"executing pending action: {pending.name}", "voice")
                 ok, msg = pending.fn()
                 self._pending_action = None
-                self._speak_and_continue(msg if ok else f"Не вийшло. {msg}")
+                self._speak_and_continue(msg if ok else f"Не получилось. {msg}")
                 return
             if is_denial(query):
                 debug_log(f"cancelled pending action: {pending.name}", "voice")
                 self._pending_action = None
-                self._speak_and_continue("Скасовано.")
+                self._speak_and_continue("Отменено.")
                 return
             # Otherwise — user said something new (not confirm/deny).
             # Drop the pending action AND remove the "Зараз відкрию X.
