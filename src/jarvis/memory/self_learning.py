@@ -80,38 +80,31 @@ _LANG_NAME_EN = {"uk": "Ukrainian", "ru": "Russian", "de": "German", "en": "Engl
 
 
 def language_lock_block(lang: str) -> str:
-    """Strong, language-aware instruction to lock the reply language.
+    """Strong instruction to lock the reply language to Russian.
 
-    Re-emitted on every turn. The phrasing intentionally uses the
-    target language itself — models are more compliant when the
-    instruction is in the language they're being asked to produce.
+    R34-S51 — RU-only enforcement. The user demanded "нехай відповідає
+    завжди російською но українську просто розуміє". Previously this
+    function returned a UA / DE / EN variant when ``detect_user_language``
+    reported one of those — which caused the LLM to confidently emit
+    Ukrainian replies that then leaked to TTS even after R34-S48's
+    forced ``lang="ru"`` at the call site (some upstream paths still
+    passed the detected language).
+
+    The function now ALWAYS returns the Russian-only lock regardless
+    of the input ``lang`` argument. The argument is preserved in the
+    signature so existing callers don't break. STT still hears UA/EN/DE
+    fine — only the *reply* path is pinned to Russian.
     """
-    lang = (lang or "ru").lower()
-    if lang == "uk":
-        return (
-            "МОВНЕ ПРАВИЛО (СУВОРО): відповідай ВИКЛЮЧНО українською. "
-            "Жодних російських, англійських чи німецьких слів. Якщо "
-            "стикаєшся з іншомовними іменами або термінами — переклади "
-            "чи транслітеруй українською. Перевір кожне слово відповіді "
-            "перед тим, як її дати."
-        )
-    if lang == "de":
-        return (
-            "SPRACHREGEL (STRENG): Antworte AUSSCHLIESSLICH auf Deutsch. "
-            "Keine russischen, ukrainischen oder englischen Wörter."
-        )
-    if lang == "en":
-        return (
-            "LANGUAGE RULE (STRICT): Reply ONLY in English. "
-            "No Ukrainian, Russian, or German words. Transliterate "
-            "any foreign names into English."
-        )
-    # Default — Russian.
+    # Ignore ``lang`` — Russian is the only outbound language.
     return (
         "ЯЗЫКОВОЕ ПРАВИЛО (СТРОГО): отвечай ИСКЛЮЧИТЕЛЬНО на русском. "
         "Никаких украинских, английских или немецких слов. Иностранные "
-        "имена и термины — транслитерируй на русский. Проверь каждое "
-        "слово ответа перед тем, как его произнести."
+        "имена и термины — транслитерируй на русский. "
+        "Пользователь может говорить по-украински — понимай его, но "
+        "отвечай только по-русски. Проверь каждое слово ответа перед "
+        "тем, как его произнести: если видишь украинские буквы і, ї, є, "
+        "ґ или украинские окончания (-ою, -ів, -ій) — перепиши на "
+        "русский."
     )
 
 

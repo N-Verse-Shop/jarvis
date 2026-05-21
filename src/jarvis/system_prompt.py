@@ -227,12 +227,20 @@ def _cached_time_block(minute_bucket) -> str:
     months_en = ["January", "February", "March", "April", "May", "June",
                  "July", "August", "September", "October", "November", "December"]
     m = minute_bucket.month - 1
+    # R34-S51 — time_block rewritten in Russian only. Previously the
+    # block was authored in Ukrainian ("Поточний час", "Це єдина
+    # правда — НЕ вигадуй...") and the model parroted those phrases
+    # verbatim ("Поточний час 15:30") which then reached TTS as UA.
+    # Multilingual day/month names are kept for context (the model
+    # picks the right one when asked in a non-RU language), but the
+    # instruction text itself is Russian-only.
     time_block = (
-        f" Поточний час: {minute_bucket.strftime('%H:%M, %d')} "
-        f"{months_uk[m]} / {months_ru[m]} / {months_de[m]} / {months_en[m]} {minute_bucket.year}, "
-        f"{weekday_uk} / {weekday_ru} / {weekday_de} / {weekday_en}. "
-        f"Це єдина правда про дату/час — НЕ вигадуй інший день/місяць. "
-        f"Спрашивают время — отвечай коротко 'сейчас {minute_bucket.strftime('%H:%M')}' (по-русски или соответствующим языком)."
+        f" Текущее время: {minute_bucket.strftime('%H:%M, %d')} "
+        f"{months_ru[m]} / {months_en[m]} / {months_de[m]} / {months_uk[m]} {minute_bucket.year}, "
+        f"{weekday_ru} / {weekday_en} / {weekday_de} / {weekday_uk}. "
+        f"Это единственная правда о дате/времени — НЕ выдумывай другой "
+        f"день/месяц. Когда спрашивают время — отвечай коротко "
+        f"'сейчас {minute_bucket.strftime('%H:%M')}' по-русски."
     )
     with _TIME_BLOCK_CACHE_LOCK:
         _TIME_BLOCK_CACHE[minute_bucket] = time_block
