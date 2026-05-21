@@ -113,8 +113,17 @@ def _warmup_ollama(
         "think": False,
         "options": {
             "num_predict": 1,    # we throw the reply away
-            "num_ctx": 2048,     # MUST match direct_chat's num_ctx
+            # R34-S50 LATENCY FIX — num_ctx MUST match direct_chat
+            # exactly. Mismatch → Ollama spawns a new runner per call
+            # (it keys runners by `(model, num_ctx)`), forcing a fresh
+            # 30-60s model reload AND defeating KV-cache reuse. When
+            # config knob `ollama_chat_num_ctx` changes, this value
+            # MUST be updated in lockstep.
+            "num_ctx": 1536,
             "temperature": 0.0,
+            # Match the stop sequences too so the runner config is
+            # 1:1 identical with direct_chat.
+            "stop": ["\n\n", "</s>", "<|im_end|>"],
         },
         "keep_alive": "24h",   # match the daemon's chat policy
     }
@@ -243,18 +252,28 @@ def _keepwarm_ollama_loop(
     base_url: str,
     model: str,
     system_prompt: str,
-    interval_s: float = 240.0,
+    interval_s: float = 900.0,
 ) -> None:
-    """Run ``_warmup_ollama`` on a 4-minute loop forever.
+    """Periodically re-prime Ollama's KV cache.
 
-    R34-S42 К4 — Ollama on the Hetzner CPU box silently evicts
-    qwen3:8b after a few minutes even with ``keep_alive='24h'`` set
-    (memory pressure: 4 cores / 15 GiB RAM and 3 other models loaded).
-    A re-evicted model pays a 30-60 s cold reload on the next turn.
+    R34-S50 LATENCY FIX — interval bumped 240s → 900s (15 minutes).
+    Live evidence: each warmup call takes 71-96s on Hetzner CPU because
+    the system prompt (~530 tokens) has to be eval'd from scratch when
+    the KV-cache prefix was evicted between turns. With a 4-minute
+    interval the keepwarm was using ~25-30 % of Ollama's wall-clock —
+    real user turns that landed during a keepwarm had to queue behind
+    it, blowing past sock_read timeouts.
 
-    Pinging every 4 minutes (well under any observed eviction window)
-    keeps the runner hot AND keeps the system-prompt KV cache prefix
-    primed — so real user turns hit pure-warm 1-4 s latency.
+    15 minutes is well within the typical Ollama keep_alive (24 h
+    explicit) and the OS LRU-eviction window we've seen
+    empirically (~10-20 min on a 15 GiB / 4-core box with a single
+    qwen3:8b loaded). If the user goes hours away from voice the
+    next turn will pay one warm-up; that's acceptable.
+
+    R34-S42 К4 history — Ollama on Hetzner CPU silently evicts the
+    runner after a few minutes when memory pressure spikes. After
+    R34-S49 we keep only one model loaded (qwen3:8b), so pressure
+    is much lower and the eviction window is longer.
 
     Pure daemon thread: any failure logs + continues; we never want
     keep-warm noise to leak into the user-facing voice path.
