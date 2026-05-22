@@ -1251,15 +1251,23 @@ async def _play_audio_interruptable(wav_path: Path) -> None:
         # shutdown), the user kept hearing afplay until the WAV
         # ended naturally. Now: kill the subprocess explicitly and
         # re-raise so cancellation semantics are preserved.
+        # R34-S53.1 (Phase 6b — C-9): dropped the sync ``proc.wait(timeout=1.0)``
+        # that ran inside the CancelledError handler. We're already on
+        # the asyncio event loop with cooperative cancellation pending —
+        # a synchronous 1 s wait blocks the loop and defeats the point
+        # of being interruptible. ``terminate()`` is enough: afplay
+        # honours SIGTERM immediately, and the finally-clause clears
+        # ``_CURRENT_PLAYBACK_PROC`` so subsequent stop attempts no-op.
+        # The orphaned subprocess (if any) is reaped by the OS or by
+        # ``_stop_current_playback``'s background reaper thread.
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
-                try:
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    proc.kill()
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         raise
     except Exception as exc:
         try:
@@ -2991,6 +2999,36 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                             return  # consume, keep pending
 
             if action is None:
+                # R34-S53.1 (Phase 6b — C-3 side-effect): if there is
+                # NO pending action AND the transcript is a bare
+                # confirmation token ("так", "да", "нет", "ні") — silently
+                # drop. Without this, the C-3 fix that bypassed the
+                # hallucination filter for confirmation tokens caused
+                # "так"/"да" to fall through to parse_user_command (no
+                # match) → push_frame() → LLM, which then earnestly
+                # generated a chatty reply to a one-word utterance with
+                # no context. The result was random TTS lines like
+                # "Да, я тебя слышу" firing whenever the user said "да"
+                # during a Zoom call. The guard below is tight: only
+                # for ≤2-word transcripts that match the confirm
+                # vocabulary, and only when no action is pending.
+                _norm_chk = text.lower().strip().strip(".,!?;:-—–").strip()
+                if _norm_chk and (
+                    _norm_chk in _CONFIRM_YES or _norm_chk in _CONFIRM_NO
+                ):
+                    try:
+                        self._stream.emit(
+                            "log",
+                            level="DEBUG",
+                            component="fast-path",
+                            message=(
+                                f"dropped bare confirmation token "
+                                f"{text[:40]!r} (no pending action)"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return  # consume — never reaches LLM
                 # Path (c) or (d): parse the transcript as a new command.
                 try:
                     action = parse_user_command(text)
@@ -4349,13 +4387,21 @@ def _make_echo_filter_processor():
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self._speaking = False
+            # R34-S53.1 (Phase 6b — I-3): ``_speak_end_ts`` switched
+            # to ``_time.monotonic()``. Using wall-clock ``_time.time()``
+            # meant an NTP step / DST roll-over while the echo gate was
+            # armed could either freeze the gate forever (clock jumped
+            # forward past the tail) or unblock it instantly (clock
+            # jumped back). Monotonic is unaffected by NTP and is the
+            # right primitive for "X seconds from now". Mirrors the
+            # ``_speak_end_ts`` callsites at lines 4358, 4372, 4427.
             self._speak_end_ts: float = 0.0
             self._stream = get_stream()
 
         def _is_blocking_window(self) -> bool:
             if self._speaking:
                 return True
-            if self._speak_end_ts and _time.time() < self._speak_end_ts:
+            if self._speak_end_ts and _time.monotonic() < self._speak_end_ts:
                 return True
             return False
 
@@ -4369,7 +4415,8 @@ def _make_echo_filter_processor():
                 self._speak_end_ts = 0.0
             elif isinstance(frame, (BotStoppedSpeakingFrame, TTSStoppedFrame)):
                 self._speaking = False
-                self._speak_end_ts = _time.time() + _TAIL_SEC
+                # R34-S53.1 (Phase 6b — I-3): monotonic, see comment in __init__.
+                self._speak_end_ts = _time.monotonic() + _TAIL_SEC
 
             if isinstance(frame, TranscriptionFrame):
                 # 0. Dashboard-injected transcripts always pass — the
@@ -4424,7 +4471,7 @@ def _make_echo_filter_processor():
                             message=(
                                 f"dropped transcript during TTS "
                                 f"(speaking={self._speaking}, "
-                                f"tail={self._speak_end_ts - _time.time():.2f}s)"
+                                f"tail={self._speak_end_ts - _time.monotonic():.2f}s)"
                             ),
                         )
                     except Exception:

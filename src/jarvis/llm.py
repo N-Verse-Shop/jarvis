@@ -105,13 +105,16 @@ _RETRYABLE_STATUS = {408, 502, 503, 504}
 _MAX_RETRIES = 3
 
 
-def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_content: str, timeout_sec: float = 10.0, thinking: bool = False, num_ctx: int = 4096, temperature: Optional[float] = None) -> Optional[str]:
+def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_content: str, timeout_sec: float = 10.0, thinking: bool = False, num_ctx: int = 8192, temperature: Optional[float] = None) -> Optional[str]:
     """Direct LLM call without temporal context, location, or other ask_coach features.
 
-    ``num_ctx`` controls Ollama's context window for this call. Default 4096 is
-    fine for small classification-shaped passes; callers that assemble richer
-    prompts (planner with dialogue + memory + tool catalogue) should pass a
-    larger value to avoid silent truncation.
+    ``num_ctx`` controls Ollama's context window for this call. Default 8192
+    matches ``call_llm_streaming``'s default (R34-S52 Phase 5 raised that).
+    Keeping the two in sync is what lets Ollama reuse the KV-cache prefix
+    across direct and streaming calls; a 4096 ↔ 8192 mismatch silently
+    invalidated the prefix on every alternating turn (cold-eval +15 s).
+    Callers that assemble richer prompts (planner with dialogue + memory +
+    tool catalogue) can still pass an even larger value.
 
     ``temperature`` is forwarded to Ollama when set. Pass ``0.0`` for
     classification / extraction calls where determinism beats creativity —

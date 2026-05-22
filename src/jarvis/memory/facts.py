@@ -610,7 +610,6 @@ def render_facts_for_prompt(
             break
     if not picked:
         return ""
-    s.touch_many([f.id for f in picked])
     # R34-S52 H: was English "Known about you:" — injected as the
     # header on every voice turn's system prompt, biasing the model
     # toward English. RU-only persona means the header is RU too.
@@ -628,10 +627,21 @@ def render_facts_for_prompt(
             if "ru" not in val_lower:
                 return True
         return False
+    # R34-S53.1 (Phase 6b — N-2): apply the filter BEFORE deciding which
+    # facts to mark as touched. Previously ``touch_many`` ran on the
+    # full ``picked`` list (line 613 in S52), then we filtered for the
+    # output — which boosted the recency score of a UA voice-lang fact
+    # the next render-cycle WOULDN'T even show. Net effect: filtered-out
+    # rows kept rising in the FTS ranking, eventually evicting genuinely
+    # useful facts. Touch only what we render.
+    rendered: List[Fact] = []
     for f in picked:
         if _is_ua_or_en_lang_pref(f):
             continue
+        rendered.append(f)
         lines.append(f"- {f.value}")
+    if rendered:
+        s.touch_many([f.id for f in rendered])
     if len(lines) == 1:
         return ""
     return "\n".join(lines)

@@ -599,7 +599,14 @@ def create_intent_judge(cfg) -> Optional[IntentJudge]:
     Returns:
         IntentJudge instance or None if requests library unavailable
     """
-    model = str(getattr(cfg, "intent_judge_model", "gemma4:e2b"))
+    # R34-S53.1 (Phase 6b — I-2): fallback default ``"gemma4:e2b"`` was a
+    # non-existent model; if ``cfg.intent_judge_model`` ever fell back here
+    # (missing config key, dataclass default lost), Ollama returned 404 on
+    # every wake-word judge call → silent fallback to keyword-only wake
+    # detection, which the user already complained about in S52. Mirror
+    # ``IntentJudgeConfig.model`` default (already qwen2.5:3b per S52
+    # Phase 4) so the dataclass default and the cfg fallback agree.
+    model = str(getattr(cfg, "intent_judge_model", "qwen2.5:3b"))
     ollama_base_url = str(getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434"))
 
     config = IntentJudgeConfig(
