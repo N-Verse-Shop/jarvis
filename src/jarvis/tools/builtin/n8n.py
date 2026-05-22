@@ -193,6 +193,12 @@ class N8NTool(Tool):
                     "type": "boolean",
                     "description": "MUST be true for op=delete. Other ops ignore it.",
                 },
+                "auto_activate": {
+                    "type": "boolean",
+                    "description": "For op=create_from_template: whether to activate "
+                                   "the new workflow immediately. Default True. Pass false "
+                                   "when the user wants to review nodes/credentials first.",
+                },
             },
             "required": ["op"],
         }
@@ -313,10 +319,15 @@ class N8NTool(Tool):
                 error_message="op=show требует name_or_id",
             )
         # Try as ID first (cheap single call), fall back to name match.
+        # R35-S3 C-F3: replaced dead conditional ``except N8NError if False
+        # else Exception`` — the `if False` short-circuits to Exception
+        # at parse time (NameError waiting if anyone ever flips it). Plain
+        # ``Exception`` matches the intent: any failure on the ID lookup
+        # falls through to the name search.
         wf = None
         try:
             wf = client.get_workflow(ref)
-        except N8NError if False else Exception:  # narrow at runtime
+        except Exception:
             try:
                 wf = client.find_workflow_by_name(ref)
             except Exception:
@@ -500,12 +511,25 @@ class N8NTool(Tool):
                 success=False, reply_text=None,
                 error_message=f"n8n отказал при создании: {exc}",
             )
-        # Auto-activate.
-        try:
-            client.activate_workflow(wf.id)
-            active_note = " Включил."
-        except Exception:
-            active_note = ""
+        # R35-S3 C-F4: auto-activate is now gated. Previously the tool
+        # silently activated every newly-created workflow → cron triggers
+        # fired immediately, webhooks went live, in some cases before
+        # the user had reviewed nodes/credentials. ``auto_activate``
+        # defaults to True (user convenience: "создай и запусти X" is
+        # the dominant phrasing) but can be passed false to land the
+        # workflow paused for review.
+        auto_active_raw = args.get("auto_activate")
+        # treat missing as True (default), explicit false as opt-out
+        auto_active = True if auto_active_raw is None else bool(auto_active_raw)
+        active_note = ""
+        if auto_active:
+            try:
+                client.activate_workflow(wf.id)
+                active_note = " Включил."
+            except Exception:
+                active_note = ""
+        else:
+            active_note = " На паузе — открой n8n чтобы проверить и включить."
         return ToolExecutionResult(
             success=True,
             reply_text=f"Создал автоматизацию '{wf.name}'.{active_note}",

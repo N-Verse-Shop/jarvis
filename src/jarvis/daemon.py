@@ -369,6 +369,92 @@ def _check_and_update_diary(
         _notify("complete", False)
 
 
+def _rotate_launchd_logs(
+    *,
+    log_dir: Optional[str] = None,
+    max_bytes: int = 50 * 1024 * 1024,
+    keep: int = 3,
+) -> None:
+    """Rotate the LaunchAgent stdout/stderr log files using copytruncate.
+
+    R35-S3 F8. launchd opens ``StandardOutPath``/``StandardErrorPath`` once
+    when it spawns the daemon. If we ``rename()`` the file out from under
+    that file descriptor, the FD keeps writing to the renamed inode and
+    the on-disk filename ends up empty forever — silent loss of all
+    future log lines. So we instead:
+
+      1. ``cp`` the current content to ``<name>.1`` (and shift older
+         backups to ``.2``, ``.3``, …, dropping ``.<keep+1>``).
+      2. ``truncate()`` the original file to zero length.
+
+    Because the file's inode is unchanged, launchd's FD seek-position
+    resets to 0 on next write (POSIX append-mode handles this implicitly),
+    so subsequent writes go to the start of a clean file.
+
+    Only rotates when the file exceeds ``max_bytes`` (default 50 MB).
+    Errors are swallowed by the caller — a broken rotation must NEVER
+    prevent the daemon from starting.
+
+    Args:
+        log_dir: Override the log directory (default ``~/Library/Logs``).
+        max_bytes: Only rotate files larger than this. Default 50 MiB.
+        keep: How many backup generations to keep. Default 3 (so the
+            on-disk footprint is bounded at ~4 × max_bytes = 200 MB).
+    """
+    from pathlib import Path
+    import shutil
+
+    log_root = Path(log_dir) if log_dir else Path.home() / "Library" / "Logs"
+    if not log_root.is_dir():
+        return
+
+    # All jarvis-prefixed .log files (covers jarvis-assistant.{err,out},
+    # jarvis-cf-tunnel.{err,out}, jarvis-hud.{err,out}, …)
+    for entry in sorted(log_root.iterdir()):
+        if not entry.is_file():
+            continue
+        if not entry.name.startswith("jarvis"):
+            continue
+        if entry.suffix != ".log":
+            # Skip backup files (e.g. *.log.1) — those are already rotated.
+            continue
+        try:
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        if size <= max_bytes:
+            continue
+
+        # Shift older backups out: .keep+ removed, .N → .N+1
+        for i in range(keep, 0, -1):
+            src = entry.with_suffix(f".log.{i}")
+            dst = entry.with_suffix(f".log.{i + 1}")
+            if src.exists():
+                if i == keep:
+                    try:
+                        src.unlink()
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        src.rename(dst)
+                    except OSError:
+                        pass
+
+        # Copy current → .1, then truncate current in place.
+        try:
+            shutil.copyfile(str(entry), str(entry.with_suffix(".log.1")))
+        except OSError:
+            # If copy fails (disk full, perms), don't truncate either —
+            # losing recent logs is worse than letting the file grow.
+            continue
+        try:
+            with open(entry, "r+b") as f:
+                f.truncate(0)
+        except OSError:
+            pass
+
+
 def main() -> None:
     """Main daemon entry point."""
     global _global_dialogue_memory, _global_stop_requested, _global_tts_engine, _global_dictation_engine
@@ -378,6 +464,22 @@ def main() -> None:
     _global_stop_requested = False
 
     _install_signal_handlers()
+
+    # R35-S3 F8: rotate launchd log files on startup using copytruncate
+    # semantics. The LaunchAgent's StandardErrorPath / StandardOutPath
+    # filehandles are owned by launchd — we cannot rename out from under
+    # them or the FD will continue writing to the orphan inode. Instead
+    # we copy the tail to a .1 backup and truncate the live file
+    # in-place; the FD keeps writing from offset 0 of the now-empty file.
+    try:
+        _rotate_launchd_logs()
+    except Exception as _rot_exc:
+        # Never let log rotation break the daemon — worst case the file
+        # grows another cycle.
+        try:
+            debug_log(f"launchd log rotation failed: {_rot_exc!r}", "jarvis")
+        except Exception:
+            pass
 
     cfg = load_settings()
     db = Database(cfg.db_path, cfg.sqlite_vss_path)

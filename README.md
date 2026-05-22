@@ -1,8 +1,10 @@
 # Jarvis · Nexus Studio fork
 
-> **R34 build.** Powered by Pipecat 1.2.1 (R31) + KAOS-ported persona /
+> **R35 build.** Powered by Pipecat 1.2.1 (R31) + KAOS-ported persona /
 > facts / skills / audit / capability gates (R32–R33). Nexus Studio brand
 > identity dashboard at `http://127.0.0.1:8789/dashboard/` (R34-S3).
+> R35-S1 adds bi-directional [n8n](https://n8n.io/) integration — voice
+> control of self-hosted workflow automations.
 
 **A 100% private AI voice assistant that lives on your computer** (works offline). Talk naturally as if Jarvis is a third person in the room — say its name anywhere in your sentence and get conversational, context-aware responses. It remembers everything, always knows the current location and time, can search the web, read your screen, control Chrome, track nutrition, and much more with support for unlimited MCPs and tools without context rot. Sensitive info is automatically redacted before anything is saved to disk.
 
@@ -23,6 +25,39 @@
 | R34-S1 | `pipecat_loop.py` | **Fix**: disable Pipecat `cancel_on_idle_timeout` (was killing pipeline after 5 min silence) |
 | R34-S4 | various | Security sweep: path-traversal sandbox in skills, value-pattern PII scrub in audit, CORS verbs |
 | R34-S6 | `seed-skills/` | 5 real Nexus-Studio agency-workflow seed skills |
+| R35-S1 | `jarvis/integrations/n8n_client.py` | REST client for self-hosted n8n (X-N8N-API-KEY auth, scrubbed errors, pagination, retry on ConnectTimeout) |
+| R35-S1 | `jarvis/tools/builtin/n8n.py` | Voice tool `n8nAutomation` — 9 ops: list/show/executions/trigger/activate/deactivate/create_from_template/list_templates/delete |
+| R35-S1 | `jarvis/integrations/n8n_templates/` | 4 ready-to-use workflow templates (morning briefing, async web research, Notion→memory sync, Telegram relay) |
+
+### n8n integration (R35-S1)
+
+Jarvis can read and control workflows on a self-hosted [n8n](https://n8n.io/) instance via voice.
+
+Setup:
+1. In your n8n UI: **Settings → API → Generate API key**.
+2. Add the key to `~/.config/jarvis/.env`:
+   ```bash
+   echo 'JARVIS_N8N_API_KEY=<your-key-here>' >> ~/.config/jarvis/.env
+   chmod 600 ~/.config/jarvis/.env
+   ```
+3. Optionally override the base URL (defaults to `https://n8n.nexus-studio-innovation.com`):
+   ```bash
+   echo 'JARVIS_N8N_BASE_URL=https://your-n8n.example.com' >> ~/.config/jarvis/.env
+   ```
+4. Restart the daemon.
+
+Voice phrases that route to the tool:
+
+- "Покажи мои автоматизации" / "какие у меня workflows" — list workflows
+- "Покажи логи Morning Briefing" — recent executions
+- "Запусти Morning Briefing" — trigger by name or webhook path
+- "Поставь Telegram Relay на паузу" / "включи …" — activate/deactivate
+- "Создай автоматизацию из шаблона morning_briefing с lat=52.46 lon=9.21" — instantiate template
+- "Удали автоматизацию X" (requires `confirm=true`) — delete
+
+Templates ship under `src/jarvis/integrations/n8n_templates/` and are referenceable by stem name. Each declares its required parameters in `_jarvis_template_metadata.required_params`.
+
+Security: the API key is loaded from `.env` (chmod 0600), never from a tracked file, never logged. Every n8n response that could include the URL or headers is scrubbed before raising.
 
 ### Dashboard
 
