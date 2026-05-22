@@ -48,13 +48,21 @@ def _extract_place_from_user_text(text: str, cfg) -> Optional[str]:
     except Exception:
         return None
 
+    # R34-S57 (A4-17): RU prompt. The previous English prompt to a
+    # small RU/UA-tuned model sometimes replied with the English
+    # form of a city ("Berlin") when the user said "Берлін" in UA —
+    # the RU-only TTS pin then had to transliterate and produced
+    # broken pronunciation. With the prompt in Russian and explicit
+    # "ответь кириллицей как сказал пользователь", the model
+    # preserves the original casing.
     sys_prompt = (
-        "You extract a single place name from a user's utterance so a weather "
-        "tool can look it up. Reply with ONLY the place name (city, town, or "
-        "country), with no punctuation, quotes, or explanation. If the user "
-        "did not name any place, reply with exactly: none"
+        "Извлеки название места из реплики пользователя для запроса "
+        "погоды. Ответь ТОЛЬКО названием места (город, посёлок или "
+        "страна) на том же языке/алфавите, как сказал пользователь, "
+        "без знаков препинания, кавычек и пояснений. Если место не "
+        "названо, ответь точно: none"
     )
-    user_prompt = f"User utterance: {text}\n\nPlace:"
+    user_prompt = f"Реплика пользователя: {text}\n\nМесто:"
 
     try:
         resp = call_llm_direct(

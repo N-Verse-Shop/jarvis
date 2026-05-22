@@ -50,6 +50,13 @@ class FieldMeta:
     step: Optional[float] = None
     suffix: Optional[str] = None
     nullable: bool = False  # Whether None/"" is a valid value (shows "Default" option)
+    # R34-S57 (C-P1.4): mark API keys / tokens so QLineEdit uses
+    # ``EchoMode.Password``. The setup wizard already used Password
+    # echo for the same Brave API key field; the settings window was
+    # falling through to the default plaintext branch, so anyone
+    # shoulder-surfing while the user opened Settings saw the full
+    # key. Defaults to False; only flip to True for actual secrets.
+    secret: bool = False
 
 
 # Categories and their display order
@@ -298,7 +305,7 @@ def _build_field_metadata() -> List[FieldMeta]:
     f("brave_search_api_key", "Brave Search API Key",
       "Optional. When set, Brave is used as the primary fallback if DuckDuckGo "
       "is blocked. Free tier: 2,000 queries/month at api.search.brave.com.",
-      "features", "str", nullable=True)
+      "features", "str", nullable=True, secret=True)
     f("wikipedia_fallback_enabled", "Wikipedia Fallback",
       "Use Wikipedia as a last-resort source when other search engines fail. "
       "No key, no account, privacy-light.",
@@ -560,6 +567,11 @@ class SettingsWindow(QDialog):
         w.setText(str(current) if current not in (None, "") else "")
         if fm.nullable:
             w.setPlaceholderText("Leave empty for default")
+        # R34-S57 (C-P1.4): use Password echo for fields flagged as
+        # secret. Matches the setup_wizard's existing treatment of
+        # the same Brave API key field.
+        if fm.secret:
+            w.setEchoMode(QLineEdit.EchoMode.Password)
         w.setToolTip(fm.description)
         return w
 

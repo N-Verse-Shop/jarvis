@@ -13,53 +13,50 @@ from dotenv import load_dotenv
 # This is the authoritative list of officially supported chat models.
 # Other modules should import from here rather than defining their own lists.
 
+# R34-S57 (C-P2.11/12/13): the previous default ``gemma4:e2b`` does
+# NOT exist as an Ollama tag — fresh installs would have downloaded
+# nothing for the judge and silently fallen back to keyword wake
+# detection. Setup wizard already migrated to qwen2.5:3b (intent)
+# and qwen3:8b (chat); align the canonical Settings + dataclass with
+# what production actually runs. Real Gemma tags preserved as
+# secondary options for users who explicitly want them.
 SUPPORTED_CHAT_MODELS: Dict[str, Dict[str, str]] = {
-    "gemma4:e2b": {
-        "name": "Gemma 4 E2B (Default)",
-        "description": "Fast, multimodal, effective 2B — a little dumb, occasionally fumbles tool calls; ~7.2GB download",
-        "size": "~7.2GB",
-        "vram": "8GB+",
-    },
-    "gemma4:e4b": {
-        "name": "Gemma 4 E4B (Recommended)",
-        "description": "Smarter tool use and reasoning, multimodal, effective 4B — ~9.6GB download",
-        "size": "~9.6GB",
-        "vram": "16GB+",
-    },
-    "gpt-oss:20b": {
-        "name": "GPT-OSS 20B (High-end)",
-        "description": "Best performance, ~12GB download",
-        "size": "~12GB",
-        "vram": "24GB+",
-    },
-    # Round 29 (F88): user config (~/.config/jarvis/config.json) had
-    # been running qwen3:8b / qwen2.5:3b against Hetzner remotely for
-    # months while the supported-models check only knew about the
-    # gemma/gpt-oss family — anything that does
-    # `model in get_supported_model_ids()` (validation UIs, doctor,
-    # model-picker) flagged the real production model as invalid.
     "qwen3:8b": {
-        "name": "Qwen 3 8B",
+        "name": "Qwen 3 8B (Default)",
         "description": "Multilingual, strong RU/UA — ~5GB; recommended for chat over Tailscale to a remote Ollama host",
         "size": "~5GB",
         "vram": "8GB+",
     },
     "qwen2.5:3b": {
-        "name": "Qwen 2.5 3B",
+        "name": "Qwen 2.5 3B (Intent / Classifier)",
         "description": "Lightweight, fast — ~2GB; great for intent-judge / classifier roles",
         "size": "~2GB",
         "vram": "4GB+",
     },
     "qwen2.5:1.5b": {
-        "name": "Qwen 2.5 1.5B",
+        "name": "Qwen 2.5 1.5B (Wake disambiguator)",
         "description": "Tiny, very fast — ~1GB; canned-reply / wake disambiguator",
         "size": "~1GB",
         "vram": "2GB+",
     },
+    "gemma2:2b": {
+        "name": "Gemma 2 2B",
+        "description": "Google's small open model — ~1.6GB. Real Ollama tag (gemma4 doesn't exist; gemma3 hasn't shipped).",
+        "size": "~1.6GB",
+        "vram": "4GB+",
+    },
+    "gpt-oss:20b": {
+        "name": "GPT-OSS 20B (High-end)",
+        "description": "Best performance — ~12GB download. Only viable on a host with 24GB+ VRAM or Hetzner CCX*",
+        "size": "~12GB",
+        "vram": "24GB+",
+    },
 }
 
-# The default chat model (first in the supported list)
-DEFAULT_CHAT_MODEL = "gemma4:e2b"
+# The default chat model (first in the supported list). R34-S57:
+# was ``gemma4:e2b`` — a non-existent tag. Aligned with the actual
+# production model running on Hetzner.
+DEFAULT_CHAT_MODEL = "qwen3:8b"
 
 
 def get_supported_model_ids() -> set[str]:
@@ -594,7 +591,24 @@ def get_default_config() -> Dict[str, Any]:
 
         # Wake Word Detection
         "wake_word": "jarvis",
-        "wake_aliases": ["joris", "charis", "chavis", "jar is", "jaivis", "jervis", "jarvus", "jarviz", "javis", "jairus", "jarryst", "chyrus"],
+        # R34-S57 (B3.1): the previous list was 100% ASCII — zero
+        # Cyrillic Whisper mishearings were seeded, so a fresh
+        # install relied entirely on fuzzy-prefix fallback (which
+        # has to clear the 0.58 ratio bar against "джарвис"). Add
+        # the most-observed Cyrillic variants we already hard-coded
+        # in pipecat_loop._wake_variants — keeps the config and the
+        # processor consistent.
+        "wake_aliases": [
+            # English mishearings (Whisper-EN backend or accent drift)
+            "joris", "charis", "chavis", "jar is", "jaivis", "jervis",
+            "jarvus", "jarviz", "javis", "jairus", "jarryst", "chyrus",
+            # Russian Whisper output
+            "джарвис", "джервис", "джарвиз", "джарри", "джавис",
+            "джервиз", "джарвес", "джарвиш",
+            # Ukrainian Whisper output (Whisper sometimes picks UA
+            # transliteration even on RU audio)
+            "джарвіс", "джервіс", "джарвіз", "джагвіз",
+        ],
         "wake_fuzzy_ratio": 0.78,
 
         # Whisper Speech Recognition
@@ -645,7 +659,11 @@ def get_default_config() -> Dict[str, Any]:
         # the legacy single-model behaviour.
         "ollama_chat_model_light": "",
         "intent_complexity_router_enabled": False,
-        "intent_judge_model": "gemma4:e2b",  # Model for intent judging (needs reasoning ability)
+        # R34-S57 (C-P2.12): was "gemma4:e2b" — a tag that doesn't
+        # exist on Ollama. Setup wizard already pulls qwen2.5:3b for
+        # this role; align the default so a config-less daemon picks
+        # the SAME model the wizard installed.
+        "intent_judge_model": "qwen2.5:3b",
         "intent_judge_timeout_sec": 15.0,  # Max time to wait for intent judge response
         "intent_judge_thinking_enabled": False,  # Enable thinking for intent judge (adds latency to wake detection)
 
@@ -981,7 +999,8 @@ def load_settings() -> Settings:
         voice_interrupt_absolute_rms = 0.025
 
     # Intent Judge - always used when available
-    intent_judge_model = str(merged.get("intent_judge_model", "gemma4:e2b"))
+    # R34-S57 (C-P2.12): fallback aligned with the new default.
+    intent_judge_model = str(merged.get("intent_judge_model", "qwen2.5:3b"))
     intent_judge_timeout_sec = float(merged.get("intent_judge_timeout_sec", 10.0))
     intent_judge_thinking_enabled = bool(merged.get("intent_judge_thinking_enabled", False))
     llm_thinking_enabled = bool(merged.get("llm_thinking_enabled", False))

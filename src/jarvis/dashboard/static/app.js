@@ -68,6 +68,13 @@ function setView(name) {
   if (name === "chat") initChatTab();
   if (name === "brain") startBrainView();
   if (name !== "brain") stopBrainView();
+  // R34-S57 (C-P2.1): close the live-events WebSocket when leaving
+  // the Live tab. Previously the socket stayed open AND auto-
+  // reconnected on close, so a backgrounded dashboard kept
+  // receiving the 4 Hz event stream forever — combined with the
+  // 1 s reconnect (C-P1.2), a crashed daemon meant infinite
+  // hammering of the daemon's restart-loop.
+  if (name !== "live") stopLiveStream();
 }
 tabs.forEach(t => t.addEventListener("click", () => setView(t.dataset.view)));
 
@@ -631,15 +638,42 @@ function renderFeedItem(e) {
   `;
 }
 
+// R34-S57 (C-P1.2): exponential backoff for the WS reconnect.
+// Previously the client unconditionally re-opened every 1s on
+// close, so a crashed daemon meant the browser burned a WS handshake
+// every second forever — and with CF Tunnel in front, also burned
+// CF connection budget. 1/2/4/8/16/30s ceiling matches the typical
+// daemon restart window.
+let _liveReconnectMs = 1000;
+const _LIVE_RECONNECT_MAX_MS = 30000;
+
+function stopLiveStream() {
+  // R34-S57 (C-P2.1): explicit close lets setView() drop the
+  // socket when the user navigates away from Live.
+  try { liveSocket?.close(); } catch (_) {}
+  liveSocket = null;
+  _liveReconnectMs = 1000; // reset backoff for next visit
+}
+
 function startLiveStream() {
   if (liveSocket && liveSocket.readyState !== WebSocket.CLOSED) return;
   const token = localStorage.getItem(TOKEN_KEY);
   const url = new URL("/ws/events", window.location.href);
   url.protocol = url.protocol.replace("http", "ws");
+  // R34-S57 (C-P1.1) — known limitation:
+  // The browser cannot set headers on a WebSocket handshake, so the
+  // bearer token MUST ride in the URL. We keep this for backwards
+  // compatibility with the existing dashboard. Defense-in-depth
+  // mitigations live server-side (CSP + token rotation + 0600 file
+  // perms on config.json). The right long-term fix is a one-shot
+  // ticket exchange via POST /api/ws-ticket; tracked as a follow-up.
   url.searchParams.set("token", token);
   const feed = document.getElementById("live-feed");
   feed.innerHTML = "";
   liveSocket = new WebSocket(url.toString());
+  liveSocket.addEventListener("open", () => {
+    _liveReconnectMs = 1000; // reset on successful open
+  });
   liveSocket.addEventListener("message", (ev) => {
     if (document.getElementById("live-pause").checked) return;
     try {
@@ -650,11 +684,18 @@ function startLiveStream() {
     } catch (e) { console.warn("live parse:", e); }
   });
   liveSocket.addEventListener("close", () => {
+    const delay = _liveReconnectMs;
+    _liveReconnectMs = Math.min(_liveReconnectMs * 2, _LIVE_RECONNECT_MAX_MS);
     setTimeout(() => {
-      if (document.getElementById("view-live").classList.contains("active")) {
+      // Only reconnect if the user is STILL on the Live tab AND
+      // the page is visible (don't burn cycles in a background
+      // tab).
+      const active = document.getElementById("view-live").classList.contains("active");
+      const visible = document.visibilityState !== "hidden";
+      if (active && visible) {
         startLiveStream();
       }
-    }, 1000);
+    }, delay);
   });
 }
 document.getElementById("live-clear").addEventListener("click", () => {
@@ -757,6 +798,28 @@ function settingsToast(message, level = "ok") {
   window._settingsToastTimer = setTimeout(() => { el.hidden = true; }, 4000);
 }
 
+// R34-S57 (C-P2.2): button-disable helper. Prevents double-submit
+// when the user mashes Save / Restart while a request is in flight
+// — previously two PATCH /api/settings calls would race the file
+// rewrite, or two POST /api/restart calls would queue two
+// SIGTERMs (the second arriving as the new daemon spins up).
+function _withButtonBusy(btnId, label, fn) {
+  return async () => {
+    const btn = document.getElementById(btnId);
+    if (!btn) { await fn(); return; }
+    if (btn.disabled) return; // already in flight
+    const prev = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = label;
+    try {
+      await fn();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = prev;
+    }
+  };
+}
+
 async function saveSettings() {
   // Collect form values into a patch object.
   const numOrUndef = (id, parser) => {
@@ -852,8 +915,17 @@ async function restartDaemon() {
 }
 
 // Wire up controls + live readouts
-document.getElementById("settings-save")?.addEventListener("click", saveSettings);
-document.getElementById("settings-restart")?.addEventListener("click", restartDaemon);
+// R34-S57 (C-P2.2): wrap the click handlers so duplicate clicks
+// while a request is in flight are dropped (and the user gets a
+// visible "saving…" / "restarting…" state).
+document.getElementById("settings-save")?.addEventListener(
+  "click",
+  _withButtonBusy("settings-save", "Saving…", saveSettings),
+);
+document.getElementById("settings-restart")?.addEventListener(
+  "click",
+  _withButtonBusy("settings-restart", "Restarting…", restartDaemon),
+);
 document.getElementById("settings-reload")?.addEventListener("click", loadSettings);
 ["set-vad-aggr", "set-wake-fuzzy", "set-hot-window", "set-endpoint"].forEach(id => {
   document.getElementById(id)?.addEventListener("input", e => {
@@ -1032,8 +1104,14 @@ function _brainDraw() {
   const canvas = document.getElementById("brain-canvas");
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
-  const W = canvas.width;
-  const H = canvas.height;
+  // R34-S57 (C-P2.3): the context is already scaled by DPR, so all
+  // draw math must use LOGICAL pixels (rect.width / rect.height),
+  // not the device-pixel buffer size (canvas.width / canvas.height).
+  // Otherwise everything renders at 2× position on Retina and orbs
+  // overshoot the visible canvas.
+  const rect = canvas.getBoundingClientRect();
+  const W = rect.width;
+  const H = rect.height;
   // Background fade for trailing motion blur
   ctx.fillStyle = "rgba(5, 6, 16, 0.18)";
   ctx.fillRect(0, 0, W, H);
@@ -1107,11 +1185,23 @@ function startBrainView() {
   if (canvas) {
     const rect = canvas.getBoundingClientRect();
     const dpr = Math.min(2, window.devicePixelRatio || 1);
+    // R34-S57 (C-P2.3): canvas DPR fix.
+    // The original code set ``canvas.width = rect.width * dpr``,
+    // applied ``ctx.scale(dpr, dpr)``, then IMMEDIATELY reset
+    // ``canvas.width = canvas.width / dpr`` — assigning to
+    // ``canvas.width`` RESETS the 2D context state (including the
+    // scale transform) and snaps the buffer back to logical
+    // pixels. Net effect: every byte of DPR work was thrown away
+    // and the canvas rendered at logical resolution, so orbs
+    // looked blurry on Retina + Hi-DPI displays.
+    //
+    // Correct pattern: set the backing-store size in device px,
+    // pin the CSS box to the logical px, scale the context ONCE.
     canvas.width = Math.floor(rect.width * dpr);
     canvas.height = Math.floor(rect.height * dpr);
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
     canvas.getContext("2d").scale(dpr, dpr);
-    canvas.width = canvas.width / dpr;
-    canvas.height = canvas.height / dpr;
   }
   _brainState.t0 = performance.now();
   _fetchBrain();

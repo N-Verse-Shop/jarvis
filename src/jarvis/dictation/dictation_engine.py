@@ -595,10 +595,19 @@ def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "gemma4:e
     except ImportError:
         return text
 
+    # R34-S57 (A3-13): RU-aware prompt + explicit filler list.
+    # The previous English prompt to a small RU/UA-tuned model
+    # produced mixed output: either left UA fillers untouched ("ну",
+    # "це", "тіпа") or appended English meta-commentary like "Here
+    # is the cleaned text:" because it didn't understand the rules.
+    # The RU prompt + enumerated fillers fixes both.
     prompt = (
-        "Clean the following dictated text. Remove filler words, hesitations, "
-        "and false starts. Keep the meaning and language identical. Return ONLY "
-        "the cleaned text, nothing else.\n\n"
+        "Очисти продиктованный текст ниже. Удали слова-паразиты и "
+        "колебания (эээ, ээ, ну, типа, короче, ммм, эм, как бы, "
+        "значит; ну, це, тіпа, типу, ну це, як би, ееее). "
+        "Сохрани смысл и язык исходного текста — НЕ переводи. "
+        "Верни ТОЛЬКО очищенный текст без пояснений, без префиксов, "
+        "без кавычек.\n\n"
         f"{text}"
     )
 
@@ -612,6 +621,9 @@ def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "gemma4:e
                 "think": thinking,
             },
             timeout=5,
+            # R34-S56.1 Phase 9b (P2) parity: drop stale Tailscale
+            # sockets between dictation calls.
+            headers={"Connection": "close"},
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -619,6 +631,11 @@ def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "gemma4:e
             if cleaned:
                 debug_log(f"LLM filler removal: {text!r} → {cleaned!r}", "dictation")
                 return cleaned
+        else:
+            debug_log(
+                f"LLM filler removal HTTP {resp.status_code} — using raw text",
+                "dictation",
+            )
     except Exception as exc:
         debug_log(f"LLM filler removal failed (using raw text): {exc}", "dictation")
 
@@ -1131,6 +1148,55 @@ class DictationEngine:
             self._recording = False
             if self._on_dictation_end:
                 self._on_dictation_end()
+            return
+
+        # R34-S57 (A3-12): wall-clock stuck-key watchdog.
+        # The audio-frame counter (_max_frames check) only triggers
+        # when callbacks keep arriving — but if pynput drops a
+        # ``KeyUp`` event (lock screen during press, app focus
+        # change on Wayland, USB keyboard reconnect mid-hold) AND
+        # the audio source also disconnects, ``_recording`` stays
+        # True forever. Face stuck in DICTATING, voice listener
+        # stays paused, until process restart.
+        #
+        # The watchdog sleeps ``MAX_RECORD_SECONDS + 5`` then checks
+        # if we're still recording the same session (epoch counter
+        # bumps each ``_start_recording``); if so, forces a discard
+        # stop. The +5s padding lets the normal max-duration
+        # autostop fire first on a healthy stream.
+        try:
+            self._record_epoch = int(getattr(self, "_record_epoch", 0)) + 1
+            _expected_epoch = self._record_epoch
+            def _watchdog() -> None:
+                time.sleep(MAX_RECORD_SECONDS + 5.0)
+                # If a new recording has started since, the epoch
+                # bumped — that watchdog will own the new session.
+                if not self._recording:
+                    return
+                if getattr(self, "_record_epoch", 0) != _expected_epoch:
+                    return
+                debug_log(
+                    "dictation watchdog tripped — stuck-key recovery "
+                    f"(epoch {_expected_epoch}, no normal stop after "
+                    f"{MAX_RECORD_SECONDS + 5:.0f}s)",
+                    "dictation",
+                )
+                try:
+                    self._stop_recording(discard=True)
+                except Exception as exc:
+                    debug_log(
+                        f"dictation watchdog stop failed: {exc}",
+                        "dictation",
+                    )
+            threading.Thread(
+                target=_watchdog,
+                daemon=True,
+                name=f"dictation-watchdog-{_expected_epoch}",
+            ).start()
+        except Exception as exc:
+            # Watchdog is belt-and-braces — never let a setup failure
+            # block the recording itself.
+            debug_log(f"watchdog setup failed: {exc}", "dictation")
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         """sounddevice callback — accumulate audio frames."""
@@ -1255,13 +1321,20 @@ class DictationEngine:
 
             text = self._transcribe(audio)
 
-            # Apply custom dictionary corrections
-            if text and self._custom_dictionary:
-                text = _apply_custom_dictionary(text, self._custom_dictionary)
-
-            # LLM-based filler word removal
+            # R34-S57 (A3-14): order swap. Previously the custom
+            # dictionary was applied BEFORE LLM filler-removal —
+            # which let the LLM "normalise" the user's manual
+            # corrections back to their natural form ("IBONS" →
+            # "Ibons"). Run the LLM cleanup first (general filler /
+            # hesitation removal) then apply the user's explicit
+            # corrections as the final authoritative pass.
             if text and self._filler_removal:
                 text = _llm_clean_dictation(text, self._ollama_base_url, self._ollama_model, thinking=self._thinking)
+
+            # Apply custom dictionary corrections (authoritative last
+            # word — overrides anything the LLM may have changed).
+            if text and self._custom_dictionary:
+                text = _apply_custom_dictionary(text, self._custom_dictionary)
 
             if text:
                 duration = len(audio) / self._target_sample_rate

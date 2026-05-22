@@ -183,8 +183,14 @@ class EchoDetector:
         self._cancel_stale_clear()
         # Atomic mutation of the trio used by `_matches_tts_segment`
         # (round 12 fix H2).
+        # R34-S57 (B1.1): monotonic. The Pipecat path migrated to
+        # monotonic in S52..S54; the legacy listener was missed and
+        # an NTP step during a live utterance silently corrupted the
+        # echo-detection `time_since_finish` window. ``_tts_start_time``,
+        # ``_last_tts_finish_time`` and the matching `_utterance_*`
+        # anchors must all use the same clock.
         with self._tts_state_lock:
-            self._tts_start_time = time.time()
+            self._tts_start_time = time.monotonic()
             self._last_tts_text = tts_text.lower().strip()
             self._tts_energy_baseline = baseline_energy
             self._tts_exact_duration = exact_duration
@@ -212,8 +218,10 @@ class EchoDetector:
         # Audit round 14 fix C3: ``_last_tts_finish_time`` is now part
         # of the lock-protected TTS-state quadruple (see
         # ``snapshot_tts_window``); writers must take the lock too.
+        # R34-S57 (B1.1): monotonic — paired with track_tts_start
+        # (same clock, no NTP-step risk).
         with self._tts_state_lock:
-            self._last_tts_finish_time = time.time()
+            self._last_tts_finish_time = time.monotonic()
         # Always cancel any pending clear so a NEW TTS starts with a
         # fresh reference. The clear-scheduling below is what's gated.
         self._cancel_stale_clear()
