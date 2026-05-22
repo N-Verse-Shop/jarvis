@@ -120,8 +120,17 @@ def is_wake_word_detected(text_lower: str, wake_word: str, aliases: List[str], f
                         continue
                 ratio = difflib.SequenceMatcher(a=alias, b=token).ratio()
                 if ratio >= fuzzy_ratio:
+                    # R34-S55.1 Phase 8a (P1 security): dropped the
+                    # unconditional ``print(... '{token}' ...)`` here.
+                    # ``token`` is raw user-spoken text — launchd captures
+                    # stdout into ``~/Library/Logs/jarvis-assistant.out.log``
+                    # which is world-readable. A user who voices a
+                    # password / 2FA code / private name during the same
+                    # window the wake-word fuzzy gate fires would land
+                    # those bytes on disk in plaintext. ``debug_log``
+                    # above already carries the same info to the IPC
+                    # event stream where it's gated by voice-debug.
                     debug_log(f"wake word fuzzy match: '{alias}' ~ '{token}' (ratio: {ratio:.3f})", "wake")
-                    print(f"🟢 wake fuzzy: '{token}' ~ '{alias}' ({ratio:.2f})", flush=True)
                     return True
     except Exception:
         pass
@@ -193,8 +202,10 @@ def is_wake_word_detected(text_lower: str, wake_word: str, aliases: List[str], f
         # hot window already closed. 0.58 widens the catchment without
         # opening up "жарить"/"чарівний" again (those score ~0.40-0.50).
         if soft >= 0.58:
+            # R34-S55.1 Phase 8a (P1 security): same rationale as the
+            # fuzzy-match print above — dropped the stdout emit so raw
+            # spoken tokens don't land in ``out.log``.
             debug_log(f"wake word prefix match: '{token}' (soft ratio: {soft:.3f})", "wake")
-            print(f"🟡 wake prefix: '{token}' (soft {soft:.2f})", flush=True)
             return True
 
     return False

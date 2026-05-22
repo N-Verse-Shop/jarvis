@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
 import sys
@@ -192,9 +193,23 @@ def discover_mcp_tools(mcps_config: Dict[str, Any]) -> Tuple[Dict[str, ToolSpec]
 # mcp_tools_generation). Cache the result keyed on that. Bust the
 # cache when ``initialize_mcp_tools``/``refresh_mcp_tools`` updates
 # ``_mcp_tools_cache`` — see ``_bump_tools_generation`` below.
-_TOOLS_RESULT_CACHE: Dict[Tuple[Any, ...], Any] = {}
+#
+# R34-S55.1 Phase 8a (P1 leak): bounded LRU. Before this cap, every
+# unique ``tuple(sorted(allowed_tools))`` produced a permanent dict
+# entry — and ``selection.py`` routes a per-query tool subset that
+# varies with the user's voice content, so a long-running daemon
+# accumulated tens of thousands of subset combinations × ~5-20 KB
+# of cached JSON-schema strings. ``_bump_tools_generation`` only
+# clears on MCP / builtin-set mutation, which can be days apart.
+# Net: multi-100 MB drift over a year of normal voice traffic.
+#
+# 256 entries is generous (covers the typical 50-80 distinct subsets
+# the selector actually emits) and uses OrderedDict's move-to-end
+# semantics for true LRU eviction.
+_TOOLS_RESULT_CACHE: "OrderedDict[Tuple[Any, ...], Any]" = OrderedDict()
 _TOOLS_RESULT_CACHE_LOCK = threading.Lock()
 _TOOLS_CACHE_GENERATION: int = 0
+_TOOLS_RESULT_CACHE_MAX = 256
 
 
 def _bump_tools_generation() -> None:
@@ -259,6 +274,10 @@ def generate_tools_json_schema(allowed_tools: Optional[List[str]] = None, mcp_to
     cache_key = _tools_cache_key(allowed_tools, mcp_tools, "schema")
     with _TOOLS_RESULT_CACHE_LOCK:
         cached = _TOOLS_RESULT_CACHE.get(cache_key)
+        if cached is not None:
+            # LRU bookkeeping — move the touched entry to the end so
+            # the rarely-used ones drop off first when we hit the cap.
+            _TOOLS_RESULT_CACHE.move_to_end(cache_key)
     if cached is not None:
         # Deep-ish copy — the function dict structure is small;
         # ``json.loads(json.dumps(...))`` would be cleanest but is
@@ -300,6 +319,10 @@ def generate_tools_json_schema(allowed_tools: Optional[List[str]] = None, mcp_to
 
     with _TOOLS_RESULT_CACHE_LOCK:
         _TOOLS_RESULT_CACHE[cache_key] = tools
+        _TOOLS_RESULT_CACHE.move_to_end(cache_key)
+        # LRU eviction — drop the oldest entry once we exceed the cap.
+        while len(_TOOLS_RESULT_CACHE) > _TOOLS_RESULT_CACHE_MAX:
+            _TOOLS_RESULT_CACHE.popitem(last=False)
     # Caller may mutate the returned list — give them a copy.
     return [dict(t, function=dict(t["function"])) for t in tools]
 
@@ -313,6 +336,8 @@ def generate_tools_description(allowed_tools: Optional[List[str]] = None, mcp_to
     cache_key = _tools_cache_key(allowed_tools, mcp_tools, "desc")
     with _TOOLS_RESULT_CACHE_LOCK:
         cached = _TOOLS_RESULT_CACHE.get(cache_key)
+        if cached is not None:
+            _TOOLS_RESULT_CACHE.move_to_end(cache_key)
     if cached is not None:
         return cached
     names = list(allowed_tools or list(BUILTIN_TOOLS.keys()))
@@ -361,6 +386,9 @@ def generate_tools_description(allowed_tools: Optional[List[str]] = None, mcp_to
     result = "\n".join(lines)
     with _TOOLS_RESULT_CACHE_LOCK:
         _TOOLS_RESULT_CACHE[cache_key] = result
+        _TOOLS_RESULT_CACHE.move_to_end(cache_key)
+        while len(_TOOLS_RESULT_CACHE) > _TOOLS_RESULT_CACHE_MAX:
+            _TOOLS_RESULT_CACHE.popitem(last=False)
     return result
 
 # Audit round 11 fix M1: previously a duplicate ``_normalize_time_range``

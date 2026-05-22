@@ -1337,7 +1337,10 @@ class VoiceListener(threading.Thread):
             _head_text = " ".join(text_lower.split()[:2])
             if is_wake_word_detected(_head_text, _ww, _wal, _wfr):
                 debug_log(f"pre-emptive wake-interrupt during TTS: '{text_lower[:60]}'", "voice")
-                print(f"  ⏸  Wake interrupt: \"{text_lower[:60]}\"", flush=True)
+                # R34-S55.1 Phase 8a (P1 security): _vprint+_safe_user_text
+                # so the raw user transcript only lands in ``out.log`` when
+                # voice-debug is explicitly enabled.
+                _vprint(f"  ⏸  Wake interrupt: \"{_safe_user_text(text_lower, 60)}\"", flush=True)
                 # Confirmed wake → reset persistent-session idle timer.
                 try:
                     self.state_manager.mark_user_wake()
@@ -1387,7 +1390,8 @@ class VoiceListener(threading.Thread):
                     f"rejected utterance overlapping TTS window (no wake, no stop): '{text_lower[:80]}'",
                     "voice",
                 )
-                print(f"  🔇 Dropped TTS-overlap audio: \"{text_lower[:50]}{'...' if len(text_lower) > 50 else ''}\"", flush=True)
+                # R34-S55.1 Phase 8a: gate + scrub raw transcript.
+                _vprint(f"  🔇 Dropped TTS-overlap audio: \"{_safe_user_text(text_lower, 50)}\"", flush=True)
                 # CRITICAL: also mark as processed in transcript_buffer.
                 # Without this, the rejected TTS-echo segment stays as
                 # context for the NEXT utterance's intent judge, which
@@ -1543,7 +1547,8 @@ class VoiceListener(threading.Thread):
                         f"wake word found mid-sentence (not in first 4 tokens) — ignoring as background speech: '{text_lower[:80]}'",
                         "voice",
                     )
-                    print(f"  🔇 Ignored mid-sentence wake: \"{text_lower[:60]}\"", flush=True)
+                    # R34-S55.1 Phase 8a: gate + scrub raw transcript.
+                    _vprint(f"  🔇 Ignored mid-sentence wake: \"{_safe_user_text(text_lower, 60)}\"", flush=True)
                     self._transcript_buffer.mark_segment_processed(text_lower)
                     return
 
@@ -1561,7 +1566,8 @@ class VoiceListener(threading.Thread):
         )
         if is_stop_command(text_lower, session_stop_words):
             debug_log(f"session-stop command detected: '{text_lower}'", "voice")
-            print(f"  🛑 Session stop: \"{text_lower[:60]}\"", flush=True)
+            # R34-S55.1 Phase 8a: gate + scrub raw transcript.
+            _vprint(f"  🛑 Session stop: \"{_safe_user_text(text_lower, 60)}\"", flush=True)
             if self.tts and self.tts.enabled and self.tts.is_speaking():
                 self._interrupt_tts(reason="session-stop command")
             # Wipe dialog history — new session starts with a clean slate
@@ -1812,8 +1818,12 @@ class VoiceListener(threading.Thread):
                     f"wake-word fast-path: judge skipped, extracted='{extracted}'",
                     "voice",
                 )
-                print(f"  ⚡ Wake fast-path: \"{extracted}\"" if extracted
-                      else "  ⚡ Wake fast-path: (listening for query)", flush=True)
+                # R34-S55.1 Phase 8a (P1 security): gate + scrub.
+                # ``extracted`` is the post-wake user query — gating
+                # through ``_vprint`` keeps it out of world-readable
+                # out.log unless voice-debug is enabled.
+                _vprint(f"  ⚡ Wake fast-path: \"{_safe_user_text(extracted, 60)}\"" if extracted
+                        else "  ⚡ Wake fast-path: (listening for query)", flush=True)
                 self.state_manager.cancel_hot_window_activation()
                 self._transcript_buffer.mark_segment_processed(text_lower)
                 self._clear_audio_buffers()
@@ -3966,11 +3976,22 @@ class VoiceListener(threading.Thread):
                 # cap. Every "стоп"/"час"/"open url" command leaked two
                 # dict entries forever; engine.py:2408 reads the whole
                 # list per turn so per-turn latency grew linearly.
+                # R34-S55.1 Phase 8a (P1 concurrency regression): wrap
+                # the direct-action dialog-history mutation in
+                # ``_dialog_history_lock`` to match the invariant F28/F75
+                # established at lines 3091-3091 (the cousin path).
+                # Without this lock, a concurrent ``_voice_direct_chat``
+                # snapshot can observe a torn 17/18-element history; and
+                # the ``= self._dialog_history[-16:]`` REBIND swaps the
+                # attribute out from under any reader inside the lock
+                # at that instant — the reader operates on the OLD list
+                # while we point ``self._dialog_history`` at a new one.
                 try:
-                    self._dialog_history.append({"role": "user", "content": query})
-                    self._dialog_history.append({"role": "assistant", "content": msg})
-                    if len(self._dialog_history) > 16:
-                        self._dialog_history = self._dialog_history[-16:]
+                    with self._dialog_history_lock:
+                        self._dialog_history.append({"role": "user", "content": query})
+                        self._dialog_history.append({"role": "assistant", "content": msg})
+                        if len(self._dialog_history) > 16:
+                            self._dialog_history = self._dialog_history[-16:]
                 except Exception:
                     pass
                 return

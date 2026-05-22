@@ -447,6 +447,26 @@ def _open_app(app_name: str) -> tuple[bool, str]:
         # `open` via -b on the bundle id resolved from Info.plist.
         try:
             from pathlib import Path as _Path
+            # R34-S55.1 Phase 8a (P1 security): defence-in-depth against
+            # mdfind-query-language injection. ``canonical`` /
+            # ``app_name`` are derived from raw voice input. argv mode
+            # blocks OS-level shell injection, but a literal "'" inside
+            # the spoken name would close the quoted string in the
+            # mdfind expression and let the rest re-parse as additional
+            # clauses (e.g. injecting `kMDItemPath == '*ssh/id_rsa*'`
+            # to ENUMERATE arbitrary file paths). Whisper rarely emits
+            # `'` or `"` so the practical risk is near-zero, but a
+            # tight whitelist eliminates the surface entirely. App
+            # names that legitimately contain quotes (e.g. McDonald's)
+            # can't be queried this way — fall back to ``open -a``
+            # which already ran above.
+            _MDFIND_SAFE = re.compile(r"^[A-Za-zА-Яа-яЁёІіЇїЄєҐґ0-9 \-_.+]+$")
+            if not (_MDFIND_SAFE.match(canonical) and _MDFIND_SAFE.match(app_name)):
+                # Skip mdfind fallback for non-whitelisted names — let
+                # the function fall through to the final error return
+                # below.
+                err = (r.stderr or "").strip()[:120]
+                return False, f"Не смог открыть {canonical}. {err}"
             # mdfind kMDItemKind == 'Application' AND name matches.
             q = (
                 f"kMDItemKind == 'Application' && "
