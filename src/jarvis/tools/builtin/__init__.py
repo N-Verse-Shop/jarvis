@@ -20,6 +20,8 @@ from .mac_control import MacControlTool
 from .n8n import N8NTool
 # R35-S7 — Claude Code bridge (delegates dev tasks to subscription, not API).
 from .claude_bridge import ClaudeCodeSpawnTool
+# R35-S9 — Self-learning: research topic + persist as a vault skill.
+from .learn_skill import LearnSkillTool
 
 # Import supporting functions that may still be used elsewhere
 
@@ -37,4 +39,5 @@ __all__ = [
     'MacControlTool',
     'N8NTool',
     'ClaudeCodeSpawnTool',
+    'LearnSkillTool',
 ]

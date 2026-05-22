@@ -23,6 +23,7 @@ from .builtin.tool_search import ToolSearchTool
 from .builtin.mac_control import MacControlTool
 from .builtin.n8n import N8NTool
 from .builtin.claude_bridge import ClaudeCodeSpawnTool
+from .builtin.learn_skill import LearnSkillTool
 from .types import ToolExecutionResult
 from ..config import Settings
 from .external.mcp_client import MCPClient
@@ -56,6 +57,10 @@ BUILTIN_TOOLS = {
     # NOT the paid Anthropic API. Tool returns a friendly error if the
     # ``claude`` binary is missing, so registration is always safe.
     "claudeCodeSpawn": ClaudeCodeSpawnTool(),
+    # R35-S9: Self-learning — when Jarvis doesn't know how to do X,
+    # research the topic via web search + read sources via Claude bridge,
+    # synthesize a markdown skill into the vault for future reuse.
+    "learnSkill": LearnSkillTool(),
 }
 
 # Global MCP tools cache
