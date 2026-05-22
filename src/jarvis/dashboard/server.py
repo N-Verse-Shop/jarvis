@@ -1355,7 +1355,13 @@ class DashboardServer:
         # leaves `content` empty, so Pipecat hears nothing).
         model = "qwen2.5:3b"
         num_predict = 220
-        num_ctx = 4096
+        # R34-S54.1 Phase 7c: default 4096 → 8192 to mirror
+        # llm.py:call_llm_direct (S53.1 I-1) and call_llm_streaming
+        # (S52 Phase 5). Aligned defaults keep Ollama's KV-cache
+        # prefix reuse intact across voice / dashboard / direct paths.
+        # ``cfg.ollama_chat_num_ctx`` overrides this in practice; this
+        # literal is the unconfigured-cfg fallback path.
+        num_ctx = 8192
         try:
             from ..config import load_settings
             cfg = load_settings()

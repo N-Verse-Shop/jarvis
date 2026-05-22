@@ -403,7 +403,9 @@ def _clipboard_windows(text: str) -> None:
 
 
 def _clipboard_macos(text: str) -> None:
-    import subprocess
+    # R34-S54.1 Phase 7c: dropped redundant inner ``import subprocess``
+    # — Phase 6c added module-level import. Python caches modules so
+    # the re-import was a no-op but kept lint linting (W0404).
     subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
 
 
@@ -423,7 +425,7 @@ def _check_macos_accessibility() -> bool:
         trusted = ats.AXIsProcessTrusted()
         if not trusted:
             debug_log("Accessibility permission not granted — opening System Settings", "dictation")
-            import subprocess
+            # R34-S54.1 Phase 7c: dropped redundant inner import; see _clipboard_macos.
             subprocess.Popen([
                 "open",
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
@@ -495,7 +497,10 @@ def _paste_cgevent() -> bool:
 
 def _clipboard_linux(text: str) -> None:
     import shutil
-    import subprocess
+    # R34-S54.1 Phase 7c: dropped redundant inner ``import subprocess``;
+    # see _clipboard_macos. ``shutil`` stays local — it's used nowhere
+    # else in this file so a function-local import keeps cold-start
+    # work minimal.
     for cmd in ("xclip", "xsel", "wl-copy"):
         path = shutil.which(cmd)
         if path:

@@ -549,7 +549,9 @@ class TestWarmUp:
         args, kwargs = mock_requests.post.call_args
         assert args[0].endswith("/api/generate")
         assert kwargs["json"]["model"] == "qwen2.5:3b"
-        assert kwargs["json"]["keep_alive"] == "30m"
+        # R34-S54.1 Phase 7c: was "30m" — source migrated to "24h" in
+        # S52 F74 to keep qwen3:8b loaded across overnight idle.
+        assert kwargs["json"]["keep_alive"] == "24h"
         assert kwargs["json"]["stream"] is False
 
     def test_warmup_returns_false_on_http_error(self):

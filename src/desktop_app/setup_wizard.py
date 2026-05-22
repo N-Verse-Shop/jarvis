@@ -200,19 +200,24 @@ def get_required_models() -> List[str]:
             models.append(cfg.ollama_embed_model)
 
         # Intent judge model - always required for voice intent classification
-        # This is separate from the chat model and cannot be changed by users
-        intent_judge_model = getattr(cfg, "intent_judge_model", "gemma4:e2b")
+        # This is separate from the chat model and cannot be changed by users.
+        # R34-S54.1 Phase 7c: fallback updated gemma4:e2b → qwen2.5:3b
+        # to match IntentJudgeConfig.model default and the cfg fallback
+        # in create_intent_judge (both fixed in S52 Phase 4 and S53.1
+        # Phase 6b). gemma4:e2b doesn't exist as an Ollama tag — fresh
+        # installs with no config would have downloaded nothing for the
+        # judge and silently fallen back to keyword wake detection.
+        intent_judge_model = getattr(cfg, "intent_judge_model", "qwen2.5:3b")
         if intent_judge_model and intent_judge_model not in models:
             models.append(intent_judge_model)
 
         return models
     except Exception:
-        # Default models if config can't be loaded
-        # Note: DEFAULT_CHAT_MODEL is gemma4:e2b which is also the intent judge model,
-        # so the default list is effectively just 2 unique models
+        # Default models if config can't be loaded.
+        # R34-S54.1 Phase 7c: same migration as above.
         defaults = [DEFAULT_CHAT_MODEL, "nomic-embed-text"]
-        if "gemma4:e2b" not in defaults:
-            defaults.append("gemma4:e2b")
+        if "qwen2.5:3b" not in defaults:
+            defaults.append("qwen2.5:3b")
         return defaults
 
 
@@ -1223,9 +1228,10 @@ class ModelsPage(QWizardPage):
             self._model_buttons[model_id] = btn
             selection_layout.addWidget(btn)
 
-        # VRAM note — explains that VRAM values include the always-loaded intent judge
+        # VRAM note — explains that VRAM values include the always-loaded intent judge.
+        # R34-S54.1 Phase 7c: label text updated gemma4:e2b → qwen2.5:3b.
         ram_note = QLabel(
-            "ℹ️ VRAM values include the intent judge model (gemma4:e2b) "
+            "ℹ️ VRAM values include the intent judge model (qwen2.5:3b) "
             "which is always loaded for voice intent classification."
         )
         ram_note.setWordWrap(True)
@@ -1317,13 +1323,14 @@ class ModelsPage(QWizardPage):
         """Update the models display based on selected model."""
         wizard = self.wizard()
 
-        # Get config values
+        # Get config values.
+        # R34-S54.1 Phase 7c: defaults updated gemma4:e2b → qwen2.5:3b.
         embed_model = "nomic-embed-text"
-        intent_judge_model = "gemma4:e2b"
+        intent_judge_model = "qwen2.5:3b"
         try:
             cfg = load_settings()
             embed_model = cfg.ollama_embed_model
-            intent_judge_model = getattr(cfg, "intent_judge_model", "gemma4:e2b")
+            intent_judge_model = getattr(cfg, "intent_judge_model", "qwen2.5:3b")
         except Exception:
             pass
 

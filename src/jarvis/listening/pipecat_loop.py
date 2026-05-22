@@ -2713,6 +2713,18 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
             Runs on the standby-fanout thread, so we keep it cheap
             and exception-safe. Emits a log so the user/dashboard can
             see WHY the next turn isn't ambient-locked.
+
+            R34-S54.1 Phase 7c: documented the cross-thread mutation.
+            ``_pending_action`` is also touched by ``process_frame`` on
+            the asyncio loop (TTL expiry / confirm / cancel / supersede
+            / set). CPython reference assignment is atomic, so a single
+            ``self._pending_action = None`` write from this thread races
+            benignly against the loop's own assignments. The ``try /
+            except`` guards the snapshot read against ``None[0]`` if
+            the loop cleared between our None-check and our index.
+            That's the only window — no torn read possible past this
+            method. A proper ``threading.Lock`` would over-engineer for
+            zero observable benefit (worst case: a redundant log line).
             """
             if self._pending_action is None:
                 return
