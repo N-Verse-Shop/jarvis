@@ -235,11 +235,19 @@ def call_llm_streaming(
         {"role": "user", "content": user_content}
     ]
 
+    # R34-S52 M: num_ctx was 4096 here but ``chat_with_messages`` uses
+    # 8192. The diary summariser is the heaviest consumer of this
+    # streaming path — a full day's chunks easily exceed 4096 tokens
+    # with the deflection-strip + attribution rules included, so
+    # Ollama silently truncated the system prompt server-side and the
+    # summariser's instruction list got cut, producing diary entries
+    # that contained the very "the assistant said" leaks the rules
+    # were designed to prevent. Match the rest of the LLM surface.
     payload: Dict[str, Any] = {
         "model": chat_model,
         "messages": messages,
         "stream": True,
-        "options": {"num_ctx": 4096},
+        "options": {"num_ctx": 8192},
         "think": thinking,
     }
 

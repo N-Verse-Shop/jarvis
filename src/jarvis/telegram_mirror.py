@@ -86,9 +86,17 @@ def _send_telegram(token: str, chat_id: str, text: str,
     if not text.strip():
         return True
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    # R34-S52 M: ``text[:4090]`` counts CHARACTERS, but Telegram's 4096
+    # limit is in BYTES. For Cyrillic text (each character ≈ 2 UTF-8
+    # bytes) the original code allowed up to ~8180 bytes — Telegram
+    # would reject the message with 400 BAD_REQUEST. Trim by byte
+    # length, then re-decode safely with ``errors='ignore'`` so we
+    # don't slice in the middle of a multi-byte sequence.
+    encoded = text.encode("utf-8")[:4090]
+    safe_text = encoded.decode("utf-8", errors="ignore")
     data = urllib.parse.urlencode({
         "chat_id": chat_id,
-        "text": text[:4090],  # Telegram limit 4096; leave buffer for parse_mode
+        "text": safe_text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": "true",
     }).encode("utf-8")
@@ -192,6 +200,21 @@ def main() -> int:
     if not token or not chat_id:
         print("# missing JARVIS_TG_BOT_TOKEN or JARVIS_TG_CHAT_ID env",
               file=sys.stderr)
+        return 1
+    # R34-S52 M: validate the token shape before opening the polling
+    # loop. Telegram bot tokens are ``<digits>:<35-46 chars [A-Za-z0-9_-]>``.
+    # Without this check, a malformed token (typo in launchd plist,
+    # accidentally pasted comment text, etc.) would silently produce
+    # HTTP 401 on every poll — and ``_scrub_token_in`` would correctly
+    # redact the token from logs, but the bot would just spam stderr
+    # at the polling cadence forever.
+    import re as _re_v
+    if not _re_v.match(r"^\d+:[A-Za-z0-9_\-]{30,}$", token):
+        print(
+            "# JARVIS_TG_BOT_TOKEN has wrong shape (expected "
+            "<digits>:<chars>) — refusing to start polling",
+            file=sys.stderr,
+        )
         return 1
 
     types = set(os.environ.get("JARVIS_TG_TYPES", "").split(",")) - {""}
