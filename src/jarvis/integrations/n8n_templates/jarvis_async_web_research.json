@@ -1,0 +1,125 @@
+{
+  "name": "Jarvis — Async web research",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "jarvis/research",
+        "options": {
+          "responseMode": "lastNode"
+        }
+      },
+      "id": "trigger-webhook",
+      "name": "Webhook (Jarvis calls)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "jarvis-research"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pull the query out of the webhook payload.\nconst body = $input.first()?.json?.body || $input.first()?.json || {};\nconst query = (body.query || body.q || body.text || '').toString().trim();\nif (!query) {\n  return [{ json: { error: 'no query supplied', usage: 'POST { query: \"...\" }' } }];\n}\nreturn [{ json: { query } }];"
+      },
+      "id": "parse-query",
+      "name": "Parse query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.search.brave.com/res/v1/web/search?q={{ encodeURIComponent($json.query) }}&count=5",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Subscription-Token",
+              "value": "{{brave_api_key}}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "id": "brave-search",
+      "name": "Brave search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 220]
+    },
+    {
+      "parameters": {
+        "url": "https://api.tavily.com/search",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "api_key",
+              "value": "{{tavily_api_key}}"
+            },
+            {
+              "name": "query",
+              "value": "={{ $('Parse query').first().json.query }}"
+            },
+            {
+              "name": "max_results",
+              "value": "5"
+            },
+            {
+              "name": "include_answer",
+              "value": "true"
+            }
+          ]
+        }
+      },
+      "id": "tavily-search",
+      "name": "Tavily search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 380]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge Brave + Tavily results.\nconst brave = $('Brave search').first()?.json?.web?.results || [];\nconst tavily = $('Tavily search').first()?.json || {};\nconst tavilyAnswer = tavily.answer || '';\nconst tavilyResults = tavily.results || [];\n\nconst combined = [];\nfor (const r of brave.slice(0, 5)) combined.push({ title: r.title, url: r.url, snippet: r.description, source: 'brave' });\nfor (const r of tavilyResults.slice(0, 5)) combined.push({ title: r.title, url: r.url, snippet: r.content, source: 'tavily' });\n\n// Dedupe by URL.\nconst seen = new Set();\nconst dedup = combined.filter(x => { if (seen.has(x.url)) return false; seen.add(x.url); return true; });\n\nconst summary = `Найдено ${dedup.length} источников. ${tavilyAnswer ? 'Краткий ответ: ' + tavilyAnswer : ''}`;\nconst sources = dedup.slice(0, 8).map((r, i) => `${i+1}. ${r.title} — ${r.url}`).join('\\n');\n\nreturn [{ json: { summary, sources, results: dedup.slice(0, 8), query: $('Parse query').first().json.query, ts: new Date().toISOString() } }];"
+      },
+      "id": "merge-results",
+      "name": "Merge + dedupe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300]
+    }
+  ],
+  "connections": {
+    "Webhook (Jarvis calls)": {
+      "main": [[{ "node": "Parse query", "type": "main", "index": 0 }]]
+    },
+    "Parse query": {
+      "main": [
+        [
+          { "node": "Brave search", "type": "main", "index": 0 },
+          { "node": "Tavily search", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Brave search": {
+      "main": [[{ "node": "Merge + dedupe", "type": "main", "index": 0 }]]
+    },
+    "Tavily search": {
+      "main": [[{ "node": "Merge + dedupe", "type": "main", "index": 0 }]]
+    }
+  },
+  "_jarvis_template_metadata": {
+    "description": "Webhook-triggered parallel web research (Brave + Tavily). Jarvis POSTs { query } → gets merged + deduped results back. Use to offload heavy real-time web search from the voice turn.",
+    "required_params": ["brave_api_key", "tavily_api_key"],
+    "trigger_path": "jarvis/research",
+    "example_call": "curl -X POST https://n8n.example.com/webhook/jarvis/research -H 'Content-Type: application/json' -d '{\"query\":\"latest qwen3 release notes\"}'"
+  }
+}

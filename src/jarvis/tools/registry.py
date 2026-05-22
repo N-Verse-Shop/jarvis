@@ -21,6 +21,7 @@ from .builtin.weather import WeatherTool
 from .builtin.stop import StopTool
 from .builtin.tool_search import ToolSearchTool
 from .builtin.mac_control import MacControlTool
+from .builtin.n8n import N8NTool
 from .types import ToolExecutionResult
 from ..config import Settings
 from .external.mcp_client import MCPClient
@@ -44,6 +45,10 @@ BUILTIN_TOOLS = {
     "stop": StopTool(),
     "toolSearchTool": ToolSearchTool(),
     "macControl": MacControlTool(),
+    # R35-S1: n8n self-hosted workflow management — gated behind
+    # JARVIS_N8N_API_KEY env var (tool returns a friendly "configure
+    # me" reply when unset, so registration is always safe).
+    "n8nAutomation": N8NTool(),
 }
 
 # Global MCP tools cache

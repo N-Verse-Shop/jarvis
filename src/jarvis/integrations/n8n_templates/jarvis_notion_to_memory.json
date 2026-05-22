@@ -1,0 +1,120 @@
+{
+  "name": "Jarvis — Notion changes to memory",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "trigger-cron-30min",
+      "name": "Every 30 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "getAll",
+        "databaseId": "{{notion_database_id}}",
+        "returnAll": false,
+        "limit": 20,
+        "filterType": "manual",
+        "filters": {
+          "conditions": [
+            {
+              "key": "Last edited time",
+              "condition": "past_week"
+            }
+          ]
+        }
+      },
+      "id": "fetch-notion-pages",
+      "name": "Notion: recent pages",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [480, 300],
+      "credentials": {
+        "notionApi": {
+          "id": "{{notion_credential_id}}",
+          "name": "Notion API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Convert each Notion page into a Jarvis fact insert.\nconst items = $input.all();\nconst facts = [];\nfor (const item of items) {\n  const page = item.json;\n  const title = page.properties?.Name?.title?.[0]?.plain_text\n             || page.properties?.title?.title?.[0]?.plain_text\n             || 'untitled';\n  const lastEdited = page.last_edited_time;\n  const url = page.url;\n  facts.push({\n    key: 'notion.recent',\n    value: `${title} (edited ${lastEdited}) ${url}`,\n    source: 'n8n.notion',\n    confidence: 0.9,\n    metadata: { url, last_edited: lastEdited, notion_id: page.id }\n  });\n}\nreturn facts.map(f => ({ json: f }));"
+      },
+      "id": "shape-facts",
+      "name": "Shape into facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{jarvis_dashboard_url}}/api/facts",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{jarvis_dashboard_token}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "jsonBody": "={{ JSON.stringify({ key: $json.key, value: $json.value, source: $json.source, confidence: $json.confidence }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 100
+            }
+          }
+        }
+      },
+      "id": "push-fact",
+      "name": "POST fact to Jarvis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 300]
+    }
+  ],
+  "connections": {
+    "Every 30 min": {
+      "main": [[{ "node": "Notion: recent pages", "type": "main", "index": 0 }]]
+    },
+    "Notion: recent pages": {
+      "main": [[{ "node": "Shape into facts", "type": "main", "index": 0 }]]
+    },
+    "Shape into facts": {
+      "main": [[{ "node": "POST fact to Jarvis", "type": "main", "index": 0 }]]
+    }
+  },
+  "_jarvis_template_metadata": {
+    "description": "Polls Notion every 30 minutes for recently-edited pages and pushes them into Jarvis memory facts. Lets Jarvis answer 'що ти редагував у Notion за минулий тиждень' without hitting the Notion API at voice-turn time.",
+    "required_params": [
+      "notion_database_id",
+      "notion_credential_id",
+      "jarvis_dashboard_url",
+      "jarvis_dashboard_token"
+    ],
+    "notes": "Requires the Jarvis dashboard /api/facts endpoint (added when you wire Phase 2 of R35-S1). For now, you can adapt this to POST to a webhook on Jarvis instead."
+  }
+}

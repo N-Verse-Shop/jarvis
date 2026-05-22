@@ -1,0 +1,62 @@
+{
+  "name": "Jarvis — Telegram message relay",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "jarvis/telegram",
+        "options": {
+          "responseMode": "lastNode"
+        }
+      },
+      "id": "trigger-webhook",
+      "name": "Webhook (Jarvis calls)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "jarvis-telegram"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first()?.json?.body || $input.first()?.json || {};\nconst text = (body.text || body.message || '').toString();\nconst priority = (body.priority || 'normal').toString();\n\nif (!text.trim()) {\n  return [{ json: { error: 'no text supplied' } }];\n}\n\n// Compose with priority emoji.\nconst prefix = priority === 'high' ? '🚨 ' : (priority === 'low' ? '💭 ' : '');\nconst out = `${prefix}${text.slice(0, 4000)}`;\nreturn [{ json: { chat_id: '{{telegram_chat_id}}', text: out, parse_mode: 'Markdown' } }];"
+      },
+      "id": "compose-message",
+      "name": "Compose message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{telegram_bot_token}}/sendMessage",
+        "method": "POST",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "telegram-send",
+      "name": "Telegram sendMessage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300]
+    }
+  ],
+  "connections": {
+    "Webhook (Jarvis calls)": {
+      "main": [[{ "node": "Compose message", "type": "main", "index": 0 }]]
+    },
+    "Compose message": {
+      "main": [[{ "node": "Telegram sendMessage", "type": "main", "index": 0 }]]
+    }
+  },
+  "_jarvis_template_metadata": {
+    "description": "Webhook → Telegram message. Jarvis POSTs { text, priority } and the message lands in your Telegram. Useful for: 'Джарвіс, нагадай мені в Telegram купити молоко через годину' (Jarvis schedules + this webhook delivers).",
+    "required_params": ["telegram_bot_token", "telegram_chat_id"],
+    "trigger_path": "jarvis/telegram",
+    "example_call": "curl -X POST https://n8n.example.com/webhook/jarvis/telegram -H 'Content-Type: application/json' -d '{\"text\":\"купити молоко\",\"priority\":\"normal\"}'"
+  }
+}

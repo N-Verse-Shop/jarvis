@@ -334,6 +334,14 @@ class Settings:
     # MCP Integration
     mcps: Dict[str, Any]
 
+    # R35-S1 — n8n self-hosted integration. The API key is NOT stored in
+    # config.json (which lives in the repo / backups) — it's read from
+    # ``JARVIS_N8N_API_KEY`` env var or ``~/.config/jarvis/.env``. Base URL
+    # is non-secret so it lives in config so multi-instance users can
+    # override per project.
+    n8n_base_url: str
+    n8n_api_key: str  # transient — populated from env at load time; never written back
+
     # R31 — voice engine selector. "legacy" (default) keeps the
     # hand-rolled listener.VoiceListener; "pipecat" switches to the
     # Pipecat-based loop in listening.pipecat_loop. Defaults to
@@ -749,6 +757,11 @@ def get_default_config() -> Dict[str, Any]:
 
         # MCP Integration (external servers Jarvis can use). No defaults.
         "mcps": {},
+
+        # R35-S1 — n8n self-hosted automation. Base URL is non-secret
+        # (config-file safe); API key NEVER lives in config.json — set
+        # JARVIS_N8N_API_KEY in ~/.config/jarvis/.env (chmod 0600).
+        "n8n_base_url": "https://n8n.nexus-studio-innovation.com",
     }
 
 
@@ -1055,6 +1068,15 @@ def load_settings() -> Settings:
     dictation_custom_dictionary = list(raw_dict) if isinstance(raw_dict, list) else []
     mcps = _ensure_dict(merged.get("mcps"))
 
+    # R35-S1 — n8n integration. Base URL from config (or env override),
+    # API key ALWAYS from env (never persisted). Empty key means
+    # "n8n not configured" and the voice tool returns a friendly prompt.
+    n8n_base_url = str(
+        os.environ.get("JARVIS_N8N_BASE_URL")
+        or merged.get("n8n_base_url", "https://n8n.nexus-studio-innovation.com")
+    ).strip().rstrip("/")
+    n8n_api_key = str(os.environ.get("JARVIS_N8N_API_KEY", "") or "").strip()
+
     # R31 — voice engine selector. Accepts "legacy" or "pipecat".
     # Unknown values fall back to "legacy" so a typo in config.json
     # doesn't silently disable voice.
@@ -1233,6 +1255,10 @@ def load_settings() -> Settings:
 
         # MCP Integration
         mcps=mcps,
+
+        # R35-S1 — n8n integration
+        n8n_base_url=n8n_base_url,
+        n8n_api_key=n8n_api_key,
 
         # R31 — voice engine selector
         voice_engine=voice_engine,

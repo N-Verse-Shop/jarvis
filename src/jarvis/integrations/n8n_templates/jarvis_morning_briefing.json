@@ -1,0 +1,152 @@
+{
+  "name": "Jarvis — Morning briefing",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "trigger-cron-8am",
+      "name": "Every day at 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://api.open-meteo.com/v1/forecast?latitude={{lat}}&longitude={{lon}}&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto",
+        "options": {}
+      },
+      "id": "fetch-weather",
+      "name": "Weather (Open-Meteo)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 220]
+    },
+    {
+      "parameters": {
+        "url": "https://api.github.com/user/issues?state=open&sort=updated&per_page=5",
+        "options": {
+          "redirect": {
+            "redirect": {}
+          }
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "token {{github_token}}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        }
+      },
+      "id": "fetch-github",
+      "name": "GitHub: open issues",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 380]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge weather + GitHub issues into a single Jarvis-bound payload.\n// All input items come into this node from upstream merge or via\n// $items() lookup. We accept either shape.\nconst weather = $('Weather (Open-Meteo)').first()?.json || {};\nconst issuesNode = $('GitHub: open issues').first()?.json;\nconst issues = Array.isArray(issuesNode) ? issuesNode : (issuesNode?.items || []);\n\nconst today = weather.daily || {};\nconst max = today.temperature_2m_max?.[0];\nconst min = today.temperature_2m_min?.[0];\nconst rain = today.precipitation_sum?.[0];\n\nconst weatherLine = (max !== undefined)\n  ? `Погода: ${Math.round(min)}…${Math.round(max)}°C${rain > 0 ? `, осадки ${rain}мм` : ''}`\n  : 'Погода: недоступна';\n\nconst issueLines = (issues || []).slice(0, 5).map((it, i) => `  ${i+1}. ${it.title} (${it.repository_url?.split('/').slice(-1)[0] || '?'})`);\nconst issuesBlock = issueLines.length\n  ? `GitHub issues:\\n${issueLines.join('\\n')}`\n  : 'GitHub issues: чисто';\n\nconst summary = [weatherLine, '', issuesBlock].join('\\n');\nreturn [{ json: { summary, kind: 'morning_briefing', ts: new Date().toISOString() } }];"
+      },
+      "id": "build-summary",
+      "name": "Compose briefing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "url": "{{jarvis_dashboard_url}}/api/voice/inject",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{jarvis_dashboard_token}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{ $json.summary }}"
+            },
+            {
+              "name": "source",
+              "value": "n8n.morning_briefing"
+            }
+          ]
+        }
+      },
+      "id": "push-to-jarvis",
+      "name": "Push to Jarvis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 300]
+    }
+  ],
+  "connections": {
+    "Every day at 08:00": {
+      "main": [
+        [
+          { "node": "Weather (Open-Meteo)", "type": "main", "index": 0 },
+          { "node": "GitHub: open issues", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Weather (Open-Meteo)": {
+      "main": [[{ "node": "Compose briefing", "type": "main", "index": 0 }]]
+    },
+    "GitHub: open issues": {
+      "main": [[{ "node": "Compose briefing", "type": "main", "index": 0 }]]
+    },
+    "Compose briefing": {
+      "main": [[{ "node": "Push to Jarvis", "type": "main", "index": 0 }]]
+    }
+  },
+  "_jarvis_template_metadata": {
+    "description": "Daily 08:00 briefing — weather + open GitHub issues pushed to Jarvis voice loop",
+    "required_params": [
+      "lat",
+      "lon",
+      "github_token",
+      "jarvis_dashboard_url",
+      "jarvis_dashboard_token"
+    ],
+    "example_params": {
+      "lat": "52.46",
+      "lon": "9.21",
+      "github_token": "ghp_***",
+      "jarvis_dashboard_url": "http://127.0.0.1:8789",
+      "jarvis_dashboard_token": "***"
+    }
+  }
+}
