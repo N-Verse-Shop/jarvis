@@ -1,5 +1,10 @@
 .DS_Store
 .env/
+# R34-S56.1 Phase 9c: also ignore the bare ``.env`` FILE, not just the
+# folder. A stray ``.env`` at project root used to be committable —
+# anyone running ``echo "JARVIS_TG_BOT_TOKEN=…" > .env`` could
+# ``git add .env`` and push the secret. Now Git refuses by default.
+.env
 .venv/
 __pycache__/
 .pytest_cache/

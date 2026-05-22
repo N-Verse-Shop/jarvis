@@ -1,10 +1,19 @@
+#
+# R34-S56.1 Phase 9a (P1 build hygiene): explicitly declare every
+# import the daemon needs at boot. Previously ``pipecat-ai``, ``PyAudio``,
+# and ``aiohttp`` were pulled in transitively (pipecat → aiohttp;
+# sounddevice/system → PyAudio) and a fresh clone + venv would crash
+# on the first wake-word with ImportError. Pinning to the floor
+# version we've tested with + the next-major upper bound to catch
+# breaking releases early.
 python-dotenv==1.0.1
-flask>=3.0.0
+# Upper bounds on ranged deps so a breaking 2.x doesn't stop boot.
+flask>=3.0.0,<4.0.0
 requests==2.32.3
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
-html2text>=2020.1.16
-playwright>=1.40.0
+beautifulsoup4>=4.12.0,<5.0.0
+lxml>=4.9.0,<6.0.0
+html2text>=2020.1.16,<2026.0.0
+playwright>=1.40.0,<2.0.0
 numpy<2.0.0
 faster-whisper==1.0.3
 setuptools<81
@@ -13,17 +22,32 @@ pytesseract==0.3.13
 Pillow==10.4.0
 webrtcvad==2.0.10
 rapidfuzz==3.6.1
-pynput>=1.7.6
+pynput>=1.7.6,<2.0.0
 geoip2==4.8.0
-tzdata==2026.1; sys_platform == "win32"
+tzdata>=2024.1; sys_platform == "win32"
 miniupnpc==2.2.8
 pytest==8.3.2
 pytest-repeat==0.9.3
 mcp==1.13.1
-chatterbox-tts==0.1.2
-piper-tts>=1.3.0
-pygame>=2.1.0
-faiss-cpu>=1.7.4
+piper-tts>=1.3.0,<2.0.0
+pygame>=2.1.0,<3.0.0
+faiss-cpu>=1.7.4,<2.0.0
+
+# Pipecat voice pipeline + transport — R34-S56.1 Phase 9a.
+# pipecat 1.2.1 is the version we ship + test against; allow patch
+# bumps but block the next minor that may shift adapter APIs.
+pipecat-ai>=1.2.1,<1.3.0
+aiohttp>=3.9.0,<4.0.0
+# PyAudio is the cross-platform audio backend Pipecat's mic input
+# relies on. Listed explicitly so a fresh clone doesn't silently
+# pull a stale version via dep resolution.
+PyAudio>=0.2.14
+
+# R34-S56.1 note on ``chatterbox-tts``: removed from the runtime
+# requirements list. The desktop bundle spec already excludes both
+# ``chatterbox`` and torch (see jarvis_desktop.spec:248), and no code
+# path in src/jarvis imports it. Keeping the pin would still drag
+# ~5 GB of torch into every fresh dev venv.
 
 # NVIDIA CUDA libraries for GPU-accelerated speech recognition on Windows
 nvidia-cublas-cu12>=12.8.0; sys_platform == "win32"
@@ -33,8 +57,8 @@ nvidia-cudnn-cu12>=9.0.0; sys_platform == "win32"
 mlx-whisper>=0.4.0; sys_platform == "darwin" and platform_machine == "arm64"
 
 # Desktop app dependencies
-PyQt6>=6.6.0
-PyQt6-WebEngine>=6.6.0
-psutil>=5.9.0
+PyQt6>=6.6.0,<6.8.0
+PyQt6-WebEngine>=6.6.0,<6.8.0
+psutil>=5.9.0,<7.0.0
 # Note: 6.13.0+ has VC runtime pre-loading fix for Windows
-pyinstaller>=6.13.0
+pyinstaller>=6.13.0,<7.0.0
