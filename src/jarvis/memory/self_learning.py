@@ -125,29 +125,38 @@ class FactCandidate:
 # Value-template uses {0} for the first capture, lowercased+stripped.
 # Patterns target Ukrainian / Russian / English first-person statements
 # typical for the IT-agency owner using the assistant.
+#
+# R34-S53.1 (Phase 6a): all fact value-templates normalised to RU. The
+# UA forms ("ім'я", "живе в", "компанія", "роботодавець", "кава", "вік")
+# used to land verbatim in facts.db; ``render_facts_for_prompt`` then
+# re-injected them into every voice-path system prompt, where qwen3:8b
+# would echo the UA glyph chain back through Piper-RU. RU-only persona
+# (R34-S48/S51) requires RU-only storage. Regexes that detect UA
+# utterances are KEPT — Whisper still produces UA transcripts when the
+# user code-switches; we just rewrite the stored value into RU.
 _PATTERNS: List[Tuple[re.Pattern, str, str]] = [
-    # Name (uk / ru / en)
-    (re.compile(r"\bмене звуть\s+([А-ЯҐЄІЇA-Z][\wʼ'\-]+)", re.IGNORECASE), "user.name",      "ім'я: {0}"),
+    # Name (uk / ru / en — all normalised to RU storage)
+    (re.compile(r"\bмене звуть\s+([А-ЯҐЄІЇA-Z][\wʼ'\-]+)", re.IGNORECASE), "user.name",      "имя: {0}"),
     (re.compile(r"\bменя зовут\s+([А-ЯA-Z][\w\-]+)",        re.IGNORECASE), "user.name",      "имя: {0}"),
-    (re.compile(r"\bmy name is\s+([A-Z][\w\-]+)",           re.IGNORECASE), "user.name",      "name: {0}"),
+    (re.compile(r"\bmy name is\s+([A-Z][\w\-]+)",           re.IGNORECASE), "user.name",      "имя: {0}"),
     (re.compile(r"\bя\s+([А-ЯҐЄІЇA-Z][\wʼ'\-]+),\s+(?:CEO|керівник|основатель|засновник)\b", re.IGNORECASE),
                                                                             "user.role",      "{0} — CEO"),
 
     # Location
-    (re.compile(r"\bя живу\s+(?:в|у)\s+([А-ЯҐЄІЇA-Z][\wʼ'\- ]{1,40})", re.IGNORECASE), "user.location", "живе в {0}"),
+    (re.compile(r"\bя живу\s+(?:в|у)\s+([А-ЯҐЄІЇA-Z][\wʼ'\- ]{1,40})", re.IGNORECASE), "user.location", "живёт в {0}"),
     (re.compile(r"\bя живу\s+в\s+([А-ЯA-Z][\w\- ]{1,40})",             re.IGNORECASE), "user.location", "живёт в {0}"),
-    (re.compile(r"\bi live in\s+([A-Z][\w\- ,]{1,40})",                re.IGNORECASE), "user.location", "lives in {0}"),
+    (re.compile(r"\bi live in\s+([A-Z][\w\- ,]{1,40})",                re.IGNORECASE), "user.location", "живёт в {0}"),
 
     # Company
     (re.compile(r"\b(?:моя компанія|моя компания|my company)\s+[—–-]\s+([А-ЯҐЄІЇA-Z][\w \-]{1,40})", re.IGNORECASE),
-                                                                            "user.company",   "компанія: {0}"),
+                                                                            "user.company",   "компания: {0}"),
     (re.compile(r"\b(?:я працюю|я работаю|i work)\s+(?:в|у|at)\s+([А-ЯҐЄІЇA-Z][\w \-]{1,40})", re.IGNORECASE),
-                                                                            "user.company",   "роботодавець: {0}"),
+                                                                            "user.company",   "работодатель: {0}"),
 
     # Preferences — coffee/tea/etc.
-    (re.compile(r"\bя п(?:ʼ|')ю\s+([\w\s\-]{1,40}?)\s+кав[уи]\b",       re.IGNORECASE), "user.preference.coffee", "кава: {0}"),
+    (re.compile(r"\bя п(?:ʼ|')ю\s+([\w\s\-]{1,40}?)\s+кав[уи]\b",       re.IGNORECASE), "user.preference.coffee", "кофе: {0}"),
     (re.compile(r"\bпью\s+([\w\s\-]{1,40}?)\s+кофе\b",                  re.IGNORECASE), "user.preference.coffee", "кофе: {0}"),
-    (re.compile(r"\bi drink\s+([\w\s\-]{1,40}?)\s+coffee\b",            re.IGNORECASE), "user.preference.coffee", "coffee: {0}"),
+    (re.compile(r"\bi drink\s+([\w\s\-]{1,40}?)\s+coffee\b",            re.IGNORECASE), "user.preference.coffee", "кофе: {0}"),
 
     # Language preference for voice.
     # R34-S52 H: the UA and EN regex captures used to write
@@ -163,7 +172,7 @@ _PATTERNS: List[Tuple[re.Pattern, str, str]] = [
                                                                             "user.preference.voice_lang", "voice language: ru"),
 
     # Birthday / age (light touch — confidence 0.6 because of false positives)
-    (re.compile(r"\bмені\s+(\d{1,2})\s+рок[іиу]в?", re.IGNORECASE), "user.age", "вік: {0}"),
+    (re.compile(r"\bмені\s+(\d{1,2})\s+рок[іиу]в?", re.IGNORECASE), "user.age", "возраст: {0}"),
     (re.compile(r"\bмне\s+(\d{1,2})\s+(?:год|лет)", re.IGNORECASE), "user.age", "возраст: {0}"),
 ]
 

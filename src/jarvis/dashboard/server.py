@@ -1371,9 +1371,15 @@ class DashboardServer:
             system_prompt = build_system_prompt("Jarvis")
         except Exception as exc:
             log.warning("chat: system prompt build failed: %r", exc)
+            # R34-S53.1 (Phase 6a): UA fallback prompt → RU. The
+            # daemon's persona is RU-only (R34-S48/S51); if
+            # ``build_system_prompt`` failed and we landed here, the
+            # fallback used to leak UA tokens into qwen3:8b's context
+            # — which then echoed UA back through TTS. Now matches the
+            # persona's primary tone.
             system_prompt = (
-                "Ти — Jarvis, особистий голосовий асистент. "
-                "Відповідай стисло, по суті."
+                "Ты — Jarvis, личный голосовой ассистент. "
+                "Отвечай кратко, по сути, на русском."
             )
         # R34-S30: switched from /v1/chat/completions (OpenAI shim) to
         # native /api/chat. The OpenAI shim IGNORES the `think: false`

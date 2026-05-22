@@ -167,7 +167,7 @@ def _run_async(fn: Callable[[], tuple[bool, str]], action_name: str) -> Future:
                 except Exception:
                     pass
             return False, (
-                f"Дія '{action_name}' не завершилась за "
+                f"Действие '{action_name}' не завершилось за "
                 f"{int(_ACTION_TIMEOUT_SEC)} секунд — пропускаю."
             )
         if exc_box:
@@ -184,7 +184,7 @@ def _run_async(fn: Callable[[], tuple[bool, str]], action_name: str) -> Future:
                     )
                 except Exception:
                     pass
-            return False, f"Помилка: {e}"
+            return False, f"Ошибка: {e}"
         ok, msg = result_box[0] if result_box else (False, "no result")
         debug_log(f"async action {action_name}: ok={ok} msg={msg!r}", "voice")
         if _stream is not None:
@@ -396,7 +396,7 @@ def _open_app(app_name: str) -> tuple[bool, str]:
     # app and fails silently with cryptic stderr.
     name = (app_name or "").strip()
     if not name or len(name) < 2:
-        return False, "Не вказано назву додатка."
+        return False, "Не указано название приложения."
     # F80: expanded RU/UA preposition + conjunction blacklist. Covers
     # leakage like "сейчас открою во весь экран", "открой у себя" and
     # the conjunction case "открыть и закрыть".
@@ -418,7 +418,7 @@ def _open_app(app_name: str) -> tuple[bool, str]:
         "э", "эй", "ох", "ах",
     }
     if name.lower() in _FILLER_APP_NAMES:
-        return False, f"'{name}' — не схоже на назву додатка."
+        return False, f"'{name}' — не похоже на название приложения."
     canonical = _resolve_app_name(name)
     app_name = name  # use sanitized name downstream
     try:
@@ -427,7 +427,7 @@ def _open_app(app_name: str) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0:
-            return True, f"Відкрив {canonical}"
+            return True, f"Открыл {canonical}"
         # Try once more with the raw (untransformed) name in case
         # the user said the canonical name and we mis-aliased.
         if canonical != app_name.strip():
@@ -436,7 +436,7 @@ def _open_app(app_name: str) -> tuple[bool, str]:
                 capture_output=True, text=True, timeout=10,
             )
             if r2.returncode == 0:
-                return True, f"Відкрив {app_name.strip()}"
+                return True, f"Открыл {app_name.strip()}"
         # Round 29 (F81): bundle-id fallback via Spotlight. The
         # docstring promised it but the code never tried it. When the
         # user says an app name that isn't in APP_ALIASES (rare/3rd-
@@ -477,13 +477,13 @@ def _open_app(app_name: str) -> tuple[bool, str]:
                         capture_output=True, text=True, timeout=10,
                     )
                     if r3.returncode == 0:
-                        return True, f"Відкрив {_Path(app_path).stem}"
+                        return True, f"Открыл {_Path(app_path).stem}"
         except Exception:
             pass
         err = (r.stderr or "").strip()[:120]
-        return False, f"Не зміг відкрити {canonical}. {err}"
+        return False, f"Не смог открыть {canonical}. {err}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _write_note(text: str) -> tuple[bool, str]:
@@ -535,9 +535,9 @@ def _write_note(text: str) -> tuple[bool, str]:
         os.makedirs(os.path.dirname(inbox), exist_ok=True)
         with open(inbox, "a", encoding="utf-8") as f:
             f.write(f"\n## {datetime.now():%Y-%m-%d %H:%M}\n\n{safe_text}\n")
-        return True, "Записав нотатку"
+        return True, "Записал заметку"
     except Exception as e:
-        return False, f"Не зміг записати: {e}"
+        return False, f"Не смог записать: {e}"
 
 
 # R34-S49 REC 3 — Self-skill-add voice flow.
@@ -676,11 +676,11 @@ def _nexus_brain_search(query: str) -> tuple[bool, str]:
 
     vault = os.path.expanduser("~/Documents/Nexus-Brain")
     if not os.path.isdir(vault):
-        return False, "Nexus-Brain не знайдено локально"
+        return False, "Nexus-Brain не найден локально"
 
     q = (query or "").strip()
     if not q:
-        return False, "Порожній запит до Nexus-Brain"
+        return False, "Пустой запрос к Nexus-Brain"
     if len(q) > 200:
         q = q[:200]
 
@@ -713,7 +713,7 @@ def _nexus_brain_search(query: str) -> tuple[bool, str]:
                 if len(hits) >= 3:
                     break
         except Exception as exc:
-            return False, f"Не зміг прочитати vault: {exc}"
+            return False, f"Не смог прочитать vault: {exc}"
         if not hits:
             return False, "В Nexus-Brain ничего не нашёл"
         # R34-S48 — voice-friendly: speak file-name list only.
@@ -792,7 +792,7 @@ def _nexus_brain_append(section: str, body: str) -> tuple[bool, str]:
 
     safe = (body or "").strip()
     if not safe:
-        return False, "Порожній зміст для запису"
+        return False, "Пустое содержание для записи"
     try:
         safe = _scrub(safe)
     except Exception:
@@ -822,38 +822,38 @@ def _nexus_brain_append(section: str, body: str) -> tuple[bool, str]:
                 f"\n## {datetime.now():%Y-%m-%d %H:%M} — Jarvis\n\n{safe}\n"
             )
         rel = os.path.relpath(target, vault)
-        return True, f"Записав у Brain: {rel}"
+        return True, f"Записал в Brain: {rel}"
     except Exception as exc:
-        return False, f"Не зміг записати в Brain: {exc}"
+        return False, f"Не смог записать в Brain: {exc}"
 
 
 def _say_time() -> tuple[bool, str]:
     """Return current local time."""
     from datetime import datetime
     now = datetime.now()
-    weekday = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"][now.weekday()]
-    return True, f"Зараз {now.strftime('%H:%M')}, {weekday}, {now.day} число."
+    weekday = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
+    return True, f"Сейчас {now.strftime('%H:%M')}, {weekday}, {now.day} число."
 
 
 def _say_date() -> tuple[bool, str]:
     """R34-S40 — fast path for date queries."""
     from datetime import datetime
     now = datetime.now()
-    weekday = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"][now.weekday()]
+    weekday = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
     months = [
-        "січня", "лютого", "березня", "квітня", "травня", "червня",
-        "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
     ]
-    return True, f"Сьогодні {weekday}, {now.day} {months[now.month-1]} {now.year}."
+    return True, f"Сегодня {weekday}, {now.day} {months[now.month-1]} {now.year}."
 
 
 def _show_screen() -> tuple[bool, str]:
     """Take a screenshot, save to /tmp/jarvis-screen.png."""
     try:
         subprocess.run(["screencapture", "-x", "/tmp/jarvis-screen.png"], timeout=5, check=True)
-        return True, "Зробив скріншот, збережено в /tmp/jarvis-screen.png"
+        return True, "Сделал скриншот, сохранён в /tmp/jarvis-screen.png"
     except Exception as e:
-        return False, f"Помилка скріншоту: {e}"
+        return False, f"Ошибка скриншота: {e}"
 
 
 def _open_url(url: str) -> tuple[bool, str]:
@@ -866,10 +866,10 @@ def _open_url(url: str) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0:
-            return True, f"Відкрив {url}"
-        return False, f"Не зміг відкрити {url}"
+            return True, f"Открыл {url}"
+        return False, f"Не смог открыть {url}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _web_search(query: str) -> tuple[bool, str]:
@@ -878,9 +878,9 @@ def _web_search(query: str) -> tuple[bool, str]:
     url = f"https://www.google.com/search?q={quote_plus(query)}"
     try:
         subprocess.run(["open", url], timeout=10, check=True)
-        return True, f"Шукаю в Google: {query[:60]}"
+        return True, f"Ищу в Google: {query[:60]}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 # R34-S49 REC 2 — Web fact-check via DuckDuckGo HTML scrape.
@@ -1009,9 +1009,9 @@ def _set_volume(level: int) -> tuple[bool, str]:
             ["osascript", "-e", f"set volume output volume {level}"],
             timeout=5, check=True,
         )
-        return True, f"Гучність {level} відсотків"
+        return True, f"Громкость {level} процентов"
     except Exception as e:
-        return False, f"Не зміг змінити гучність: {e}"
+        return False, f"Не смог изменить громкость: {e}"
 
 
 def _mute_system() -> tuple[bool, str]:
@@ -1021,9 +1021,9 @@ def _mute_system() -> tuple[bool, str]:
             ["osascript", "-e", "set volume with output muted"],
             timeout=5, check=True,
         )
-        return True, "Звук вимкнено"
+        return True, "Звук выключен"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _unmute_system() -> tuple[bool, str]:
@@ -1033,9 +1033,9 @@ def _unmute_system() -> tuple[bool, str]:
             ["osascript", "-e", "set volume without output muted"],
             timeout=5, check=True,
         )
-        return True, "Звук увімкнено"
+        return True, "Звук включён"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _lock_screen() -> tuple[bool, str]:
@@ -1067,7 +1067,7 @@ def _lock_screen() -> tuple[bool, str]:
                 timeout=5, capture_output=True,
             )
             if r.returncode == 0:
-                return True, "Екран заблоковано"
+                return True, "Экран заблокирован"
     except Exception:
         pass
     # Fallback 1: Cmd-Ctrl-Q sends the real lock shortcut.
@@ -1092,9 +1092,9 @@ def _lock_screen() -> tuple[bool, str]:
             ["pmset", "displaysleepnow"],
             timeout=5, check=True,
         )
-        return True, "Дисплей заснув (без блокування — увімкни 'Require password immediately' у налаштуваннях)"
+        return True, "Дисплей уснул (без блокировки — включи 'Require password immediately' в настройках)"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _play_pause_music() -> tuple[bool, str]:
@@ -1107,10 +1107,10 @@ def _play_pause_music() -> tuple[bool, str]:
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0:
-                return True, f"Перемикнув відтворення у {app}"
+                return True, f"Переключил воспроизведение в {app}"
         except Exception:
             continue
-    return False, "Не знайшов запущений Spotify або Music"
+    return False, "Не нашёл запущённый Spotify или Music"
 
 
 def _next_track() -> tuple[bool, str]:
@@ -1122,10 +1122,10 @@ def _next_track() -> tuple[bool, str]:
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0:
-                return True, f"Наступний трек у {app}"
+                return True, f"Следующий трек в {app}"
         except Exception:
             continue
-    return False, "Не знайшов музичний плеєр"
+    return False, "Не нашёл музыкальный плеер"
 
 
 def _previous_track() -> tuple[bool, str]:
@@ -1137,10 +1137,10 @@ def _previous_track() -> tuple[bool, str]:
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0:
-                return True, f"Попередній трек у {app}"
+                return True, f"Предыдущий трек в {app}"
         except Exception:
             continue
-    return False, "Не знайшов музичний плеєр"
+    return False, "Не нашёл музыкальный плеер"
 
 
 def _youtube_search(query: str) -> tuple[bool, str]:
@@ -1155,13 +1155,13 @@ def _youtube_search(query: str) -> tuple[bool, str]:
     from urllib.parse import quote_plus
     q = (query or "").strip()
     if not q:
-        return False, "Не вказано що шукати"
+        return False, "Не указано что искать"
     url = f"https://www.youtube.com/results?search_query={quote_plus(q)}"
     try:
         subprocess.run(["open", url], timeout=10, check=True)
-        return True, f"Шукаю на YouTube: {q[:60]}"
+        return True, f"Ищу на YouTube: {q[:60]}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _open_in_browser(url: str, browser_app: str) -> tuple[bool, str]:
@@ -1180,14 +1180,14 @@ def _open_in_browser(url: str, browser_app: str) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0:
-            return True, f"Відкрив {url} у {canonical}"
+            return True, f"Открыл {url} в {canonical}"
         # Fallback: default browser via plain `open`.
         r2 = subprocess.run(["open", url], timeout=10, capture_output=True)
         if r2.returncode == 0:
-            return True, f"Відкрив {url} у браузері за замовчуванням"
-        return False, f"Не зміг відкрити {url} у {canonical}"
+            return True, f"Открыл {url} в браузере по умолчанию"
+        return False, f"Не смог открыть {url} в {canonical}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _browser_new_tab(browser_hint: str = "") -> tuple[bool, str]:
@@ -1233,9 +1233,9 @@ def _browser_new_tab(browser_hint: str = "") -> tuple[bool, str]:
             ],
             timeout=5, capture_output=True, check=True,
         )
-        return True, f"Нова вкладка у {browser}"
+        return True, f"Новая вкладка в {browser}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _browser_close_tab(browser_hint: str = "") -> tuple[bool, str]:
@@ -1263,9 +1263,9 @@ def _browser_close_tab(browser_hint: str = "") -> tuple[bool, str]:
             ],
             timeout=5, capture_output=True, check=True,
         )
-        return True, f"Закрив вкладку у {browser}"
+        return True, f"Закрыл вкладку в {browser}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _hide_app(app_name: str) -> tuple[bool, str]:
@@ -1282,9 +1282,9 @@ def _hide_app(app_name: str) -> tuple[bool, str]:
                 ],
                 timeout=5, capture_output=True, check=True,
             )
-            return True, "Сховав активний додаток"
+            return True, "Скрыл активное приложение"
         except Exception as e:
-            return False, f"Помилка: {e}"
+            return False, f"Ошибка: {e}"
     try:
         subprocess.run(
             [
@@ -1293,9 +1293,9 @@ def _hide_app(app_name: str) -> tuple[bool, str]:
             ],
             timeout=5, capture_output=True, check=True,
         )
-        return True, f"Сховав {canonical}"
+        return True, f"Скрыл {canonical}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _quit_app(app_name: str) -> tuple[bool, str]:
@@ -1310,17 +1310,17 @@ def _quit_app(app_name: str) -> tuple[bool, str]:
     """
     canonical = _resolve_app_name(app_name) if app_name else ""
     if not canonical or len(canonical) < 2:
-        return False, "Не вказано назву додатка"
+        return False, "Не указано название приложения"
     try:
         r = subprocess.run(
             ["osascript", "-e", f'tell application "{canonical}" to quit'],
             timeout=10, capture_output=True, text=True,
         )
         if r.returncode == 0:
-            return True, f"Закрив {canonical}"
-        return False, f"Не зміг закрити {canonical}"
+            return True, f"Закрыл {canonical}"
+        return False, f"Не смог закрыть {canonical}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _switch_window() -> tuple[bool, str]:
@@ -1333,9 +1333,9 @@ def _switch_window() -> tuple[bool, str]:
             ],
             timeout=5, capture_output=True, check=True,
         )
-        return True, "Перемикнув вікно"
+        return True, "Переключил окно"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _show_desktop() -> tuple[bool, str]:
@@ -1348,9 +1348,9 @@ def _show_desktop() -> tuple[bool, str]:
             ],
             timeout=5, capture_output=True, check=True,
         )
-        return True, "Показую робочий стіл"
+        return True, "Показываю рабочий стол"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _read_clipboard() -> tuple[bool, str]:
@@ -1359,11 +1359,11 @@ def _read_clipboard() -> tuple[bool, str]:
         r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
         text = (r.stdout or "").strip()
         if not text:
-            return True, "Буфер обміну порожній"
+            return True, "Буфер обмена пустой"
         snippet = text[:200].replace("\n", " ")
-        return True, f"В буфері: {snippet}"
+        return True, f"В буфере: {snippet}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _write_clipboard(text: str) -> tuple[bool, str]:
@@ -1372,9 +1372,9 @@ def _write_clipboard(text: str) -> tuple[bool, str]:
         subprocess.run(
             ["pbcopy"], input=text, text=True, timeout=5, check=True,
         )
-        return True, f"Скопіював у буфер: {text[:60]}"
+        return True, f"Скопировал в буфер: {text[:60]}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _spotlight_find(query: str) -> tuple[bool, str]:
@@ -1392,7 +1392,7 @@ def _spotlight_find(query: str) -> tuple[bool, str]:
     # could confuse AppleScript even via argv (NULs, escapes, etc.).
     safe_query = "".join(ch for ch in query if ch.isprintable())[:200]
     if not safe_query.strip():
-        return False, "Порожній запит."
+        return False, "Пустой запрос."
     try:
         script = (
             'on run argv\n'
@@ -1408,9 +1408,9 @@ def _spotlight_find(query: str) -> tuple[bool, str]:
             ["osascript", "-e", script, "--", safe_query],
             timeout=10, check=True,
         )
-        return True, f"Шукаю '{safe_query}' у Spotlight"
+        return True, f"Ищу '{safe_query}' в Spotlight"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _new_email(to: str = "") -> tuple[bool, str]:
@@ -1431,7 +1431,7 @@ def _new_email(to: str = "") -> tuple[bool, str]:
         # Reject any URL-injection metacharacters BEFORE parseaddr; the
         # parser is lenient and will happily round-trip ``a@b.c?bcc=x``.
         if any(ch in candidate for ch in ("?", "&", "#", "\n", "\r", " ")):
-            return False, "Невалідний email — містить заборонені символи"
+            return False, "Невалидный email — содержит запрещённые символы"
         try:
             from email.utils import parseaddr
             name, addr = parseaddr(candidate)
@@ -1439,19 +1439,19 @@ def _new_email(to: str = "") -> tuple[bool, str]:
             # display-name part (would let an attacker inject "Bob"
             # <attacker@x.com>); only the raw addr.
             if not addr or "@" not in addr or "." not in addr.split("@", 1)[1]:
-                return False, "Невалідний email"
+                return False, "Невалидный email"
             safe_to = addr
         except Exception:
-            return False, "Невалідний email"
+            return False, "Невалидный email"
     # URL-encode the validated address so e.g. a ``+`` survives intact
     # without ever being interpretable as a query-param boundary.
     from urllib.parse import quote
     url = f"mailto:{quote(safe_to, safe='@.+-_')}" if safe_to else "mailto:"
     try:
         subprocess.run(["open", url], timeout=5, check=True)
-        return True, f"Відкрив нового листа{' до ' + safe_to if safe_to else ''}"
+        return True, f"Открыл новое письмо{' для ' + safe_to if safe_to else ''}"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 def _say_battery() -> tuple[bool, str]:
@@ -1463,11 +1463,11 @@ def _say_battery() -> tuple[bool, str]:
         if m:
             pct = int(m.group(1))
             charging = "AC Power" in out or "charged" in out.lower()
-            state = "заряджається" if charging else "розряджається"
-            return True, f"Батарея {pct} відсотків, {state}."
-        return False, "Не зміг визначити рівень батареї"
+            state = "заряжается" if charging else "разряжается"
+            return True, f"Батарея {pct} процентов, {state}."
+        return False, "Не смог определить уровень батареи"
     except Exception as e:
-        return False, f"Помилка: {e}"
+        return False, f"Ошибка: {e}"
 
 
 # ─── External integration tools (stub level, ready for API keys) ─────────
@@ -1486,13 +1486,13 @@ def _linear_create_issue(title: str, description: str = "") -> tuple[bool, str]:
     """Create a Linear issue. Requires JARVIS_LINEAR_TOKEN env var."""
     token = os.environ.get("JARVIS_LINEAR_TOKEN", "").strip()
     if not token:
-        return False, "Підключи Linear токен у JARVIS_LINEAR_TOKEN (Settings → API → Personal API keys)"
+        return False, "Подключи Linear токен в JARVIS_LINEAR_TOKEN (Settings → API → Personal API keys)"
     try:
         import urllib.request as _ur
         import urllib.error as _ue
         team_id = os.environ.get("JARVIS_LINEAR_TEAM_ID", "").strip()
         if not team_id:
-            return False, "Постав JARVIS_LINEAR_TEAM_ID (один раз — з URL твоєї команди)"
+            return False, "Поставь JARVIS_LINEAR_TEAM_ID (один раз — из URL твоей команды)"
         body = {
             "query": (
                 "mutation IssueCreate($title:String!,$teamId:String!,$desc:String){"
@@ -1511,8 +1511,8 @@ def _linear_create_issue(title: str, description: str = "") -> tuple[bool, str]:
             data = json.loads(r.read())
         issue = (((data or {}).get("data") or {}).get("issueCreate") or {}).get("issue") or {}
         if issue:
-            return True, f"Створив {issue.get('identifier')}: {issue.get('title')}"
-        err = data.get("errors", [{}])[0].get("message", "невідома помилка")
+            return True, f"Создал {issue.get('identifier')}: {issue.get('title')}"
+        err = data.get("errors", [{}])[0].get("message", "неизвестная ошибка")
         return False, f"Linear: {err}"
     except Exception as e:
         return False, f"Linear error: {e}"
@@ -1525,7 +1525,7 @@ def _github_create_issue(repo: str, title: str, body: str = "") -> tuple[bool, s
     """
     token = os.environ.get("JARVIS_GITHUB_TOKEN", "").strip()
     if not token:
-        return False, "Підключи GitHub токен у JARVIS_GITHUB_TOKEN (gh auth token)"
+        return False, "Подключи GitHub токен в JARVIS_GITHUB_TOKEN (gh auth token)"
     try:
         import urllib.request as _ur
         payload = {"title": title, "body": body or ""}
@@ -1575,7 +1575,7 @@ def _gitlab_create_issue(
     token = os.environ.get("JARVIS_GITLAB_TOKEN", "").strip()
     if not token:
         return False, (
-            "Підключи GitLab токен у JARVIS_GITLAB_TOKEN "
+            "Подключи GitLab токен в JARVIS_GITLAB_TOKEN "
             "(Personal Access Token, scope: api)"
         )
     # GitLab project identifiers must be URL-encoded when passed as a
@@ -1634,7 +1634,7 @@ def _notion_append_to_page(page_id: str, text: str) -> tuple[bool, str]:
     """Append a paragraph to a Notion page. Requires JARVIS_NOTION_TOKEN."""
     token = os.environ.get("JARVIS_NOTION_TOKEN", "").strip()
     if not token:
-        return False, "Підключи Notion токен у JARVIS_NOTION_TOKEN (Internal Integration)"
+        return False, "Подключи Notion токен в JARVIS_NOTION_TOKEN (Internal Integration)"
     try:
         import urllib.request as _ur
         payload = {
@@ -1658,7 +1658,7 @@ def _notion_append_to_page(page_id: str, text: str) -> tuple[bool, str]:
         )
         with _ur.urlopen(req, timeout=15) as r:
             r.read()
-        return True, f"Додав до Notion: {text[:60]}"
+        return True, f"Добавил в Notion: {text[:60]}"
     except Exception as e:
         return False, f"Notion error: {e}"
 
@@ -1697,7 +1697,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:від|за)крию\s+(?:сторінку\s+|сайт\s+)?(https?://\S+|[a-z0-9-]+\.[a-z]{2,}(?:/\S*)?)", re.IGNORECASE),
         lambda m: Action(
             name="open_url",
-            description=f"Зараз відкрию {m.group(1).strip()}",
+            description=f"Сейчас открою {m.group(1).strip()}",
             fn=lambda: _open_url(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -1765,7 +1765,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="open_app",
-            description=f"Зараз відкрию {_trim_app_capture(m.group(1))}",
+            description=f"Сейчас открою {_trim_app_capture(m.group(1))}",
             fn=lambda: _open_app(_trim_app_capture(m.group(1))),
             created_ts=time.time(),
         ),
@@ -1774,7 +1774,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:по)?шукаю\s+(?:в\s+google|в\s+гуглі|в\s+браузері)[:\s]+(.{2,80})", re.IGNORECASE),
         lambda m: Action(
             name="web_search",
-            description=f"Шукаю в Google: {m.group(1).strip()[:50]}",
+            description=f"Ищу в Google: {m.group(1).strip()[:50]}",
             fn=lambda: _web_search(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -1784,7 +1784,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:за|пере)пишу(?:[\s,]+нотатку)?(?:[\s,]+в\s+inbox)?[\s,:]+(.{3,200})", re.IGNORECASE),
         lambda m: Action(
             name="write_note",
-            description=f"Запишу нотатку: {m.group(1).strip()[:60]}",
+            description=f"Запишу заметку: {m.group(1).strip()[:60]}",
             fn=lambda: _write_note(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -1794,7 +1794,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:зроблю|роблю)\s+скрін(?:шот)?", re.IGNORECASE),
         lambda m: Action(
             name="screenshot",
-            description="Зроблю скріншот екрана",
+            description="Сделаю скриншот экрана",
             fn=_show_screen,
             created_ts=time.time(),
         ),
@@ -1804,7 +1804,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:зменшу|підвищу|вставлю|поставлю|зроблю)\s+гучн[іо]ст[ьі]?\s+(?:на\s+|до\s+)?(\d{1,3})", re.IGNORECASE),
         lambda m: Action(
             name="set_volume",
-            description=f"Поставлю гучність {m.group(1)}",
+            description=f"Поставлю громкость {m.group(1)}",
             fn=lambda: _set_volume(int(m.group(1))),
             created_ts=time.time(),
         ),
@@ -1813,7 +1813,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?вимкну\s+звук\b", re.IGNORECASE),
         lambda m: Action(
             name="mute",
-            description="Вимкну звук",
+            description="Выключу звук",
             fn=_mute_system,
             created_ts=time.time(),
         ),
@@ -1822,7 +1822,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?увімкну\s+звук\b", re.IGNORECASE),
         lambda m: Action(
             name="unmute",
-            description="Увімкну звук",
+            description="Включу звук",
             fn=_unmute_system,
             created_ts=time.time(),
         ),
@@ -1832,7 +1832,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:за)?блокую\s+(?:екран|комп|маку?|ноут)", re.IGNORECASE),
         lambda m: Action(
             name="lock_screen",
-            description="Заблокую екран",
+            description="Заблокирую экран",
             fn=_lock_screen,
             created_ts=time.time(),
         ),
@@ -1842,7 +1842,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:зап(?:устю|ущу)|пауза|спаузу|пау?з[ао]|включу|вимкну)\s+(?:музику|плеєр|трек)", re.IGNORECASE),
         lambda m: Action(
             name="play_pause_music",
-            description="Перемкну відтворення",
+            description="Переключу воспроизведение",
             fn=_play_pause_music,
             created_ts=time.time(),
         ),
@@ -1851,7 +1851,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:наступ|перемкну|наступ.+трек)", re.IGNORECASE),
         lambda m: Action(
             name="next_track",
-            description="Наступний трек",
+            description="Следующий трек",
             fn=_next_track,
             created_ts=time.time(),
         ),
@@ -1861,7 +1861,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:прочитаю|зачитаю|подивлюся\s+у?)\s+(?:в\s+)?буфер(?:і)?(?:\s+обміну)?", re.IGNORECASE),
         lambda m: Action(
             name="read_clipboard",
-            description="Дивлюся в буфер обміну",
+            description="Смотрю в буфер обмена",
             fn=_read_clipboard,
             created_ts=time.time(),
         ),
@@ -1870,7 +1870,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:с?копіюю|занесу|збережу)\s+(?:у|в|до)?\s*буфер(?:\s+обміну)?[:\s]+(.{2,500})", re.IGNORECASE),
         lambda m: Action(
             name="write_clipboard",
-            description=f"Скопіюю в буфер: {m.group(1).strip()[:50]}",
+            description=f"Скопирую в буфер: {m.group(1).strip()[:50]}",
             fn=lambda: _write_clipboard(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -1880,7 +1880,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:знайду|пошукаю)(?:\s+файл|\s+у\s+spotlight)?[\s:]+([^\.\n]{2,80})", re.IGNORECASE),
         lambda m: Action(
             name="spotlight",
-            description=f"Шукаю '{m.group(1).strip()[:40]}' у Spotlight",
+            description=f"Ищу '{m.group(1).strip()[:40]}' в Spotlight",
             fn=lambda: _spotlight_find(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -1890,7 +1890,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:напишу|створю)\s+(?:листа|email|імейл|новий\s+лист)(?:\s+(?:до|на)\s+(\S+@\S+\.\S+))?", re.IGNORECASE),
         lambda m: Action(
             name="new_email",
-            description=f"Відкрию нового листа{' до ' + m.group(1) if m.group(1) else ''}",
+            description=f"Открою новое письмо{' для ' + m.group(1) if m.group(1) else ''}",
             fn=lambda: _new_email(m.group(1) or ""),
             created_ts=time.time(),
         ),
@@ -1900,7 +1900,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:скажу|повідомлю|подивлюся)\s+(?:котра|який)\s+(?:година|час)", re.IGNORECASE),
         lambda m: Action(
             name="say_time",
-            description="Подивлюся котра година",
+            description="Посмотрю который час",
             fn=_say_time,
             created_ts=time.time(),
         ),
@@ -1910,7 +1910,7 @@ ACTION_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"(?:зараз\s+)?(?:перевірю|подивлюся)\s+(?:рівень\s+)?батарею?", re.IGNORECASE),
         lambda m: Action(
             name="battery",
-            description="Перевіряю рівень батареї",
+            description="Проверяю уровень батареи",
             fn=_say_battery,
             created_ts=time.time(),
         ),
@@ -2102,39 +2102,45 @@ _IMPERATIVE_DENY = {
 # "Джарвіс на російську". Solution: ALLOW the bare "на X" pattern
 # but ONLY when prefixed by the wake word — that proves the user
 # is addressing the assistant, not narrating ambient.
+#
+# R34-S53.1 (Phase 6a): all spoken acks normalised to RU. After R34-S48/S51
+# RU-only outbound policy, any non-RU ack here would leak Ukrainian /
+# English / German into Piper-RU voice. The "lang" codes are kept for
+# upstream consumers (HUD badge, _system_prompt_for) but the daemon
+# itself stays RU regardless of which switch fires.
 LANG_SWITCH_PATTERNS: list[tuple[re.Pattern, str, str]] = [
     # Russian — imperative verb form
     (re.compile(r"\b(?:говори|скажи|відповідай|перейди|перейти)\s+(?:на\s+)?(?:російськ|русск|русс)\w*\b", re.IGNORECASE),
-     "ru", "Переходжу на російську"),
+     "ru", "Перехожу на русский"),
     # Russian — wake-prefixed "Джарвіс на російську"
     (re.compile(r"\b(?:джарвіс|джарвис|jarvis)[\s,]+(?:на\s+)?(?:російськ|русск|русс)\w*\b", re.IGNORECASE),
-     "ru", "Переходжу на російську"),
+     "ru", "Перехожу на русский"),
     (re.compile(r"\bswitch\s+to\s+russian\b", re.IGNORECASE),
-     "ru", "Переходжу на російську"),
+     "ru", "Перехожу на русский"),
     # English — imperative
     (re.compile(r"\b(?:говори|скажи|відповідай|перейди)\s+(?:на\s+)?англійськ\w*\b", re.IGNORECASE),
-     "en", "Switching to English"),
+     "en", "Остаюсь на русском"),
     # English — wake-prefixed
     (re.compile(r"\b(?:джарвіс|джарвис|jarvis)[\s,]+(?:на\s+)?англійськ\w*\b", re.IGNORECASE),
-     "en", "Switching to English"),
+     "en", "Остаюсь на русском"),
     (re.compile(r"\bswitch\s+to\s+english\b", re.IGNORECASE),
-     "en", "Switching to English"),
+     "en", "Остаюсь на русском"),
     # German — imperative
     (re.compile(r"\b(?:говори|скажи|відповідай|перейди)\s+(?:на\s+)?німецьк\w*\b", re.IGNORECASE),
-     "de", "Wechsle zu Deutsch"),
+     "de", "Остаюсь на русском"),
     # German — wake-prefixed
     (re.compile(r"\b(?:джарвіс|джарвис|jarvis)[\s,]+(?:на\s+)?німецьк\w*\b", re.IGNORECASE),
-     "de", "Wechsle zu Deutsch"),
+     "de", "Остаюсь на русском"),
     (re.compile(r"\b(?:switch\s+to|auf)\s+(?:german|deutsch)\b", re.IGNORECASE),
-     "de", "Wechsle zu Deutsch"),
+     "de", "Остаюсь на русском"),
     # Back to Ukrainian — imperative
     (re.compile(r"\b(?:говори|скажи|відповідай|перейди|повернись)\s+(?:на\s+|обратно\s+)?українськ\w*\b", re.IGNORECASE),
-     "uk", "Повертаюсь на українську"),
+     "uk", "Остаюсь на русском"),
     # Back to Ukrainian — wake-prefixed
     (re.compile(r"\b(?:джарвіс|джарвис|jarvis)[\s,]+(?:на\s+)?українськ\w*\b", re.IGNORECASE),
-     "uk", "Повертаюсь на українську"),
+     "uk", "Остаюсь на русском"),
     (re.compile(r"\bback\s+to\s+ukrainian\b", re.IGNORECASE),
-     "uk", "Повертаюсь на українську"),
+     "uk", "Остаюсь на русском"),
 ]
 
 
@@ -2232,7 +2238,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"^\s*(?:від|за)крий(?:те)?\s+(?:сайт\s+|сторінку\s+)?((?:https?://)?[a-z0-9-]+\.[a-z]{2,}(?:/\S*)?)\s*[!\.\?]?\s*$", re.IGNORECASE),
         lambda m: Action(
             name="open_url",
-            description=f"Відкриваю {m.group(1).strip()}",
+            description=f"Открываю {m.group(1).strip()}",
             fn=lambda: _open_url(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2272,7 +2278,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="browser_close_tab",
-            description="Закриваю вкладку",
+            description="Закрываю вкладку",
             fn=lambda: _browser_close_tab(""),
             created_ts=time.time(),
         ),
@@ -2289,7 +2295,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="quit_app",
-            description=f"Закриваю {_resolve_app_name(m.group(1).strip())}",
+            description=f"Закрываю {_resolve_app_name(m.group(1).strip())}",
             fn=lambda: _quit_app(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2313,9 +2319,9 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         lambda m: Action(
             name="browser_new_tab",
             description=(
-                f"Нова вкладка у {_resolve_app_name(m.group(1).strip())}"
+                f"Новая вкладка в {_resolve_app_name(m.group(1).strip())}"
                 if m.group(1)
-                else "Нова вкладка"
+                else "Новая вкладка"
             ),
             fn=lambda: _browser_new_tab((m.group(1) or "").strip()),
             created_ts=time.time(),
@@ -2347,7 +2353,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
             r"([A-Za-zА-Яа-яЇїІіЄєҐґ][A-Za-zА-Яа-яЇїІіЄєҐґ0-9\s-]{1,30})\s*[!\.\?]?\s*$",
             re.IGNORECASE,
         ),
-        lambda m: _make_open_app_action(m.group(1).strip(), "Відкриваю"),
+        lambda m: _make_open_app_action(m.group(1).strip(), "Открываю"),
     ),
     (
         re.compile(
@@ -2409,7 +2415,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"^\s*(?:встав|постав|зроби|постав\s+на)\s+гучн[іо]ст[ьі]?\s+(?:на\s+|до\s+)?(\d{1,3})\s*(?:відсотк|процент)?\w*\s*[!\.\?]?\s*$", re.IGNORECASE),
         lambda m: Action(
             name="set_volume",
-            description=f"Гучність {m.group(1)}",
+            description=f"Громкость {m.group(1)}",
             fn=lambda: _set_volume(int(m.group(1))),
             created_ts=time.time(),
         ),
@@ -2418,18 +2424,18 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"^\s*гучн[іо]ст[ьі]?\s+(\d{1,3})\s*[!\.\?]?\s*$", re.IGNORECASE),
         lambda m: Action(
             name="set_volume",
-            description=f"Гучність {m.group(1)}",
+            description=f"Громкость {m.group(1)}",
             fn=lambda: _set_volume(int(m.group(1))),
             created_ts=time.time(),
         ),
     ),
     (
         re.compile(r"^\s*вимкни\s+звук\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="mute", description="Вимикаю звук", fn=_mute_system, created_ts=time.time()),
+        lambda m: Action(name="mute", description="Выключаю звук", fn=_mute_system, created_ts=time.time()),
     ),
     (
         re.compile(r"^\s*увімкни\s+звук\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="unmute", description="Увімкаю звук", fn=_unmute_system, created_ts=time.time()),
+        lambda m: Action(name="unmute", description="Включаю звук", fn=_unmute_system, created_ts=time.time()),
     ),
     # Round 27 (F66): RU volume / mute equivalents.
     (
@@ -2461,11 +2467,11 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     # ── screen ──
     (
         re.compile(r"^\s*(?:за)?блокуй(?:те)?\s+(?:екран|комп[`']?ютер|маку?|ноут(?:бук)?)\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="lock", description="Блокую екран", fn=_lock_screen, created_ts=time.time()),
+        lambda m: Action(name="lock", description="Блокирую экран", fn=_lock_screen, created_ts=time.time()),
     ),
     (
         re.compile(r"^\s*(?:зроби|зробити)\s+скрін(?:шот)?\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="screenshot", description="Роблю скріншот", fn=_show_screen, created_ts=time.time()),
+        lambda m: Action(name="screenshot", description="Делаю скриншот", fn=_show_screen, created_ts=time.time()),
     ),
     # Round 27 (F66): RU screen lock + screenshot.
     (
@@ -2483,16 +2489,16 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     ),
     (
         re.compile(r"^\s*(?:увімкни|включи|запусти)\s+музику\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="music_play", description="Вмикаю музику", fn=_play_pause_music, created_ts=time.time()),
+        lambda m: Action(name="music_play", description="Включаю музыку", fn=_play_pause_music, created_ts=time.time()),
     ),
     (
         re.compile(r"^\s*(?:наступн\w+\s+трек|далі|перемкни\s+трек)\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="next_track", description="Наступний трек", fn=_next_track, created_ts=time.time()),
+        lambda m: Action(name="next_track", description="Следующий трек", fn=_next_track, created_ts=time.time()),
     ),
     # ── info ──
     (
         re.compile(r"^\s*(?:котра\s+(?:зараз\s+)?година|скільки\s+(?:зараз\s+)?часу|який\s+зараз\s+час)\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="say_time", description="Дивлюся час", fn=_say_time, created_ts=time.time()),
+        lambda m: Action(name="say_time", description="Смотрю время", fn=_say_time, created_ts=time.time()),
     ),
     # R34-S40 — Russian + English variants for time. Without these,
     # "сколько сейчас времени" / "what time is it" hit the slow LLM
@@ -2509,27 +2515,27 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
     # ── date ──
     (
         re.compile(r"^\s*(?:який\s+(?:сьогодні\s+)?(?:день|число|дата)|сьогодні\s+(?:який|яке)\s+(?:день|число|дата)|какое\s+(?:сегодня\s+)?(?:число|день|дата)|сегодня\s+(?:какое|какой)\s+(?:число|день|дата))\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="say_date", description="Дивлюсь дату", fn=_say_date, created_ts=time.time()),
+        lambda m: Action(name="say_date", description="Смотрю дату", fn=_say_date, created_ts=time.time()),
     ),
     (
         re.compile(r"^\s*(?:рівень\s+)?батаре[яюїіея]\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="battery", description="Перевіряю батарею", fn=_say_battery, created_ts=time.time()),
+        lambda m: Action(name="battery", description="Проверяю батарею", fn=_say_battery, created_ts=time.time()),
     ),
     (
         re.compile(r"^\s*(?:скільки|який)\s+(?:заряд|рівень)\s+(?:батаре[яюїіея])\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="battery", description="Перевіряю батарею", fn=_say_battery, created_ts=time.time()),
+        lambda m: Action(name="battery", description="Проверяю батарею", fn=_say_battery, created_ts=time.time()),
     ),
     # ── clipboard ──
     (
         re.compile(r"^\s*(?:що|що\s+там)\s+(?:у|в)\s+буфер[іе](?:\s+обміну)?\s*[!\.\?]?\s*$", re.IGNORECASE),
-        lambda m: Action(name="clipboard", description="Дивлюся буфер", fn=_read_clipboard, created_ts=time.time()),
+        lambda m: Action(name="clipboard", description="Смотрю буфер", fn=_read_clipboard, created_ts=time.time()),
     ),
     # ── web search ──
     (
         re.compile(r"^\s*(?:знайди|шукай|пошукай)\s+(?:в\s+google|в\s+гугл[іе]|у?\s*браузер[іе])\s+(.{2,80})\s*[!\.\?]?\s*$", re.IGNORECASE),
         lambda m: Action(
             name="web_search",
-            description=f"Шукаю: {m.group(1).strip()[:50]}",
+            description=f"Ищу: {m.group(1).strip()[:50]}",
             fn=lambda: _web_search(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2595,7 +2601,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"^\s*(?:запиши|занотуй|занеси|створи)\s+нотатку[:\s]+(.{3,200})\s*$", re.IGNORECASE),
         lambda m: Action(
             name="write_note",
-            description=f"Записую: {m.group(1).strip()[:60]}",
+            description=f"Записываю: {m.group(1).strip()[:60]}",
             fn=lambda: _write_note(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2605,7 +2611,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"^\s*(?:створи|додай)\s+(?:задачу|тікет|issue|таску)\s+(?:у\s+|в\s+)?linear[:\s]+(.{3,200})\s*$", re.IGNORECASE),
         lambda m: Action(
             name="linear_create_issue",
-            description=f"Створюю Linear-задачу: {m.group(1).strip()[:60]}",
+            description=f"Создаю Linear-задачу: {m.group(1).strip()[:60]}",
             fn=lambda: _linear_create_issue(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2615,7 +2621,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"^\s*(?:створи|додай)\s+(?:issue|тікет|баг)\s+(?:у\s+|в\s+)?github(?:\s+([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+))?[:\s]+(.{3,200})\s*$", re.IGNORECASE),
         lambda m: Action(
             name="github_create_issue",
-            description=f"Створюю GitHub issue: {m.group(2).strip()[:60]}",
+            description=f"Создаю GitHub issue: {m.group(2).strip()[:60]}",
             fn=lambda: _github_create_issue(
                 m.group(1) or os.environ.get("JARVIS_GITHUB_DEFAULT_REPO", ""),
                 m.group(2).strip(),
@@ -2644,7 +2650,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="gitlab_create_issue",
-            description=f"Створюю GitLab issue: {m.group(2).strip()[:60]}",
+            description=f"Создаю GitLab issue: {m.group(2).strip()[:60]}",
             fn=lambda: _gitlab_create_issue(
                 m.group(1) or os.environ.get("JARVIS_GITLAB_DEFAULT_PROJECT", ""),
                 m.group(2).strip(),
@@ -2657,7 +2663,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         re.compile(r"^\s*(?:додай|запиши|занотуй)\s+(?:у\s+|в\s+)?notion[:\s]+(.{3,400})\s*$", re.IGNORECASE),
         lambda m: Action(
             name="notion_append",
-            description=f"Додаю до Notion: {m.group(1).strip()[:60]}",
+            description=f"Добавляю в Notion: {m.group(1).strip()[:60]}",
             fn=lambda: _notion_append_to_page(
                 os.environ.get("JARVIS_NOTION_DEFAULT_PAGE_ID", ""),
                 m.group(1).strip(),
@@ -2676,7 +2682,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="youtube_search",
-            description=f"Шукаю на YouTube: {m.group(1).strip()[:50]}",
+            description=f"Ищу на YouTube: {m.group(1).strip()[:50]}",
             fn=lambda: _youtube_search(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2689,7 +2695,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="youtube_search",
-            description=f"Шукаю на YouTube: {m.group(1).strip()[:50]}",
+            description=f"Ищу на YouTube: {m.group(1).strip()[:50]}",
             fn=lambda: _youtube_search(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2706,7 +2712,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="open_in_browser",
-            description=f"Відкриваю {m.group(1).strip()} у {_resolve_app_name(m.group(2).strip())}",
+            description=f"Открываю {m.group(1).strip()} в {_resolve_app_name(m.group(2).strip())}",
             fn=lambda: _open_in_browser(m.group(1).strip(), m.group(2).strip()),
             created_ts=time.time(),
         ),
@@ -2719,7 +2725,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="previous_track",
-            description="Попередній трек",
+            description="Предыдущий трек",
             fn=_previous_track,
             created_ts=time.time(),
         ),
@@ -2745,7 +2751,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="hide_app",
-            description=f"Ховаю {_resolve_app_name(m.group(1).strip())}",
+            description=f"Скрываю {_resolve_app_name(m.group(1).strip())}",
             fn=lambda: _hide_app(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2758,7 +2764,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="switch_window",
-            description="Перемикаю вікно",
+            description="Переключаю окно",
             fn=_switch_window,
             created_ts=time.time(),
         ),
@@ -2771,7 +2777,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="show_desktop",
-            description="Показую робочий стіл",
+            description="Показываю рабочий стол",
             fn=_show_desktop,
             created_ts=time.time(),
         ),
@@ -2813,7 +2819,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="nexus_brain_search",
-            description=f"Шукаю у Brain: {m.group(1).strip()}",
+            description=f"Ищу в Brain: {m.group(1).strip()}",
             fn=lambda: _nexus_brain_search(m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2833,7 +2839,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="nexus_brain_write",
-            description=f"Записую у Brain (Nexus Studio): {m.group(1).strip()[:60]}",
+            description=f"Записываю в Brain (Nexus Studio): {m.group(1).strip()[:60]}",
             fn=lambda: _nexus_brain_append("nexus-studio", m.group(1).strip()),
             created_ts=time.time(),
         ),
@@ -2848,7 +2854,7 @@ USER_COMMAND_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
         ),
         lambda m: Action(
             name="nexus_brain_write",
-            description=f"Записую ідею: {m.group(1).strip()[:60]}",
+            description=f"Записываю идею: {m.group(1).strip()[:60]}",
             fn=lambda: _nexus_brain_append("ideas", m.group(1).strip()),
             created_ts=time.time(),
         ),
