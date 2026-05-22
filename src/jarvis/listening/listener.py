@@ -145,12 +145,19 @@ VOICE_WHISPER_INITIAL_PROMPT = (
     # docs: keep initial_prompt to vocabulary list, NO example sentences.
     # Just bare brand/tech terms + the wake word. No commands, no
     # templates, no full phrases.
-    "Українська мова. Данило, Джарвіс, Nexus Studio, IBONS, Hydrogen, "
+    # R34-S54.1 Phase 7a: was "Українська мова. …" — biased Whisper toward
+    # UA decoding under the R34-S48/S51 RU-only policy. Whisper's
+    # ``initial_prompt`` controls the LM bias on the decode lattice, so
+    # a "Українська мова" primer forced UA token selection on quiet
+    # audio. Switched primer to RU. The brand / tech vocab is identical
+    # in both languages — only the leading phrase + a few morphology
+    # endings change (бекенд→бэкенд, лендінг→лендинг, конверсія→конверсия).
+    "Русский язык. Данило, Джарвис, Nexus Studio, IBONS, Hydrogen, "
     "Shopify, Cloudflare, Hetzner, Tailscale, Render, Ollama, "
     "Founder Cockpit, Telegram, Linear, GitHub, Notion, Obsidian, "
     "macOS, Safari, Chrome, Slack, DACH, API, JSON, MLX, Whisper, "
-    "qwen, llama, mistral, deploy, frontend, бекенд, лендінг, "
-    "конверсія, кеш, токен, промпт, streaming, latency, CDN, edge."
+    "qwen, llama, mistral, deploy, frontend, бэкенд, лендинг, "
+    "конверсия, кеш, токен, промпт, streaming, latency, CDN, edge."
 )
 
 
@@ -3487,7 +3494,8 @@ class VoiceListener(threading.Thread):
             "how are you", "how's it going", "what's up",
         }
         if q in status:
-            return "Все добре, працюю. А у вас?"
+            # R34-S54.1 Phase 7a: was UA "Все добре, працюю. А у вас?"
+            return "Всё хорошо, работаю. А у вас?"
 
         # Single-word "test"/"перевірка"/"чуєш мене" — confirm liveness.
         liveness = {
@@ -3497,7 +3505,8 @@ class VoiceListener(threading.Thread):
             "проверка", "слышишь меня",
         }
         if q in liveness:
-            return "Чую вас. Працюю."
+            # R34-S54.1 Phase 7a: was UA "Чую вас. Працюю."
+            return "Слышу вас. Работаю."
 
         # Confirmations / brief acks — bypass intent judge entirely.
         # These phrases ALONE shouldn't trigger the LLM at all.
@@ -3511,7 +3520,8 @@ class VoiceListener(threading.Thread):
             "хорошо", "понятно", "ладно",
         }
         if q in bare_acks:
-            return "Гаразд."
+            # R34-S54.1 Phase 7a: was UA "Гаразд."
+            return "Хорошо."
 
         # Identity / who-are-you — common test phrases.
         identity = {
@@ -3520,7 +3530,8 @@ class VoiceListener(threading.Thread):
             "кто ты", "как тебя зовут",
         }
         if q in identity:
-            return "Я — Джарвіс, ваш AI-асистент. Готовий допомогти."
+            # R34-S54.1 Phase 7a: was UA "Я — Джарвіс, ваш AI-асистент. Готовий допомогти."
+            return "Я — Джарвис, ваш AI-ассистент. Готов помочь."
 
         # Sorry / apology — symmetric ack.
         apologies = {
@@ -3529,29 +3540,38 @@ class VoiceListener(threading.Thread):
             "извини", "извините",
         }
         if q in apologies:
-            return "Нічого, працюємо далі."
+            # R34-S54.1 Phase 7a: was UA "Нічого, працюємо далі."
+            return "Ничего, работаем дальше."
 
         # Quick yes/no questions about Jarvis capability are misleading
         # to canned — leave to LLM.
 
         # Common short questions that don't really need LLM — answer
         # straight away.
-        if q in {"котра година", "котра зараз година", "скільки часу", "який час"}:
+        # R34-S54.1 Phase 7a: weekday + month arrays and the formatted
+        # strings migrated UA→RU. Match-keys (q in {…}) still recognise
+        # UA utterances because Whisper continues to transcribe UA when
+        # the user code-switches; the RETURN is what gets spoken.
+        if q in {"котра година", "котра зараз година", "скільки часу", "який час",
+                 "сколько времени", "сколько сейчас времени", "который час",
+                 "what time is it"}:
             from datetime import datetime
             now = datetime.now()
-            weekday = ["понеділок", "вівторок", "середа", "четвер",
-                       "п'ятниця", "субота", "неділя"][now.weekday()]
-            return f"Зараз {now.strftime('%H:%M')}, {weekday}."
+            weekday = ["понедельник", "вторник", "среда", "четверг",
+                       "пятница", "суббота", "воскресенье"][now.weekday()]
+            return f"Сейчас {now.strftime('%H:%M')}, {weekday}."
 
         if q in {"яке сьогодні число", "яка дата", "який сьогодні день",
-                 "який день тижня", "сьогодні який день"}:
+                 "який день тижня", "сьогодні який день",
+                 "какое сегодня число", "какая дата", "какой сегодня день",
+                 "какой день недели", "сегодня какой день"}:
             from datetime import datetime
             now = datetime.now()
-            months = ["січня", "лютого", "березня", "квітня", "травня", "червня",
-                      "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
-            weekday = ["понеділок", "вівторок", "середа", "четвер",
-                       "п'ятниця", "субота", "неділя"][now.weekday()]
-            return f"Сьогодні {weekday}, {now.day} {months[now.month-1]} {now.year} року."
+            months = ["января", "февраля", "марта", "апреля", "мая", "июня",
+                      "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+            weekday = ["понедельник", "вторник", "среда", "четверг",
+                       "пятница", "суббота", "воскресенье"][now.weekday()]
+            return f"Сегодня {weekday}, {now.day} {months[now.month-1]} {now.year} года."
 
         # Compliment / nice — friendly echo.
         compliments = {
@@ -3628,8 +3648,9 @@ class VoiceListener(threading.Thread):
                     # never acquired; in the others it was acquired
                     # but already released by spawn_claude on its
                     # error path. Either way no release needed here.
+                    # R34-S54.1 Phase 7a: was UA.
                     self._speak_and_continue(
-                        "Не знайшов Claude Code CLI або інша самооновка вже триває."
+                        "Не нашёл Claude Code CLI или другое самообновление уже идёт."
                     )
                     return
                 # spawn_claude returned a live process → it acquired
@@ -3736,9 +3757,13 @@ class VoiceListener(threading.Thread):
                 current = getattr(self, "_active_language", "ru")
                 if lang_code != current:
                     self._pending_lang_switch = lang_code
+                    # R34-S54.1 Phase 7a: was UA. RU-only persona policy
+                    # means even the lang-switch confirmation prompt
+                    # speaks RU. The lang_code is preserved for
+                    # downstream policy.
                     self._speak_and_continue(
-                        f"Хочеш щоб я говорив {self._lang_name(lang_code)}? "
-                        f"Підтверди — скажи 'виконуй'."
+                        f"Хочешь чтобы я говорил {self._lang_name(lang_code)}? "
+                        f"Подтверди — скажи 'выполняй'."
                     )
                     return
             if getattr(self, "_pending_lang_switch", None):
@@ -3787,9 +3812,10 @@ class VoiceListener(threading.Thread):
             from ..agent.self_upgrade import is_upgrade_request
             if is_upgrade_request(query) and not getattr(self, "_pending_upgrade", None):
                 self._pending_upgrade = query
+                # R34-S54.1 Phase 7a: was UA.
                 self._speak_and_continue(
-                    "Запускаю самооновлення через Claude Code. "
-                    "Це може зайняти 5-15 хвилин. Підтверди — скажи 'виконуй'."
+                    "Запускаю самообновление через Claude Code. "
+                    "Это может занять 5-15 минут. Подтверди — скажи 'выполняй'."
                 )
                 return
             if getattr(self, "_pending_upgrade", None):
@@ -3797,7 +3823,8 @@ class VoiceListener(threading.Thread):
                 if _is_conf(query):
                     req = self._pending_upgrade
                     self._pending_upgrade = None
-                    self._speak_and_continue("Починаю самооновлення.")
+                    # R34-S54.1 Phase 7a: was UA "Починаю самооновлення."
+                    self._speak_and_continue("Начинаю самообновление.")
                     self._run_self_upgrade_async(req)
                     return
                 if _is_den(query):
@@ -4002,8 +4029,12 @@ class VoiceListener(threading.Thread):
             else:
                 # Stage for the next utterance's confirmation.
                 self._pending_action = action
-                if "підтверди" not in reply.lower():
-                    reply = reply.rstrip(".!?") + ". Підтверди — скажи 'виконуй'."
+                # R34-S54.1 Phase 7a: was UA "Підтверди — скажи 'виконуй'."
+                # Match BOTH UA and RU "підтверди"/"подтверди" stems so we
+                # don't double-append the suffix when the LLM already
+                # produced its own RU confirmation prompt.
+                if "підтверди" not in reply.lower() and "подтверди" not in reply.lower():
+                    reply = reply.rstrip(".!?") + ". Подтверди — скажи 'выполняй'."
 
         # Handle TTS with proper callbacks
         if reply and self.tts and self.tts.enabled:

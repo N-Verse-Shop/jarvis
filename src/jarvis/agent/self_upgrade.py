@@ -293,11 +293,14 @@ def wait_for_completion_and_restart(proc: subprocess.Popen, max_wait_sec: int = 
                 proc.terminate()
             except Exception:
                 pass
-            return False, "Самооновлення тривало надто довго, перервав."
+            # R34-S54.1 Phase 7a: UA→RU. These strings are returned to
+            # listener.py:_speak_and_continue → TTS, so they must match
+            # the RU-only persona policy.
+            return False, "Самообновление длилось слишком долго, прервал."
         time.sleep(2.0)
 
     if proc.returncode != 0:
-        return False, f"Самооновлення завершилось з помилкою (код {proc.returncode}). Перевір лог."
+        return False, f"Самообновление завершилось с ошибкой (код {proc.returncode}). Проверь лог."
 
     # Check if anything actually changed.
     try:
@@ -311,7 +314,7 @@ def wait_for_completion_and_restart(proc: subprocess.Popen, max_wait_sec: int = 
         status, commits = "", ""
 
     if not status and "self-upgrade" not in commits.lower():
-        return True, "Самооновлення завершено без змін у коді."
+        return True, "Самообновление завершено без изменений в коде."
 
     # Syntax check the main file.
     try:
@@ -319,7 +322,7 @@ def wait_for_completion_and_restart(proc: subprocess.Popen, max_wait_sec: int = 
         with (REPO / "src/jarvis/listening/listener.py").open() as f:
             ast.parse(f.read())
     except SyntaxError as e:
-        return False, f"Самооновлення зробило syntax error: {e}. Не перезапускаю."
+        return False, f"Самообновление сделало syntax error: {e}. Не перезапускаю."
 
     # All good — restart the daemon.
     try:
@@ -329,9 +332,9 @@ def wait_for_completion_and_restart(proc: subprocess.Popen, max_wait_sec: int = 
             timeout=10, check=False,
         )
     except Exception as e:
-        return True, f"Код оновлено, але не зміг перезапуститись: {e}. Перезапусти вручну."
+        return True, f"Код обновлён, но не смог перезапуститься: {e}. Перезапусти вручную."
 
-    return True, "Самооновлення завершено. Перезапускаюсь."
+    return True, "Самообновление завершено. Перезапускаюсь."
 
 
 def is_upgrade_request(query: str) -> bool:
