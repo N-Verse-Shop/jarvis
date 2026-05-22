@@ -22,6 +22,7 @@ from .builtin.stop import StopTool
 from .builtin.tool_search import ToolSearchTool
 from .builtin.mac_control import MacControlTool
 from .builtin.n8n import N8NTool
+from .builtin.claude_bridge import ClaudeCodeSpawnTool
 from .types import ToolExecutionResult
 from ..config import Settings
 from .external.mcp_client import MCPClient
@@ -49,6 +50,12 @@ BUILTIN_TOOLS = {
     # JARVIS_N8N_API_KEY env var (tool returns a friendly "configure
     # me" reply when unset, so registration is always safe).
     "n8nAutomation": N8NTool(),
+    # R35-S7: Claude Code bridge — Jarvis delegates dev tasks (create
+    # site, write code, fix bug, code review) to the local ``claude``
+    # CLI in headless mode. Uses the user's Claude Max 5x subscription,
+    # NOT the paid Anthropic API. Tool returns a friendly error if the
+    # ``claude`` binary is missing, so registration is always safe.
+    "claudeCodeSpawn": ClaudeCodeSpawnTool(),
 }
 
 # Global MCP tools cache

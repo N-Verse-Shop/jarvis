@@ -18,6 +18,8 @@ from .stop import StopTool
 from .mac_control import MacControlTool
 # R35-S1 — n8n workflow automation tool.
 from .n8n import N8NTool
+# R35-S7 — Claude Code bridge (delegates dev tasks to subscription, not API).
+from .claude_bridge import ClaudeCodeSpawnTool
 
 # Import supporting functions that may still be used elsewhere
 
@@ -34,4 +36,5 @@ __all__ = [
     'StopTool',
     'MacControlTool',
     'N8NTool',
+    'ClaudeCodeSpawnTool',
 ]
