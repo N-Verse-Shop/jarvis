@@ -314,6 +314,26 @@ class EventStream:
         with self._lock:
             try:
                 if self._fh is not None:
+                    # R34-S57 (B2.1): explicit flush + fsync on
+                    # shutdown so the final N lines (typically the
+                    # ``daemon_shutdown`` event plus any in-flight
+                    # tool replies) actually hit disk before the
+                    # process exits. Pre-fix, line-buffered ``flush``
+                    # only sent bytes to the OS — a SIGKILL during
+                    # the shutdown window could lose the last
+                    # several events from the kernel page cache.
+                    try:
+                        self._fh.flush()
+                    except Exception:
+                        pass
+                    try:
+                        import os as _os
+                        _os.fsync(self._fh.fileno())
+                    except (OSError, AttributeError):
+                        # fsync isn't supported on every filesystem
+                        # (encrypted overlays, some FUSE mounts).
+                        # flush() is still better than nothing.
+                        pass
                     self._fh.close()
                     self._fh = None
             except Exception:

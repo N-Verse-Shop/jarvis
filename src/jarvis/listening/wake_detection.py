@@ -12,7 +12,12 @@ def is_wake_word_at_start(
     aliases: List[str],
     fuzzy_ratio: float = 0.78,
     *,
-    max_tokens: int = 3,
+    # R34-S57 (B3.5): default bumped 3→5 to catch natural lead-ins.
+    # Real speech patterns like "Так, ну добре, Джарвіс, котра година?"
+    # have the wake-word at position 4 — failed under the old 3-token
+    # window. Five tokens still rejects long unrelated paragraphs
+    # that merely mention the assistant by name later.
+    max_tokens: int = 5,
 ) -> bool:
     """Strict variant: wake-word must appear at the START of the utterance.
 
@@ -30,10 +35,11 @@ def is_wake_word_at_start(
          tokens — preserving all of its fuzzy / prefix tolerance for
          genuine Whisper mishearings while bounding position.
 
-    ``max_tokens=3`` is generous enough for natural lead-in patterns
-    ("ok, Jarvis ..." / "Hey, Jarvis ..." / "Так, Джарвіс ...") but
-    tight enough to reject long unrelated paragraphs that merely
-    mention the assistant by name.
+    ``max_tokens=5`` is generous enough for natural lead-in patterns
+    ("ok, Jarvis ..." / "Hey, Jarvis ..." / "Так, ну добре, Джарвіс
+    ...") but tight enough to reject long unrelated paragraphs that
+    merely mention the assistant by name. R34-S57 bumped from 3 → 5
+    after observing real RU/UA speech with 4-token prefixes.
     """
     if not text_lower or not text_lower.strip():
         return False

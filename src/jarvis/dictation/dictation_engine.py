@@ -585,11 +585,25 @@ def _apply_custom_dictionary(text: str, dictionary: list) -> str:
     return text
 
 
-def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "gemma4:e2b", thinking: bool = False) -> str:
+# R34-S57 (A2-09): consecutive failure counter. After 3 silent
+# fallbacks in a row, emit a one-shot warning event so the HUD /
+# dashboard can surface "filler removal disabled — check Ollama"
+# to the user. Previously every dictation fell back silently on
+# wrong model name / wedged Ollama; the feature was permanently
+# disabled with zero user signal.
+_LLM_CLEAN_FAIL_STREAK = 0
+_LLM_CLEAN_FAIL_THRESHOLD = 3
+
+
+def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "qwen2.5:3b", thinking: bool = False) -> str:
     """Use the local LLM to remove filler words and tidy dictation output.
 
     Falls back to the original text if the LLM is unreachable or slow.
+    R34-S57 (C-P2.12): default model was ``gemma4:e2b`` which doesn't
+    exist on Ollama — switched to ``qwen2.5:3b`` to match the real
+    intent-judge default.
     """
+    global _LLM_CLEAN_FAIL_STREAK
     try:
         import requests
     except ImportError:
@@ -630,14 +644,46 @@ def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "gemma4:e
             cleaned = data.get("response", "").strip()
             if cleaned:
                 debug_log(f"LLM filler removal: {text!r} → {cleaned!r}", "dictation")
+                # Successful pass — reset streak so a future failure
+                # spree starts the warning countdown afresh.
+                _LLM_CLEAN_FAIL_STREAK = 0
                 return cleaned
+            _LLM_CLEAN_FAIL_STREAK += 1
+            debug_log(
+                "LLM filler removal returned empty response — using raw text",
+                "dictation",
+            )
         else:
+            _LLM_CLEAN_FAIL_STREAK += 1
             debug_log(
                 f"LLM filler removal HTTP {resp.status_code} — using raw text",
                 "dictation",
             )
     except Exception as exc:
+        _LLM_CLEAN_FAIL_STREAK += 1
         debug_log(f"LLM filler removal failed (using raw text): {exc}", "dictation")
+
+    # R34-S57 (A2-09): on the Nth consecutive failure, emit ONE
+    # warning event so the dashboard can surface the problem. The
+    # warning is throttled (only the FIRST trip past the threshold
+    # emits; subsequent failures still log but don't re-emit) to
+    # avoid noise.
+    try:
+        if _LLM_CLEAN_FAIL_STREAK == _LLM_CLEAN_FAIL_THRESHOLD:
+            from ..ipc.stream import get_stream as _get_stream
+            stream = _get_stream()
+            if stream is not None:
+                stream.emit(
+                    "dictation_warning",
+                    reason="llm_clean_failures",
+                    consecutive=_LLM_CLEAN_FAIL_STREAK,
+                    model=model,
+                    base_url=ollama_base_url,
+                    hint="Check Ollama is reachable and the model name in config matches",
+                )
+    except Exception:
+        # Never let observability errors block the dictation path.
+        pass
 
     return text
 

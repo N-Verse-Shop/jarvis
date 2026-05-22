@@ -303,7 +303,16 @@ class _ServerWorker:
 
     def start(self) -> None:
         async def _setup() -> None:
-            self._queue = asyncio.Queue()
+            # R34-S57 (D-F3.2): bound the worker queue. Previously an
+            # ``asyncio.Queue()`` with no maxsize meant a wedged MCP
+            # server (session hanging, deadlock inside the subprocess)
+            # would let invocations pile up indefinitely — each
+            # holding a future + arguments dict in memory. With a 256-
+            # slot cap and put_nowait on the producer side, the queue
+            # surfaces back-pressure as a typed error (``QueueFull``)
+            # the caller can route to a tool-level failure instead of
+            # silently leaking memory.
+            self._queue = asyncio.Queue(maxsize=256)
             self._task = asyncio.ensure_future(self._run())
 
         asyncio.run_coroutine_threadsafe(_setup(), self._loop).result(timeout=5)

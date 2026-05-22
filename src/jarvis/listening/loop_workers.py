@@ -101,6 +101,11 @@ _TASKS_LOCK = threading.Lock()
 _TASKS: list[_ScheduledTask] = []
 _SCHEDULER_THREAD: Optional[threading.Thread] = None
 _SCHEDULER_STOP = threading.Event()
+# R34-S57 (D-F2.2): guards the start() idempotency check + thread
+# creation as a single critical section. Without it, two concurrent
+# start() calls could both see ``_SCHEDULER_THREAD is None`` and
+# spawn two scheduler threads.
+_SCHEDULER_INIT_LOCK = threading.Lock()
 
 
 def register_task(
@@ -176,28 +181,45 @@ def _scheduler_loop() -> None:
                     if t.due(now_mono, now_dt):
                         due_tasks.append(t)
             for t in due_tasks:
+                # R34-S57 (D-F2.1): counter mutations now happen under
+                # _TASKS_LOCK so the dashboard's get_task_status()
+                # snapshot can't read a torn count (e.g. runs_completed
+                # incremented but last_status still "running"). The
+                # actual ``t.fn()`` runs OUTSIDE the lock so a slow
+                # task doesn't block scheduler ticks for other tasks.
+                _initial_status = "running"
+                with _TASKS_LOCK:
+                    t.last_status = _initial_status
+                _msg = ""
+                _exc: Exception | None = None
                 try:
-                    t.last_status = "running"
-                    msg = t.fn()
-                    t.last_status = "ok"
-                    t.last_message = (msg or "")[:240]
-                    t.runs_completed += 1
-                    t.last_error = ""
-                    debug_log(
-                        f"loop_workers: {t.name} ok — {t.last_message[:120]}",
-                        "voice",
-                    )
+                    _msg = t.fn() or ""
                 except Exception as exc:
-                    t.last_status = "error"
-                    t.last_error = repr(exc)[:240]
-                    t.runs_failed += 1
+                    _exc = exc
+                _now_mono = time.monotonic()
+                _now_date = now_dt.strftime("%Y-%m-%d")
+                with _TASKS_LOCK:
+                    if _exc is None:
+                        t.last_status = "ok"
+                        t.last_message = _msg[:240]
+                        t.runs_completed += 1
+                        t.last_error = ""
+                    else:
+                        t.last_status = "error"
+                        t.last_error = repr(_exc)[:240]
+                        t.runs_failed += 1
+                    t.last_run_monotonic = _now_mono
+                    t.last_run_date = _now_date
+                if _exc is None:
                     debug_log(
-                        f"loop_workers: {t.name} FAILED — {exc!r}",
+                        f"loop_workers: {t.name} ok — {(_msg or '')[:120]}",
                         "voice",
                     )
-                finally:
-                    t.last_run_monotonic = time.monotonic()
-                    t.last_run_date = now_dt.strftime("%Y-%m-%d")
+                else:
+                    debug_log(
+                        f"loop_workers: {t.name} FAILED — {_exc!r}",
+                        "voice",
+                    )
         except Exception as exc:
             # Scheduler MUST never die — log and continue.
             debug_log(f"loop_workers: scheduler tick crashed: {exc!r}", "voice")
@@ -209,16 +231,22 @@ def _scheduler_loop() -> None:
 def start() -> None:
     """Start the scheduler thread. Idempotent."""
     global _SCHEDULER_THREAD
-    if _SCHEDULER_THREAD is not None and _SCHEDULER_THREAD.is_alive():
-        return
-    _register_default_tasks()
-    _SCHEDULER_STOP.clear()
-    _SCHEDULER_THREAD = threading.Thread(
-        target=_scheduler_loop,
-        name="jarvis-loop-workers",
-        daemon=True,
-    )
-    _SCHEDULER_THREAD.start()
+    # R34-S57 (D-F2.2): the existence check + thread creation must
+    # run as one atomic critical section. Pre-fix, two concurrent
+    # ``start()`` calls (daemon boot path + dashboard restart hook
+    # racing the same call) could both see _SCHEDULER_THREAD as None
+    # and spawn duplicate scheduler threads.
+    with _SCHEDULER_INIT_LOCK:
+        if _SCHEDULER_THREAD is not None and _SCHEDULER_THREAD.is_alive():
+            return
+        _register_default_tasks()
+        _SCHEDULER_STOP.clear()
+        _SCHEDULER_THREAD = threading.Thread(
+            target=_scheduler_loop,
+            name="jarvis-loop-workers",
+            daemon=True,
+        )
+        _SCHEDULER_THREAD.start()
 
 
 def stop(timeout: float = 2.0) -> None:

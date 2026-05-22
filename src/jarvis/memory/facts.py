@@ -89,10 +89,17 @@ DEFAULT_HALF_LIFE_DAYS = 30.0
 DEFAULT_MIN_SCORE = 0.05
 
 
-_SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
+# R34-S57 (B4.1): PRAGMA journal_mode=WAL must NOT live inside
+# the executescript() blob — executescript implicitly wraps the
+# statements in a transaction, and SQLite ignores journal-mode
+# changes inside a transaction. Net effect: on first-DB-creation
+# the WAL pragma was silently dropped, so the daemon ran with the
+# rollback-journal default (slower writes, no concurrent readers
+# during a write). Second-run got the pragma because the schema
+# already existed. Fix: run the two PRAGMAs as standalone execute()
+# calls in _ensure_schema() and verify via SELECT.
 
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   key         TEXT    NOT NULL,
@@ -109,6 +116,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS facts_key_value ON facts(key, value);
 CREATE INDEX IF NOT EXISTS facts_key   ON facts(key);
 CREATE INDEX IF NOT EXISTS facts_ts    ON facts(ts_utc DESC);
 CREATE INDEX IF NOT EXISTS facts_score ON facts(tombstone, ts_utc);
+-- R34-S57 (B4.3): composite covering index for the hot path:
+-- ``WHERE tombstone=0 AND key LIKE 'user.%' ORDER BY ts_utc DESC``
+-- (used by render_facts_for_prompt every voice turn). Without it,
+-- a long-running deployment with thousands of facts post-filters
+-- ``tombstone=0`` after the LIKE prefix scan.
+CREATE INDEX IF NOT EXISTS facts_active_key ON facts(tombstone, key, ts_utc DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
   key, value,
@@ -128,6 +141,13 @@ CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
   INSERT INTO facts_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
 END;
 """
+
+# R34-S57 (B4.2): tiny migration framework. ``user_version`` is
+# stored in SQLite's header (PRAGMA user_version); bumping it
+# requires no schema changes. Each integer represents the schema
+# revision the code expects. Bump when adding/removing columns or
+# changing triggers; never reuse a number.
+_FACTS_SCHEMA_VERSION = 1
 
 
 # ---- redaction (same pattern as audit.py) ----
@@ -259,8 +279,49 @@ class FactStore:
             self._conn.execute("PRAGMA busy_timeout=5000")
         except Exception:
             pass
+        # R34-S57 (B4.1): apply WAL + synchronous=NORMAL OUTSIDE the
+        # executescript() transaction so the pragmas actually take
+        # effect on first-DB-creation. Verify post-condition so the
+        # daemon's debug log surfaces any silent fallback (e.g. a
+        # read-only filesystem that won't accept WAL).
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            cur = self._conn.execute("PRAGMA journal_mode").fetchone()
+            mode = (cur[0] if cur else "").lower() if cur else ""
+            if mode != "wal":
+                try:
+                    from ..debug import debug_log as _dlog
+                    _dlog(
+                        f"facts.db journal_mode is {mode!r} (expected wal) — "
+                        "writers may serialise with readers",
+                        "memory",
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         with self._lock:
             self._conn.executescript(_SCHEMA)
+        # R34-S57 (B4.2): tiny user_version migration runner. Today
+        # there's exactly one schema rev so the loop is a no-op for
+        # existing DBs (the IF NOT EXISTS clauses cover us), but the
+        # hook is here for future column additions — bump
+        # _FACTS_SCHEMA_VERSION and add a ``if v < N: ALTER TABLE…``
+        # block.
+        try:
+            cur = self._conn.execute("PRAGMA user_version").fetchone()
+            current_version = int(cur[0]) if cur and cur[0] is not None else 0
+            if current_version < _FACTS_SCHEMA_VERSION:
+                # Future migrations go here:
+                # if current_version < 2:
+                #     self._conn.execute("ALTER TABLE facts ADD COLUMN…")
+                self._conn.execute(
+                    f"PRAGMA user_version = {_FACTS_SCHEMA_VERSION}"
+                )
+        except Exception:
+            # Best-effort — a missing user_version isn't fatal.
+            pass
 
     # ---- mutation ----
 

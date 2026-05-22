@@ -46,9 +46,12 @@ from __future__ import annotations
 import asyncio
 import os
 import re as _re
+import time as _PROBE_TIME  # R34-S57 (A1-02): hot-path probe uses _PROBE_TIME.monotonic()
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+import numpy as _PROBE_NP  # R34-S57 (A1-01): hot-path RMS probe — hoisted to module level so per-frame ``import numpy`` dict lookups disappear
 
 from ..debug import debug_log
 
@@ -1538,8 +1541,12 @@ def _make_event_stream_processor():
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self._stream = get_stream()
+            # R34-S57 (A1-02): monotonic-cadence emit gating.
             self._last_emit_ts = 0.0
-            self._window_peak = 0.0
+            # R34-S57 (A1-01): track peak mean-square (int64) instead
+            # of peak RMS (float). Square root is computed ONCE per
+            # emit (1 Hz) instead of once per audio frame (50 Hz).
+            self._window_peak_ms = 0
             self._window_frame_count = 0
             self._window_sample_rate = 0
 
@@ -1549,32 +1556,51 @@ def _make_event_stream_processor():
             await super().process_frame(frame, direction)
             try:
                 if isinstance(frame, InputAudioRawFrame):
-                    import time as _t
-                    # Compute RMS of this frame's int16 audio.
-                    try:
-                        import numpy as _np
-                        arr = _np.frombuffer(frame.audio, dtype=_np.int16)
-                        if arr.size:
-                            arr_f = arr.astype(_np.float32) / 32768.0
-                            rms = float(_np.sqrt((arr_f * arr_f).mean()))
-                            if rms > self._window_peak:
-                                self._window_peak = rms
-                            self._window_frame_count += 1
-                            self._window_sample_rate = int(
-                                getattr(frame, "sample_rate", 0) or 0
-                            )
-                    except Exception:
-                        pass
-                    now = _t.time()
+                    # R34-S57 (A1-01/02): per-frame hot path optimised.
+                    # Previously this allocated a fresh float32 buffer
+                    # (``arr.astype(np.float32) / 32768.0``) plus a
+                    # second temp for ``arr_f * arr_f`` on every frame
+                    # at 50 Hz, and used ``time.time()`` (wall-clock,
+                    # NTP-step risk for the emit cadence). The numpy
+                    # imports happened inline on every call too —
+                    # cached after first lookup but still a dict
+                    # access per frame.
+                    #
+                    # Fix: int64 integer math (no float allocation),
+                    # peak tracking only (square root deferred until
+                    # emit), and ``time.monotonic`` for the 1 Hz
+                    # cadence. ``_np`` / ``_t`` are module-level
+                    # bindings now (see file head).
+                    arr = _PROBE_NP.frombuffer(frame.audio, dtype=_PROBE_NP.int16)
+                    if arr.size:
+                        # Mean square in int64 to avoid float alloc.
+                        # int16² fits in 31 bits, mean across ≤ 1280
+                        # frames stays well under 2⁶³ — safe in int64.
+                        ms = int((arr.astype(_PROBE_NP.int64) ** 2).mean())
+                        if ms > self._window_peak_ms:
+                            self._window_peak_ms = ms
+                        self._window_frame_count += 1
+                        sr = getattr(frame, "sample_rate", 0) or 0
+                        if sr:
+                            self._window_sample_rate = int(sr)
+                    now = _PROBE_TIME.monotonic()
                     if now - self._last_emit_ts >= 1.0:
+                        # Convert peak mean-square → peak RMS only at
+                        # the emit boundary (1 Hz), not per frame.
+                        if self._window_peak_ms > 0:
+                            peak_rms = (
+                                (self._window_peak_ms ** 0.5) / 32768.0
+                            )
+                        else:
+                            peak_rms = 0.0
                         self._stream.emit(
                             "pipecat_audio_rms",
-                            peak_rms=round(self._window_peak, 5),
+                            peak_rms=round(peak_rms, 5),
                             frames_in_window=self._window_frame_count,
                             sample_rate=self._window_sample_rate,
                         )
                         self._last_emit_ts = now
-                        self._window_peak = 0.0
+                        self._window_peak_ms = 0
                         self._window_frame_count = 0
             except Exception:
                 pass
