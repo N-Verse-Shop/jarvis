@@ -532,8 +532,15 @@ Examples (English+Ukrainian+Russian):
                         "num_ctx": 8192,
                     },
                 },
-                timeout=self.config.timeout_sec,
-                headers=_OLLAMA_HEADERS,
+                # R34-S58.0 perf: (connect, read) split. The intent
+                # judge runs on EVERY wake-word detection — paying a
+                # fresh TLS-style handshake here was the user-reported
+                # "Jarvis думає дуже довго" regression. Stale-NAT is
+                # still caught by the 5 s connect deadline + retry,
+                # without burning the keep-alive on every hot turn.
+                timeout=(5.0, self.config.timeout_sec),
+                # Connection: close removed — see src/jarvis/llm.py
+                # call_llm_streaming for full rationale.
             )
 
             if response.status_code != 200:

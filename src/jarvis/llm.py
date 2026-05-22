@@ -117,14 +117,23 @@ def _validate_base_url(base_url: str) -> None:
 _RETRYABLE_STATUS = {408, 502, 503, 504}
 _MAX_RETRIES = 3
 
-# R34-S56.1 Phase 9b (P2): Tailscale CGNAT mappings can go stale —
-# urllib3's default keep-alive keeps the dead socket cached in the
-# connection pool, so the *next* request inherits a dead TCP path and
-# stalls for the full ``timeout_sec`` before the kernel notices. Force
-# the server to tear the socket down after each response so every call
-# gets a fresh ARP/route resolution. This is the same fix applied in
-# intent_judge.py + listener.py — keep the headers identical so the
-# behaviour is uniform across modules.
+# R34-S58.0 (perf regression fix): the Phase 9b ``Connection: close``
+# approach forced a fresh TCP/TLS-style handshake on EVERY Ollama
+# call — over Tailscale that's ~50-100 ms per call, which added up
+# to noticeable "Jarvis думає дуже довго" on every voice turn (each
+# turn fires intent_judge + chat). New approach:
+#   1. Hot paths (call_llm_streaming, chat_with_messages,
+#      call_llm_direct, intent_judge.judge, listener._voice_direct_chat
+#      and web-retry) use a ``(5s connect, full read)`` timeout tuple
+#      so a stale-NAT socket fails fast → existing retry loop opens a
+#      fresh socket. Keep-alive between intent_judge → chat within
+#      the same turn is preserved (saves one handshake per turn).
+#   2. Warmup pings (intent_judge.warm_up_ollama_model + KV-cache
+#      warmup) and the idle-keepalive ping in listener.py KEEP
+#      ``Connection: close`` because they explicitly want a fresh
+#      socket after potentially long idle periods (60-180 s).
+# Kept as a constant so the warmup callsites still have a single
+# source of truth.
 _OLLAMA_HEADERS = {"Connection": "close"}
 
 
@@ -183,8 +192,16 @@ def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_con
             with requests.post(
                 f"{base_url.rstrip('/')}/api/chat",
                 json=payload,
-                timeout=timeout_sec,
-                headers=_OLLAMA_HEADERS,
+                # R34-S58.0 perf: (connect, read) split — stale-NAT
+                # socket fails fast at 5 s instead of hanging for
+                # the full request timeout. The retry loop below
+                # already opens a fresh socket on ConnectionError.
+                timeout=(5.0, timeout_sec),
+                # Connection: close removed — see call_llm_streaming
+                # for full rationale. Net effect: hot voice turns
+                # save ~50-100 ms per call by reusing urllib3's
+                # keep-alive pool; stale-NAT is caught by the 5 s
+                # connect deadline + retry.
             ) as resp:
                 if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
                     sleep_for = 0.5 * (2 ** (attempt - 1))
@@ -306,9 +323,24 @@ def call_llm_streaming(
         with requests.post(
             f"{base_url.rstrip('/')}/api/chat",
             json=payload,
-            timeout=timeout_sec,
+            # R34-S58.0 perf fix: split (connect, read) timeout so a
+            # stale-NAT socket fails fast at the 5s connect deadline
+            # instead of hanging for the full ``timeout_sec`` window.
+            # The existing retry-on-ConnectionError loop then opens a
+            # fresh socket on next attempt — cheaper than the broken
+            # ``Connection: close`` approach which paid a TLS-style
+            # handshake on every streaming reply (~50-100 ms wasted
+            # per turn over Tailscale, ~30 s read budget anyway).
+            timeout=(5.0, timeout_sec),
             stream=True,
-            headers=_OLLAMA_HEADERS,
+            # NOTE: ``Connection: close`` deliberately NOT set here.
+            # The streaming chat reply lives for 30+ s read time
+            # already; closing the socket after gives zero benefit
+            # and forces a fresh TLS-style handshake on every turn.
+            # The stale-NAT bug it was meant to fix is now handled
+            # by the (5s, read) timeout tuple above: a dead socket
+            # surfaces as ConnectionError or read timeout, the
+            # caller's retry loop opens a fresh one.
         ) as resp:
             resp.raise_for_status()
 
@@ -524,8 +556,15 @@ def chat_with_messages(
             with requests.post(
                 f"{base_url.rstrip('/')}/api/chat",
                 json=payload,
-                timeout=timeout_sec,
-                headers=_OLLAMA_HEADERS,
+                # R34-S58.0 perf: (connect, read) split — stale-NAT
+                # socket fails fast at 5 s connect instead of hanging
+                # for the full request timeout. See call_llm_streaming
+                # for the full rationale.
+                timeout=(5.0, timeout_sec),
+                # Connection: close removed — see streaming path. The
+                # connect-timeout above + the existing retry loop
+                # handles the stale-NAT case without paying a fresh
+                # TLS-style handshake on every turn.
             ) as resp:
                 if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
                     try:

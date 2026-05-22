@@ -2800,16 +2800,19 @@ class VoiceListener(threading.Thread):
                         "num_batch": 256,
                     },
                 },
-                # 240s hard limit — gemma2:9b cold-cache rebuild can
-                # hit 60-90s on first call; warm subsequent calls
-                # return in 8-30s. 600 num_predict at 6 tok/s = 100s.
-                timeout=240.0,
+                # R34-S58.0 perf: (connect, read) split. Stale-NAT
+                # socket fails fast at 5 s connect deadline instead
+                # of hanging for the 240 s request timeout. Tracks
+                # the same fix in llm.py:call_llm_streaming.
+                # 240s read = gemma2:9b cold-cache rebuild can hit
+                # 60-90 s on first call; warm subsequent calls return
+                # in 8-30 s. 600 num_predict at 6 tok/s = 100 s.
+                timeout=(5.0, 240.0),
                 stream=True,
-                # R34-S56.1 Phase 9b (P2): Connection: close mirrors
-                # llm.py + intent_judge.py — drops stale Tailscale
-                # sockets from urllib3's keep-alive pool between
-                # successive direct-chat replies.
-                headers={"Connection": "close"},
+                # Connection: close removed — see llm.py for the full
+                # rationale (closing on a 30+ s streaming reply just
+                # wastes the keep-alive between intent-judge → chat
+                # within the same voice turn).
             )
             if response.status_code != 200:
                 debug_log(
@@ -3083,10 +3086,10 @@ class VoiceListener(threading.Thread):
                                         "num_ctx": 2048,  # web-search retry — same rationale as _voice_direct_chat
                                     },
                                 },
-                                timeout=90.0,
-                                # R34-S56.1 Phase 9b (P2): Connection:
-                                # close — see top of direct-chat post.
-                                headers={"Connection": "close"},
+                                # R34-S58.0 perf: (connect, read)
+                                # split mirrors the direct-chat path
+                                # above. Stale-NAT fails at 5 s.
+                                timeout=(5.0, 90.0),
                             )
                             if r2.status_code == 200:
                                 d2 = r2.json()

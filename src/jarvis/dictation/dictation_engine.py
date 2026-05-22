@@ -634,10 +634,13 @@ def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "qwen2.5:
                 "stream": False,
                 "think": thinking,
             },
-            timeout=5,
-            # R34-S56.1 Phase 9b (P2) parity: drop stale Tailscale
-            # sockets between dictation calls.
-            headers={"Connection": "close"},
+            # R34-S58.0 perf: (connect, read) split. Dictation paste
+            # blocks on this call — paying a fresh TLS-style handshake
+            # for every dictation was part of the user-reported
+            # slowness. Fail-fast at 2 s connect (dictation feels
+            # broken if anything past 5 s blocks the paste).
+            timeout=(2.0, 5.0),
+            # Connection: close removed — see llm.py for rationale.
         )
         if resp.status_code == 200:
             data = resp.json()

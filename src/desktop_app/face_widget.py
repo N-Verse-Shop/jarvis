@@ -35,7 +35,7 @@ import time as _time
 from typing import Optional, List, Tuple
 from enum import Enum
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QApplication
-from PyQt6.QtGui import QPainter, QPen, QColor, QBrush, QPainterPath, QLinearGradient, QRadialGradient
+from PyQt6.QtGui import QPainter, QPen, QColor, QBrush, QPainterPath, QLinearGradient, QRadialGradient, QCursor
 from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal, QObject
 
 
@@ -1255,11 +1255,52 @@ class FaceWindow(QWidget):
         layout.addWidget(self.face)
 
         # Position on the right side of the screen
-        self._position_on_right()
+        # R34-S58.0 (C-P2.9 fix): the HUD now follows whichever screen
+        # the cursor is currently on. Pre-fix it was pinned to
+        # ``primaryScreen()`` — users on a 2-monitor setup saw the
+        # HUD stuck on the primary while they worked on the
+        # secondary. Identical fix already shipped for the Electron
+        # HUD in commit c613a41 (R34-S47); the PyQt FaceWindow path
+        # was missed at the time.
+        self._current_screen_name: Optional[str] = None
+        self._position_on_active_screen()
 
-    def _position_on_right(self):
-        """Position the window on the right side of the screen, vertically centered."""
-        screen = QApplication.primaryScreen()
+        # Poll every 750 ms to detect the user dragging their cursor
+        # to a different display. Pure read of QCursor.pos(); cheap
+        # — no syscall on the hot path. Window only re-positions
+        # when the screen-under-cursor changes, so a user with the
+        # cursor parked on one screen never sees flicker.
+        self._screen_follow_timer = QTimer(self)
+        self._screen_follow_timer.setInterval(750)
+        self._screen_follow_timer.timeout.connect(self._maybe_follow_active_screen)
+        self._screen_follow_timer.start()
+
+    def _active_screen(self):
+        """Return the QScreen the cursor is currently on, or the primary screen.
+
+        ``QApplication.screenAt(QPoint)`` returns ``None`` if the
+        cursor is in dead zones between displays (e.g. a sliver of
+        empty geometry on a multi-display setup with offset
+        resolutions). Falling back to the primary screen keeps the
+        HUD visible rather than disappearing off-screen.
+        """
+        try:
+            cur = QCursor.pos()
+            screen = QApplication.screenAt(cur)
+            if screen is not None:
+                return screen
+        except Exception:
+            pass
+        return QApplication.primaryScreen()
+
+    def _position_on_active_screen(self):
+        """Position the window on the right side of the *active* screen.
+
+        Same vertical-centered, 20px-from-right-edge geometry as
+        the legacy ``_position_on_right`` but now anchored to the
+        screen the cursor is on.
+        """
+        screen = self._active_screen()
         if screen is None:
             return
 
@@ -1267,12 +1308,34 @@ class FaceWindow(QWidget):
         window_width = self.width()
         window_height = self.height()
 
-        # Position on right side with margin, vertically centered
         margin = 20
         x = screen_geometry.right() - window_width - margin
         y = screen_geometry.top() + (screen_geometry.height() - window_height) // 2
 
         self.move(x, y)
+        # Track the screen we just snapped to so the poll timer
+        # only re-positions on an actual screen change.
+        try:
+            self._current_screen_name = screen.name()
+        except Exception:
+            self._current_screen_name = None
+
+    def _maybe_follow_active_screen(self):
+        """Poll callback — re-position only when the active screen changes."""
+        try:
+            screen = self._active_screen()
+            if screen is None:
+                return
+            name = screen.name() if screen is not None else None
+            if name != self._current_screen_name:
+                self._position_on_active_screen()
+        except Exception:
+            # Never let a QScreen API hiccup crash the HUD.
+            pass
+
+    # Back-compat alias for any external caller (HUD bus, tests).
+    def _position_on_right(self):
+        self._position_on_active_screen()
 
     def set_expression(self, expression: Expression):
         """Set the face expression."""
