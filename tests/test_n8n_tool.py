@@ -110,8 +110,11 @@ class _StubClient:
                 return w_new
         raise N8NError("not found", status=404)
 
-    def delete_workflow(self, wf_id: str) -> bool:
-        self.calls.append(("delete_workflow", wf_id))
+    def delete_workflow(self, wf_id: str, *, force: bool = False) -> bool:
+        self.calls.append(("delete_workflow", wf_id, force))
+        # mirror the real client's safety gate
+        if not force:
+            raise N8NError("force=True required")
         for w in list(self.workflows):
             if w.id == wf_id:
                 self.workflows.remove(w)
@@ -342,6 +345,19 @@ def test_op_delete_with_confirm():
     assert result.success is True
     assert "удалил" in (result.reply_text or "").lower()
     assert len(stub.workflows) == 0
+    # R35-S3 P3-32: verify the tool passed force=True to the client
+    delete_calls = [c for c in stub.calls if c[0] == "delete_workflow"]
+    assert delete_calls
+    assert delete_calls[0][2] is True  # force kwarg
+
+
+def test_client_delete_workflow_refuses_without_force():
+    """P3-32: direct client call without force=True raises."""
+    from jarvis.integrations.n8n_client import N8NClient
+    c = N8NClient(api_key="eyJabc1234567890defGHIjklMNOpqrSTUv")
+    with pytest.raises(N8NError) as exc:
+        c.delete_workflow("xyz")
+    assert "force" in str(exc.value).lower()
 
 
 # ─── op=create_from_template ───────────────────────────────────────────

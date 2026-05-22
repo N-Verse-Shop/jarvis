@@ -571,7 +571,10 @@ class N8NTool(Tool):
             return ToolExecutionResult(
                 success=True, reply_text=f"Не нашёл автоматизацию '{ref}'.",
             )
-        client.delete_workflow(wf.id)
+        # R35-S3 P3-32: client now requires explicit force=True even
+        # after the tool-layer confirm. The voice flow has already
+        # consented via args["confirm"], so we pass force=True here.
+        client.delete_workflow(wf.id, force=True)
         return ToolExecutionResult(
             success=True, reply_text=f"Удалил '{wf.name}'.",
         )

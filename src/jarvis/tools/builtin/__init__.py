@@ -16,6 +16,8 @@ from .weather import WeatherTool
 from .stop import StopTool
 # Audit round 20 P3 — Mac-control capability.
 from .mac_control import MacControlTool
+# R35-S1 — n8n workflow automation tool.
+from .n8n import N8NTool
 
 # Import supporting functions that may still be used elsewhere
 
@@ -31,4 +33,5 @@ __all__ = [
     'WeatherTool',
     'StopTool',
     'MacControlTool',
+    'N8NTool',
 ]

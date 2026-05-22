@@ -408,9 +408,21 @@ class N8NClient:
         data = self._request("PUT", f"/workflows/{workflow_id}", json_body=definition)
         return Workflow.from_api(data)
 
-    def delete_workflow(self, workflow_id: str) -> bool:
-        """Hard-delete a workflow. Irreversible — voice flows MUST gate
-        this with a user confirmation."""
+    def delete_workflow(self, workflow_id: str, *, force: bool = False) -> bool:
+        """Hard-delete a workflow. Irreversible.
+
+        R35-S3 P3-32: defense-in-depth — the client itself refuses to
+        proceed without ``force=True``. Voice flows already gate by
+        ``confirm=true`` at the tool layer, but if a future caller
+        bypasses that path (script, third-party adapter, raw REPL),
+        the client refuses by default. Set ``force=True`` at the call
+        site to acknowledge the destructiveness.
+        """
+        if not force:
+            raise N8NError(
+                "delete_workflow refused: pass force=True to acknowledge "
+                "this is an irreversible destructive operation"
+            )
         self._request("DELETE", f"/workflows/{workflow_id}", expect_json=False)
         return True
 
@@ -551,3 +563,21 @@ def get_n8n_client(cfg: Optional[Any] = None) -> N8NClient:
                 key = getattr(cfg, "n8n_api_key", None) or None
             _GLOBAL_CLIENT = N8NClient(base_url=base, api_key=key)
         return _GLOBAL_CLIENT
+
+
+def shutdown_n8n_client() -> None:
+    """Close the singleton's HTTP session if any.
+
+    R35-S3 P3-36: called from daemon.request_stop so the connection
+    pool is cleanly torn down. Calling this is idempotent + safe to
+    invoke from arbitrary threads (the lock + the singleton's own
+    RLock serialise access).
+    """
+    global _GLOBAL_CLIENT
+    with _GLOBAL_CLIENT_LOCK:
+        if _GLOBAL_CLIENT is not None:
+            try:
+                _GLOBAL_CLIENT.close()
+            except Exception:
+                pass
+            _GLOBAL_CLIENT = None

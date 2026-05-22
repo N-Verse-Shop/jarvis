@@ -78,6 +78,12 @@ def request_stop() -> None:
         # Never let shutdown-side imports raise — graceful stop must
         # always succeed even when warmup module is partially loaded.
         pass
+    # R35-S3 P3-36: tear down the n8n HTTP session pool.
+    try:
+        from .integrations.n8n_client import shutdown_n8n_client
+        shutdown_n8n_client()
+    except Exception:
+        pass
 
 
 def set_diary_update_callbacks(

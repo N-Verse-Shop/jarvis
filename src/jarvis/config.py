@@ -567,6 +567,13 @@ def get_default_config() -> Dict[str, Any]:
         "tts_chatterbox_audio_prompt": None,  # Path to audio file for voice cloning
         "tts_chatterbox_exaggeration": 0.5,  # Emotion exaggeration (0.0-1.0+)
         "tts_chatterbox_cfg_weight": 0.5,  # CFG weight for quality/speed trade-off
+        # R35-S3 P3-34: per-language SystemTTS voice override map.
+        # Empty dict = fall back to SystemTTS's hardcoded language→voice
+        # mapping. Populate with e.g. {"ru": "piper:ruslan-medium",
+        # "uk": "piper:lada"} to point a language at a specific piper /
+        # macOS "say" voice. Surface here so the dashboard's
+        # "reset-to-defaults" path round-trips without dropping the field.
+        "tts_system_voice_map": {},
 
         # Piper TTS
         "tts_piper_model_path": None,  # Path to .onnx voice model
@@ -649,6 +656,11 @@ def get_default_config() -> Dict[str, Any]:
         "hot_window_enabled": True,
         "hot_window_seconds": 3.0,
         "hot_window_persistent": False,  # If True, hot window never auto-expires
+        # R35-S3 P3-34: were declared in Settings but missing from this dict.
+        # Persistent-mode bounds — match the inline literals in load_settings
+        # so the dashboard's "reset to defaults" actually resets these.
+        "hot_window_max_session_seconds": 1800.0,  # 30 min absolute cap
+        "hot_window_max_idle_seconds": 180.0,  # 3 min idle cap
         "echo_energy_threshold": 2.0,
         "echo_tolerance": 0.3,  # Time tolerance for echo detection timing
 
