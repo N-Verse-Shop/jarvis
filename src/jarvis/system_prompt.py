@@ -101,9 +101,14 @@ _SYSTEM_PROMPT_TEMPLATE: str = (
     "Стиль: серьёзный, лаконичный, billionaire CEO tone, gravitas. "
     "БЕЗ преамбул ('Конечно!', 'Of course!', 'Sure!'), БЕЗ markdown, "
     "БЕЗ пересказывания вопроса. Отвечай 1–3 короткими предложениями для voice. "
-    "Языки: RU — главный, UA — второй, DE и EN — по необходимости. "
-    "СТРОГО: отвечай ТЕМ ЖЕ языком, что и запрос. Если запрос "
-    "просит 'по-українськи' / 'in English' / 'auf Deutsch' — переключайся. "
+    # R34-S52 H: was a self-contradicting block — said "RU primary"
+    # then immediately said "switch to UA / EN / DE if asked". After
+    # R34-S48/S51 the policy is RU-only outbound. The persona prompt
+    # must reflect that single rule, not the legacy multi-language
+    # branching. Switch instructions removed.
+    "Понимай украинский, английский и немецкий, но ОТВЕЧАЙ ВСЕГДА "
+    "по-русски. Никогда не используй украинские слова, буквы (і, ї, "
+    "є, ґ) или окончания. Никаких ответов на UA/EN/DE даже по просьбе. "
     "Технические термины (GitLab CI, Hetzner, DACH, Tailscale, Ollama, Qdrant) — НЕ переводи. "
     "Если запрос серьёзный (ошибка, деньги, здоровье) — без шуток, конкретно. "
     "Если чего-то не знаешь — говори прямо, не выдумывай."
@@ -210,37 +215,29 @@ def _cached_time_block(minute_bucket) -> str:
         # Evict everything else — only the current minute is useful.
         _TIME_BLOCK_CACHE.clear()
     idx = minute_bucket.weekday()  # 0=Mon … 6=Sun
-    weekday_uk = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця",
-                  "субота", "неділя"][idx]
     weekday_ru = ["понедельник", "вторник", "среда", "четверг", "пятница",
                   "суббота", "воскресенье"][idx]
-    weekday_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag",
-                  "Samstag", "Sonntag"][idx]
     weekday_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday"][idx]
-    months_uk = ["січня", "лютого", "березня", "квітня", "травня", "червня",
-                 "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
     months_ru = ["января", "февраля", "марта", "апреля", "мая", "июня",
                  "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-    months_de = ["Januar", "Februar", "März", "April", "Mai", "Juni",
-                 "Juli", "August", "September", "Oktober", "November", "Dezember"]
-    months_en = ["January", "February", "March", "April", "May", "June",
-                 "July", "August", "September", "October", "November", "December"]
     m = minute_bucket.month - 1
-    # R34-S51 — time_block rewritten in Russian only. Previously the
-    # block was authored in Ukrainian ("Поточний час", "Це єдина
-    # правда — НЕ вигадуй...") and the model parroted those phrases
-    # verbatim ("Поточний час 15:30") which then reached TTS as UA.
-    # Multilingual day/month names are kept for context (the model
-    # picks the right one when asked in a non-RU language), but the
-    # instruction text itself is Russian-only.
+    # R34-S52 H: dropped UA + DE weekday/month names. The previous
+    # block dumped four-language day/month names (`пʼятниця`, `липня`,
+    # …) into the prompt every minute as raw tokens — small qwen3:8b
+    # picked them up and parroted UA when answering time/date
+    # questions. RU-only persona means the prompt should also be
+    # RU-only. English ISO date is retained as a stable date-arithmetic
+    # anchor — short, doesn't trigger language drift. R34-S51 RU-only
+    # instruction text is unchanged.
     time_block = (
         f" Текущее время: {minute_bucket.strftime('%H:%M, %d')} "
-        f"{months_ru[m]} / {months_en[m]} / {months_de[m]} / {months_uk[m]} {minute_bucket.year}, "
-        f"{weekday_ru} / {weekday_en} / {weekday_de} / {weekday_uk}. "
+        f"{months_ru[m]} {minute_bucket.year} "
+        f"({minute_bucket.strftime('%Y-%m-%d')} {weekday_en}), "
+        f"{weekday_ru}. "
         f"Это единственная правда о дате/времени — НЕ выдумывай другой "
         f"день/месяц. Когда спрашивают время — отвечай коротко "
-        f"'сейчас {minute_bucket.strftime('%H:%M')}' по-русски."
+        f"«сейчас {minute_bucket.strftime('%H:%M')}» по-русски."
     )
     with _TIME_BLOCK_CACHE_LOCK:
         _TIME_BLOCK_CACHE[minute_bucket] = time_block

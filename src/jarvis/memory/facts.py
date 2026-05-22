@@ -611,6 +611,27 @@ def render_facts_for_prompt(
     if not picked:
         return ""
     s.touch_many([f.id for f in picked])
-    lines = ["Known about you:"]
-    lines.extend(f"- {f.value}" for f in picked)
+    # R34-S52 H: was English "Known about you:" — injected as the
+    # header on every voice turn's system prompt, biasing the model
+    # toward English. RU-only persona means the header is RU too.
+    lines = ["Что я знаю о тебе:"]
+    # R34-S52 H: filter out facts that would re-inject a non-Russian
+    # language preference into the prompt. Even after the
+    # language_lock_block always returns RU, a stored
+    # ``user.preference.voice_lang: uk`` fact rendered here gives the
+    # model conflicting signals ("user wants UA"). We hide any
+    # language-preference fact whose value is not "ru".
+    def _is_ua_or_en_lang_pref(fact: Fact) -> bool:
+        key_lower = (fact.key or "").lower()
+        val_lower = (fact.value or "").lower()
+        if "voice_lang" in key_lower or "language" in key_lower:
+            if "ru" not in val_lower:
+                return True
+        return False
+    for f in picked:
+        if _is_ua_or_en_lang_pref(f):
+            continue
+        lines.append(f"- {f.value}")
+    if len(lines) == 1:
+        return ""
     return "\n".join(lines)

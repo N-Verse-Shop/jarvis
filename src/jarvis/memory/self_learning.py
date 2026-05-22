@@ -149,13 +149,18 @@ _PATTERNS: List[Tuple[re.Pattern, str, str]] = [
     (re.compile(r"\bпью\s+([\w\s\-]{1,40}?)\s+кофе\b",                  re.IGNORECASE), "user.preference.coffee", "кофе: {0}"),
     (re.compile(r"\bi drink\s+([\w\s\-]{1,40}?)\s+coffee\b",            re.IGNORECASE), "user.preference.coffee", "coffee: {0}"),
 
-    # Language preference for voice
-    (re.compile(r"\b(?:говори|відповідай|відповідайте)\s+(?:зі мною\s+)?українською\b",  re.IGNORECASE),
-                                                                            "user.preference.voice_lang", "voice language: uk"),
+    # Language preference for voice.
+    # R34-S52 H: the UA and EN regex captures used to write
+    # ``user.preference.voice_lang: uk`` / ``: en`` into facts.db,
+    # which then re-injected the conflicting preference into every
+    # voice-path system prompt via render_facts_for_prompt. R34-S48/S51
+    # made RU the only outbound language. The UA + EN patterns are
+    # removed; only the RU pattern remains so the user can still
+    # explicitly confirm Russian. (render_facts_for_prompt also
+    # filters out non-RU voice_lang facts as a belt-and-braces
+    # defence — see memory/facts.py.)
     (re.compile(r"\b(?:говори|отвечай)\s+(?:со мной\s+)?на\s+русском\b",   re.IGNORECASE),
                                                                             "user.preference.voice_lang", "voice language: ru"),
-    (re.compile(r"\bspeak\s+(?:to me\s+)?in english\b",                    re.IGNORECASE),
-                                                                            "user.preference.voice_lang", "voice language: en"),
 
     # Birthday / age (light touch — confidence 0.6 because of false positives)
     (re.compile(r"\bмені\s+(\d{1,2})\s+рок[іиу]в?", re.IGNORECASE), "user.age", "вік: {0}"),

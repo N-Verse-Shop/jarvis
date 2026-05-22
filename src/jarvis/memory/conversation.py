@@ -1202,6 +1202,8 @@ def generate_conversation_summary(
 
     system_prompt = """You are a conversation summariser for a personal AI assistant. Your job is to create concise daily summaries of conversations that will be stored in a diary for future reference.
 
+R34-S52 H: language rule — write the summary IN RUSSIAN. The user is a Russian speaker (CEO of Nexus Studio, Rehburg-Loccum). The diary is read back into future turns and re-injected into the assistant's system prompt; if the summary is English, the assistant drifts to English on the next turn. Use Russian sentence structure, Russian verbs, Russian nouns. Proper nouns and technical terms (GitLab, Hetzner, qwen3, Cloudflare) stay in their canonical form. The BAD/GOOD examples below are in English for clarity of the rules — your OUTPUT must still be Russian.
+
 Create a summary that:
 1. Captures the key topics discussed and important information shared
 2. Is concise but informative (max 200 words)
@@ -1243,6 +1245,13 @@ Create a summary that:
      MAL: "El usuario preguntó por una película. El asistente dijo que no tenía información."
    Spanish — correct:
      BIEN: "El usuario preguntó por una película."
+
+   Russian (the LANGUAGE YOU MUST USE) — what NOT to write:
+     ПЛОХО: "Пользователь спросил про фильм. Ассистент сказал, что не имеет информации."
+     ПЛОХО: "Пользователь спросил про погоду. Ассистент предложил поискать в интернете."
+   Russian — correct:
+     ХОРОШО: "Пользователь спросил про фильм Posessor."
+     ХОРОШО: "Пользователь обсуждал планы на отпуск в Анталье."
 
    This rule has no exceptions and applies in every language.
 7. CRITICAL attribution rule — record what was SAID faithfully, but make clear WHO said it. The diary is a log of the conversation, not a fact sheet, so preserve the actual content (including the assistant's answers, because a later session may need them — and because the user may later correct a wrong answer, and we want the whole chain on record). What must not happen is quietly promoting an assistant claim into an unattributed fact, because the assistant may hallucinate.
