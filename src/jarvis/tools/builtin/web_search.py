@@ -1024,7 +1024,16 @@ class WebSearchTool(Tool):
             if search_results:
                 if instant_results or fetched_content:
                     all_results.append("**Other search results:**")
+                # R34-S58.3 B4.3: fence the link-list block the same
+                # way the auto-fetch extract is fenced. Result titles
+                # and snippets come straight from third-party search
+                # providers and can carry injected instructions
+                # ("ignore previous instructions and..."). Small models
+                # still occasionally honour these; the fence makes the
+                # boundary explicit and catchable in evals.
+                all_results.append("<<<BEGIN UNTRUSTED LINK LIST>>>")
                 all_results.extend(search_results)
+                all_results.append("<<<END UNTRUSTED LINK LIST>>>")
 
             # Format results with explicit instruction for the LLM to use this data.
             # Small LLMs often need explicit guidance to use tool results.

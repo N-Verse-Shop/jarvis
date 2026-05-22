@@ -412,7 +412,33 @@ class LowPolyFaceWidget(QWidget):
 
         # Blink timer (random intervals)
         self._schedule_next_blink()
-        
+
+    # R34-S58.3 C1.1: stop timers when widget is hidden so they don't keep
+    # firing in the background. Restart on show. Previously the animation
+    # timer ran at 30 FPS for the entire daemon lifetime even when the
+    # widget was hidden (Close-to-Standby HUD UX).
+    def hideEvent(self, event):
+        try:
+            self._animation_timer.stop()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        try:
+            if not self._animation_timer.isActive():
+                self._animation_timer.start(33)
+        except Exception:
+            pass
+        super().showEvent(event)
+
+    def closeEvent(self, event):
+        try:
+            self._animation_timer.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def _schedule_next_blink(self):
         """Schedule the next blink at a random interval."""
         interval = random.randint(2000, 5000)  # 2-5 seconds
@@ -1336,6 +1362,32 @@ class FaceWindow(QWidget):
     # Back-compat alias for any external caller (HUD bus, tests).
     def _position_on_right(self):
         self._position_on_active_screen()
+
+    # R34-S58.3 C1.1: lifecycle hooks for `_screen_follow_timer`. Without
+    # these the 750 ms QTimer kept polling QCursor.pos() forever after the
+    # window was closed/hidden — small but real CPU + battery cost on
+    # Close-to-Standby cycles. Restart on show.
+    def hideEvent(self, event):
+        try:
+            self._screen_follow_timer.stop()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        try:
+            if not self._screen_follow_timer.isActive():
+                self._screen_follow_timer.start()
+        except Exception:
+            pass
+        super().showEvent(event)
+
+    def closeEvent(self, event):
+        try:
+            self._screen_follow_timer.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def set_expression(self, expression: Expression):
         """Set the face expression."""

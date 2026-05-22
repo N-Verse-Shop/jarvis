@@ -718,6 +718,14 @@ class StateManager:
         Args:
             voice_debug: Whether to enable debug logging
         """
+        # R34-S58.3 C3.1: persistent mode opts out of all auto-expiry —
+        # matches the guard in `_schedule_hot_window_expiry` and
+        # `_should_expire_hot_window`. Without this, an external caller
+        # invoking expire_hot_window() (e.g. stop-command path) would
+        # close a window the user explicitly asked to stay open.
+        if getattr(self, "hot_window_persistent", False):
+            debug_log("expire_hot_window: skipped, persistent mode", "state")
+            return
         # Cancel expiry timer since we're manually expiring
         self._cancel_hot_window_expiry_timer()
 

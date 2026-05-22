@@ -6,7 +6,7 @@ Handles memory enrichment, tool planning and execution.
 
 from __future__ import annotations
 import threading
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from ..utils.redact import redact
 from ..system_prompt import build_system_prompt
@@ -46,6 +46,7 @@ from ..utils.time_context import format_time_context
 
 if TYPE_CHECKING:
     from ..memory.db import Database
+    from ..memory.conversation import DialogueMemory  # R34-S58.3 D4.1
 
 
 # Audit round 16 fix: diary entries, graph node data, and the distilled

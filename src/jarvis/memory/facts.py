@@ -122,6 +122,12 @@ CREATE INDEX IF NOT EXISTS facts_score ON facts(tombstone, ts_utc);
 -- a long-running deployment with thousands of facts post-filters
 -- ``tombstone=0`` after the LIKE prefix scan.
 CREATE INDEX IF NOT EXISTS facts_active_key ON facts(tombstone, key, ts_utc DESC);
+-- R34-S58.3 (P2-C2.2): sibling index on ``last_used DESC`` because
+-- ``all()`` / ``by_key()`` now sort by ``MAX(ts_utc, last_used)`` so
+-- recently-touched old facts (re-asserted via ``add()``'s
+-- duplicate-bump path) still surface near the top. Without this
+-- index the new ORDER BY falls back to a full sort.
+CREATE INDEX IF NOT EXISTS facts_last_used ON facts(last_used DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
   key, value,
@@ -362,31 +368,85 @@ class FactStore:
                 )
                 return int(cur.lastrowid)
             # Bump existing row.
+            # R34-S58.3 (P2-C2.4): also UPDATE source so audit filtering
+            # by ``source="manual"`` reflects the most-recent assertion.
+            # Previously a value first stored as ``"diary"`` and later
+            # re-asserted via the manual CLI kept the original source —
+            # which silently broke the "show me what I told Jarvis
+            # myself" audit lens.
             new_conf = min(1.0, row["confidence"] + (1.0 - row["confidence"]) * 0.5)
             self._conn.execute(
                 "UPDATE facts SET ts_utc=?, last_used=?, confidence=?, "
-                "                 tombstone=0 WHERE id=?",
-                (now, now, new_conf, row["id"]),
+                "                 source=?, tombstone=0 WHERE id=?",
+                (now, now, new_conf, source, row["id"]),
             )
             return int(row["id"])
 
     def delete(self, fact_id: int) -> bool:
-        """Soft delete (tombstone). Returns True if a row was hit."""
+        """Soft delete (tombstone). Returns True if a row was hit.
+
+        R34-S58.3 (P2-C2.3): tombstoning is an UPDATE, not a DELETE, so
+        the ``facts_ad`` trigger doesn't fire and the row stays in
+        ``facts_fts``. A user-deleted secret would keep influencing
+        FTS5 ranking on later searches. Emit an explicit FTS5 delete
+        directive so the row is purged from the inverted index even
+        though the SQL row is preserved for audit history.
+        """
         with self._lock:
-            cur = self._conn.execute(
-                "UPDATE facts SET tombstone=1 WHERE id=? AND tombstone=0",
+            row = self._conn.execute(
+                "SELECT id, key, value FROM facts WHERE id=? AND tombstone=0",
                 (int(fact_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            self._conn.execute(
+                "UPDATE facts SET tombstone=1 WHERE id=?",
+                (int(row["id"]),),
             )
-            return cur.rowcount > 0
+            # Purge from FTS5 — the row is soft-deleted from the
+            # primary table but the trigger only fires on hard DELETE.
+            try:
+                self._conn.execute(
+                    "INSERT INTO facts_fts(facts_fts, rowid, key, value) "
+                    "VALUES('delete', ?, ?, ?)",
+                    (int(row["id"]), row["key"], row["value"]),
+                )
+            except Exception:
+                # FTS5 cleanup is best-effort — a broken FTS index
+                # shouldn't block tombstoning the row.
+                pass
+            return True
 
     def forget_key(self, key: str) -> int:
-        """Tombstone every fact under a key. Returns rows affected."""
+        """Tombstone every fact under a key. Returns rows affected.
+
+        R34-S58.3 (P2-C2.3): same FTS5 purge as ``delete()`` — collect
+        the affected rows first, tombstone them, then emit FTS5 delete
+        directives so user-forgotten secrets stop influencing search.
+        """
         with self._lock:
-            cur = self._conn.execute(
-                "UPDATE facts SET tombstone=1 WHERE key=? AND tombstone=0",
+            rows = self._conn.execute(
+                "SELECT id, key, value FROM facts WHERE key=? AND tombstone=0",
                 (key,),
+            ).fetchall()
+            if not rows:
+                return 0
+            ids = [int(r["id"]) for r in rows]
+            placeholders = ",".join("?" for _ in ids)
+            self._conn.execute(
+                f"UPDATE facts SET tombstone=1 WHERE id IN ({placeholders})",
+                ids,
             )
-            return cur.rowcount
+            for r in rows:
+                try:
+                    self._conn.execute(
+                        "INSERT INTO facts_fts(facts_fts, rowid, key, value) "
+                        "VALUES('delete', ?, ?, ?)",
+                        (int(r["id"]), r["key"], r["value"]),
+                    )
+                except Exception:
+                    pass
+            return len(rows)
 
     # ---- retrieval ----
 
@@ -404,16 +464,22 @@ class FactStore:
         include_tombstones: bool = False,
         limit: int = 1000,
     ) -> List[Fact]:
+        # R34-S58.3 (P2-C2.2): order by MAX(ts_utc, last_used) so a
+        # recently-touched old fact (re-asserted via ``add()`` duplicate
+        # bump, or matched by ``mark_used()``) still surfaces near the
+        # top. ``ts_utc`` alone hid recently-relevant historical facts
+        # behind freshly-extracted-but-unused ones from the diary.
         with self._lock:
             if include_tombstones:
                 rows = self._conn.execute(
-                    "SELECT * FROM facts ORDER BY ts_utc DESC LIMIT ?",
+                    "SELECT * FROM facts "
+                    "ORDER BY MAX(ts_utc, last_used) DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
                     "SELECT * FROM facts WHERE tombstone=0 "
-                    "ORDER BY ts_utc DESC LIMIT ?",
+                    "ORDER BY MAX(ts_utc, last_used) DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
         return [_row_to_fact(r) for r in rows]
@@ -423,11 +489,16 @@ class FactStore:
 
         Used by the prompt injector: ``store.by_key("user.")`` pulls
         every persistent user trait.
+
+        R34-S58.3 (P2-C2.2): see ``all()`` for the MAX(ts_utc, last_used)
+        rationale — voice prompts inject ``by_key("user.")`` every turn,
+        so the freshness signal must include recent re-touches, not just
+        original write time.
         """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM facts WHERE tombstone=0 AND key LIKE ? "
-                "ORDER BY ts_utc DESC LIMIT ?",
+                "ORDER BY MAX(ts_utc, last_used) DESC LIMIT ?",
                 (f"{key_prefix}%", limit),
             ).fetchall()
         return [_row_to_fact(r) for r in rows]

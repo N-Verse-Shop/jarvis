@@ -503,6 +503,11 @@ Examples (English+Ukrainian+Russian):
             # (which was the original timeout culprit). Ollama's default is
             # 5m; we pin to 30m because voice sessions can have long quiet
             # stretches and reloading mid-conversation is a bad experience.
+            # R34-S58.3 (A1.1): clamp connect-portion to the caller's
+            # budget — a 15 s budget gets a 5 s connect tail, a 3 s
+            # budget shrinks the connect tail to 3 s so wall-clock
+            # stays predictable.
+            _connect_timeout = min(5.0, max(2.0, float(self.config.timeout_sec)))
             response = requests.post(
                 f"{self.config.ollama_base_url}/api/generate",
                 json={
@@ -536,9 +541,10 @@ Examples (English+Ukrainian+Russian):
                 # judge runs on EVERY wake-word detection — paying a
                 # fresh TLS-style handshake here was the user-reported
                 # "Jarvis думає дуже довго" regression. Stale-NAT is
-                # still caught by the 5 s connect deadline + retry,
-                # without burning the keep-alive on every hot turn.
-                timeout=(5.0, self.config.timeout_sec),
+                # still caught by the connect deadline + the caller's
+                # retry policy, without burning the keep-alive on every
+                # hot turn. R34-S58.3 clamps the connect portion.
+                timeout=(_connect_timeout, self.config.timeout_sec),
                 # Connection: close removed — see src/jarvis/llm.py
                 # call_llm_streaming for full rationale.
             )
@@ -573,19 +579,32 @@ Examples (English+Ukrainian+Russian):
 
             return judgment
 
-        except requests.Timeout:
-            # Do NOT back off on timeout. Voice is high-turn: a single slow
-            # call must not lock out intent judging for the next 30s. The
-            # engagement-signal gate upstream already prevents calling the
-            # judge on ambient speech, so timeouts don't hammer Ollama.
-            self._last_failure_reason = f"timeout after {self.config.timeout_sec}s"
+        except requests.exceptions.ConnectTimeout as exc:
+            # R34-S58.3 (A1.2): ConnectTimeout is a stale-NAT signal
+            # (no socket established within the connect-portion
+            # deadline), distinct from a slow Ollama reply. Treat as
+            # a connection error so the HUD telemetry is honest about
+            # the cause. No retry — voice is high-turn and the next
+            # engagement signal will trigger a fresh attempt.
+            self._last_failure_reason = f"connect-timeout after {self.config.timeout_sec}s: {exc}"
             debug_log(f"intent judge: {self._last_failure_reason}", "voice")
-            # Audit round 15 fix: emit an IPC error event so the HUD
-            # can show a "judge slow" badge after N consecutive
-            # timeouts. Previously every wake word paid the full 15s
-            # timeout silently and the user had no signal that Ollama
-            # was wedged. ``available`` deliberately stays True (the
-            # no-backoff policy), but the HUD now has a breadcrumb.
+            self._last_error_time = time.time()
+            try:
+                from ..ipc import get_stream
+                get_stream().emit(
+                    "error",
+                    component="intent_judge",
+                    message="connect-timeout",
+                )
+            except Exception:
+                pass
+            return None
+        except requests.exceptions.ReadTimeout:
+            # R34-S58.3 (A1.2): caller's ``timeout_sec`` budget elapsed.
+            # Honour it — no retry. Voice is high-turn: a single slow
+            # call must not lock out intent judging for the next 30s.
+            self._last_failure_reason = f"read-timeout after {self.config.timeout_sec}s"
+            debug_log(f"intent judge: {self._last_failure_reason}", "voice")
             try:
                 from ..ipc import get_stream
                 get_stream().emit(
@@ -594,7 +613,21 @@ Examples (English+Ukrainian+Russian):
                     message=self._last_failure_reason,
                 )
             except Exception:
-                # Never let IPC break the voice path.
+                pass
+            return None
+        except requests.Timeout:
+            # Generic Timeout fallthrough (rare — the subclasses above
+            # cover the common cases).
+            self._last_failure_reason = f"timeout after {self.config.timeout_sec}s"
+            debug_log(f"intent judge: {self._last_failure_reason}", "voice")
+            try:
+                from ..ipc import get_stream
+                get_stream().emit(
+                    "error",
+                    component="intent_judge",
+                    message=self._last_failure_reason,
+                )
+            except Exception:
                 pass
             return None
         except requests.RequestException as e:

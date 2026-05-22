@@ -824,13 +824,11 @@ def _format_loop_activity(loop_messages: list[dict]) -> str:
 def _resolve_loop_digest_model(cfg) -> str:
     """Pick the LLM model for the max-turn digest pass.
 
-    Mirrors ``_resolve_evaluator_model``: explicit ``evaluator_model`` →
-    ``intent_judge_model`` → ``ollama_chat_model``. The digest is a
-    cheap classification-adjacent pass so reusing an already-warm small
-    model is preferred.
+    Resolution: ``intent_judge_model`` → ``ollama_chat_model``. The digest
+    is a cheap classification-adjacent pass so reusing an already-warm small
+    model is preferred. R34-S58.3: evaluator_model removed (was unwired).
     """
     for candidate in (
-        getattr(cfg, "evaluator_model", ""),
         getattr(cfg, "intent_judge_model", ""),
         getattr(cfg, "ollama_chat_model", ""),
     ):

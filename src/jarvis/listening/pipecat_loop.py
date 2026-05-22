@@ -56,6 +56,50 @@ import numpy as _PROBE_NP  # R34-S57 (A1-01): hot-path RMS probe — hoisted to 
 from ..debug import debug_log
 
 
+# R34-S58.3 B1.1: PII/secret scrubbing for events.jsonl emits. The
+# audit DB path (audit.py:_redact) already redacts, but the parallel
+# events.jsonl stream consumed by the HUD + WebSocket dashboard fan-out
+# did not. Tools like ``mac_control(open url ...)`` could carry tokens
+# inside ``args.url`` or ``result``; user STT could include pasted
+# secrets. Route every user-supplied / tool-result text through the
+# same scrubber the dashboard's _h_chat already uses (server.py:1489).
+def _scrub_for_emit(text: Any) -> Any:
+    """Best-effort secret scrub for an emit payload value.
+
+    Strings go through ``utils.redact.scrub_secrets``. Dicts/lists are
+    walked recursively. Other types pass through unchanged. Caps depth
+    at 8 to defend against pathological inputs; failures fail-open
+    (returning the original value) because dropping an event would be
+    worse than emitting a slightly-less-redacted one.
+    """
+    try:
+        from ..utils.redact import scrub_secrets as _scrub
+    except Exception:
+        return text
+
+    def _walk(v: Any, depth: int) -> Any:
+        if depth > 8:
+            return v
+        if isinstance(v, str):
+            try:
+                return _scrub(v)
+            except Exception:
+                return v
+        if isinstance(v, dict):
+            try:
+                return {k: _walk(vv, depth + 1) for k, vv in v.items()}
+            except Exception:
+                return v
+        if isinstance(v, (list, tuple)):
+            try:
+                return [_walk(vv, depth + 1) for vv in v]
+            except Exception:
+                return v
+        return v
+
+    return _walk(text, 0)
+
+
 # Stage gate — bumped as each stage lands. ``run()`` refuses to start
 # if it cannot satisfy the minimum stage required for a working voice
 # loop (currently 5 = core + adapters + tools + wake/echo).
@@ -1666,9 +1710,10 @@ def _make_event_stream_processor():
             # ── user-side STT ──────────────────────────────────────
             if isinstance(frame, InterimTranscriptionFrame):
                 if frame.text.strip():
+                    # R34-S58.3 B1.1: scrub STT text before events.jsonl.
                     self._stream.emit(
                         "stt_partial",
-                        text=frame.text,
+                        text=_scrub_for_emit(frame.text),
                         lang=_lang_to_iso(frame.language),
                     )
                 return
@@ -1687,9 +1732,10 @@ def _make_event_stream_processor():
                         (_time.monotonic() - self._utterance_t0) * 1000
                     )
                 self._utterance_t0 = 0.0
+                # R34-S58.3 B1.1: scrub STT text before events.jsonl.
                 self._stream.emit(
                     "stt_final",
-                    text=frame.text,
+                    text=_scrub_for_emit(frame.text),
                     lang=_lang_to_iso(frame.language),
                     confidence=1.0,  # MLX whisper doesn't expose conf
                     duration_ms=duration_ms,
@@ -3208,9 +3254,10 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
             # user's matched command — real STT events already fired
             # upstream, but injected /api/voice/inject paths need this.
             try:
+                # R34-S58.3 B1.1: scrub user text before events.jsonl.
                 self._stream.emit(
                     "stt_final",
-                    text=text[:500],
+                    text=_scrub_for_emit(text[:500]),
                     # R34-S52 H: was hardcoded "uk" — but R34-S48 made
                     # RU the only outbound language, AND the input text
                     # itself can be either UA or RU (we accept both at
@@ -3237,13 +3284,16 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
             except Exception as exc:
                 ok, msg = False, f"fast-path exec error: {exc!r}"
             duration_ms = int((_time.monotonic() - t0) * 1000)
+            # R34-S58.3 B1.1: scrub fast-path result (clipboard reads,
+            # nexus_brain_search snippets etc. can carry secrets). The
+            # audit-DB emit below stays raw — audit.py:_redact handles it.
             self._stream.emit(
                 "tool_call",
                 tool=action.name,
                 args={},
                 status="completed" if ok else "failed",
-                result=msg if ok else None,
-                error=None if ok else msg,
+                result=_scrub_for_emit(msg) if ok else None,
+                error=None if ok else _scrub_for_emit(msg),
             )
             self._audit.emit(
                 kind="fast_path",
@@ -3633,10 +3683,14 @@ def _register_mac_control_handlers(llm):
     def _make_handler(op_name: str):
         async def _handler(params) -> None:
             args = dict(params.arguments or {})
+            # R34-S58.3 B1.1: scrub args / result in the stream.emit
+            # payloads that land in events.jsonl + the WebSocket fan-out.
+            # The audit-DB write below stays raw — audit.py:_redact does
+            # its own pass before SQLite insert.
             stream.emit(
                 "tool_call",
                 tool=op_name,
-                args=args,
+                args=_scrub_for_emit(args),
                 status="starting",
             )
             audit.emit(
@@ -3653,13 +3707,14 @@ def _register_mac_control_handlers(llm):
             except Exception as exc:
                 ok, msg = False, f"dispatch error: {exc!r}"
             duration_ms = int((_time.monotonic() - t0) * 1000)
+            # R34-S58.3 B1.1: scrub args / result on completion too.
             stream.emit(
                 "tool_call",
                 tool=op_name,
-                args=args,
+                args=_scrub_for_emit(args),
                 status="completed" if ok else "failed",
-                result=msg if ok else None,
-                error=None if ok else msg,
+                result=_scrub_for_emit(msg) if ok else None,
+                error=None if ok else _scrub_for_emit(msg),
             )
             audit.emit(
                 kind="tool_call",

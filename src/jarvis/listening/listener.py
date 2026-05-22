@@ -1712,6 +1712,43 @@ class VoiceListener(threading.Thread):
         word_count = len(text_lower.split())
         skip_intent_judge_during_tts = is_speaking_now and word_count <= 3
 
+        # R34-S58.3 (P2-C3.4): fast-path stop commands during TTS.
+        # An utterance like "стоп Джарвіс заткнись будь ласка" is >3
+        # words so it normally falls through to the intent judge —
+        # which during TTS pays a 5-15 s timeout just to confirm what
+        # any human would call obvious. If the utterance LEADS with a
+        # stop word, treat it as immediate stop and skip the judge.
+        # Matches the prefixes in the session-end stop list (line ~1562)
+        # plus a few Russian variants the user actually says.
+        _STOP_PREFIXES = (
+            "стоп", "стой", "досить", "хватит",
+            "тихо", "замолчи", "замовкни", "прекрати",
+        )
+        if (
+            is_speaking_now
+            and not skip_intent_judge_during_tts
+            and text_lower.strip().startswith(_STOP_PREFIXES)
+        ):
+            debug_log(
+                f"intent-judge bypass: stop-prefix during TTS → immediate stop "
+                f"(\"{text_lower[:40]}{'...' if len(text_lower) > 40 else ''}\")",
+                "voice",
+            )
+            skip_intent_judge_during_tts = True
+            # Synthesise a STOP judgment so downstream handlers can
+            # short-circuit reply playback exactly like the judge would.
+            try:
+                from .intent_judge import IntentJudgment
+                intent_judgment = IntentJudgment(
+                    directed=True,
+                    query="",
+                    stop=True,
+                    confidence="high",
+                    reasoning="stop-prefix fast-path during TTS",
+                )
+            except Exception:
+                intent_judgment = None
+
         # Gate the intent judge on an engagement signal. Without this check the
         # judge was called on every ambient utterance, blocking the audio loop
         # for up to `timeout_sec` on each background chatter — which could
@@ -3107,6 +3144,15 @@ class VoiceListener(threading.Thread):
                                         f"web-search retry ok in {_time.monotonic()-t1:.1f}s",
                                         "voice",
                                     )
+                        except (requests.exceptions.ConnectTimeout,
+                                requests.exceptions.ConnectionError) as e:
+                            # R34-S58.3 (A1.2): ConnectTimeout is the
+                            # stale-NAT signal; treat it as a connection
+                            # error rather than honour-the-budget timeout.
+                            debug_log(f"web-search retry: connect error ({e})", "voice")
+                        except requests.exceptions.ReadTimeout:
+                            # R34-S58.3 (A1.2): read budget elapsed.
+                            debug_log("web-search retry: read-timeout (Ollama slow)", "voice")
                         except Exception as e:
                             debug_log(f"web-search retry error: {e}", "voice")
                 # Append to rolling dialog history AND persist to disk
@@ -3132,8 +3178,23 @@ class VoiceListener(threading.Thread):
                     "voice",
                 )
             return content
+        except requests.exceptions.ConnectTimeout as e:
+            # R34-S58.3 (A1.2): stale-NAT signal — no socket established
+            # within the connect deadline. Distinct from a slow Ollama
+            # reply. Voice is single-shot here (no retry loop) so the
+            # next user turn will get a fresh socket via urllib3's pool.
+            debug_log(f"voice direct-chat: connect-timeout ({e})", "voice")
+            return ""
+        except requests.exceptions.ReadTimeout:
+            # R34-S58.3 (A1.2): Ollama actually started responding but
+            # the read budget elapsed. Honour caller's deadline.
+            debug_log("voice direct-chat: read-timeout (Ollama slow)", "voice")
+            return ""
+        except requests.exceptions.ConnectionError as e:
+            debug_log(f"voice direct-chat: connection error ({e})", "voice")
+            return ""
         except requests.exceptions.Timeout:
-            debug_log("voice direct-chat: timeout after 12s", "voice")
+            debug_log("voice direct-chat: timeout", "voice")
             return ""
         except Exception as e:
             debug_log(f"voice direct-chat error: {e}", "voice")

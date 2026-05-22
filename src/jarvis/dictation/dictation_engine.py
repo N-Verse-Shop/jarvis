@@ -662,6 +662,18 @@ def _llm_clean_dictation(text: str, ollama_base_url: str, model: str = "qwen2.5:
                 f"LLM filler removal HTTP {resp.status_code} — using raw text",
                 "dictation",
             )
+    except requests.exceptions.ConnectTimeout as exc:
+        # R34-S58.3 (A1.2): stale-NAT signal — no socket established
+        # within the 2 s connect deadline. Distinct from a slow Ollama
+        # reply; logged separately so users can see whether to fix the
+        # network or use a smaller model.
+        _LLM_CLEAN_FAIL_STREAK += 1
+        debug_log(f"LLM filler removal: connect-timeout ({exc}) — using raw text", "dictation")
+    except requests.exceptions.ReadTimeout as exc:
+        # R34-S58.3 (A1.2): Ollama took longer than the 5 s read budget.
+        # Dictation paste is interactive — silently fall back to raw text.
+        _LLM_CLEAN_FAIL_STREAK += 1
+        debug_log(f"LLM filler removal: read-timeout ({exc}) — using raw text", "dictation")
     except Exception as exc:
         _LLM_CLEAN_FAIL_STREAK += 1
         debug_log(f"LLM filler removal failed (using raw text): {exc}", "dictation")
@@ -844,7 +856,12 @@ class DictationEngine:
         filler_removal: bool = False,
         custom_dictionary: Optional[list] = None,
         ollama_base_url: str = "http://127.0.0.1:11434",
-        ollama_model: str = "gemma4:e2b",
+        # R34-S58.3 (P2-D1.S57.2): default was the stale ``gemma4:e2b``
+        # tag (doesn't exist on Ollama) while the body of
+        # ``_llm_clean_dictation`` already uses ``qwen2.5:3b`` after
+        # S57.1. Align the signature default with the body so callers
+        # that don't pass an explicit model don't silently get a 404.
+        ollama_model: str = "qwen2.5:3b",
         thinking: bool = False,
     ) -> None:
         self._whisper_model_ref = whisper_model_ref

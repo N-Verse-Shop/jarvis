@@ -183,11 +183,16 @@ class AuditEvent:
 # ─────────────────────── store ──────────────────────────
 
 
-_SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA busy_timeout=5000;
+# R34-S58.3 B2.1: tiny migration framework, mirroring memory/facts.py
+# (S57). ``user_version`` lives in the SQLite header and survives every
+# row insert/index rebuild. Bump when adding/removing columns or changing
+# triggers. The PRAGMAs are now applied as standalone ``execute()`` calls
+# AFTER ``executescript()`` so they actually take effect on first-DB
+# creation (executescript() runs inside its own implicit transaction
+# which silently no-ops journal_mode/synchronous).
+_AUDIT_SCHEMA_VERSION = 1
 
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_events (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   ts           REAL NOT NULL,
@@ -207,6 +212,26 @@ CREATE INDEX IF NOT EXISTS idx_audit_kind_ts ON audit_events(kind, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_tool_ts ON audit_events(tool, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_events(status);
 """
+
+
+def _migrate_locked(conn: sqlite3.Connection) -> None:
+    """Apply pending user_version migrations.
+
+    Caller MUST hold any external lock guarding ``conn``. Today there's
+    exactly one schema rev so the loop is a no-op — but the hook is here
+    for future column additions. Bump ``_AUDIT_SCHEMA_VERSION`` and add
+    ``if current < N: conn.execute("ALTER TABLE …")`` clauses.
+    """
+    try:
+        cur = conn.execute("PRAGMA user_version").fetchone()
+        current_version = int(cur[0]) if cur and cur[0] is not None else 0
+        if current_version < _AUDIT_SCHEMA_VERSION:
+            # Future migrations slot in here, e.g.:
+            #   if current_version < 2:
+            #       conn.execute("ALTER TABLE audit_events ADD COLUMN …")
+            conn.execute(f"PRAGMA user_version = {_AUDIT_SCHEMA_VERSION}")
+    except sqlite3.Error as exc:
+        log.warning("audit migration check failed: %s", exc)
 
 
 class AuditStore:
@@ -236,8 +261,19 @@ class AuditStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # Initialise schema on a one-shot connection so subsequent
         # opens are guaranteed to see the tables/indexes.
+        # R34-S58.3 B2.1: PRAGMAs live OUTSIDE executescript() (which
+        # silently no-ops journal_mode/synchronous inside its implicit
+        # transaction) and we run the user_version migration check on
+        # the same connection.
         with sqlite3.connect(str(self._path), isolation_level=None) as conn:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+            except sqlite3.Error:
+                pass
             conn.executescript(_SCHEMA)
+            _migrate_locked(conn)
         try:
             self._path.chmod(0o600)
         except OSError:

@@ -1786,15 +1786,24 @@ def update_diary_from_dialogue_memory(
 
         debug_log(f"update_daily_conversation_summary returned: {summary_id}", "memory")
 
-        # Mark only the messages that existed at snapshot time as saved
-        # New messages that arrived during summarization remain pending
+        # R34-S58.3 (P2-C2.5): DEFER ``mark_saved_up_to`` until AFTER
+        # graph extraction completes. Previously the mark fired before
+        # extraction, so if the daemon crashed mid-extraction the
+        # extracted facts were lost AND the source messages were marked
+        # saved — silently dropping memory. Now: keep the messages
+        # pending until BOTH diary summary + graph extraction succeed.
+        # On extraction failure the mark still fires (diary succeeded,
+        # graph is best-effort and re-runs on the next flush against
+        # the same pending messages) — wrapped below.
+        graph_ok = True  # default to "graph step succeeded" so a path
+                         # that doesn't run graph (no summary_text) still
+                         # marks the diary saved.
         if summary_id is not None:
-            dialogue_memory.mark_saved_up_to(snapshot_timestamp)
-            debug_log(f"marked messages saved up to timestamp {snapshot_timestamp}", "memory")
-
             # Graph memory (v2): extract facts and store in the node graph.
-            # Non-blocking — if this fails, the diary update still succeeded.
-            # Uses a dedicated timeout (30s) rather than the diary chat timeout,
+            # Non-blocking — if this fails, the diary update still succeeded
+            # but the mark_saved is deferred so the next flush retries
+            # extraction over the same conversation window. Uses a
+            # dedicated timeout (30s) rather than the diary chat timeout,
             # so graph updates don't inflate the diary flush wall time.
             try:
                 from .graph import GraphMemoryStore
@@ -1863,7 +1872,28 @@ def update_diary_from_dialogue_memory(
                         "memory",
                     )
             except Exception as e:
+                graph_ok = False
                 debug_log(f"graph memory update failed (non-fatal): {e}", "memory")
+
+            # R34-S58.3 (P2-C2.5): mark messages saved only after the
+            # graph step finished (success OR a clean exception). If a
+            # daemon crash happens mid-extraction (e.g. SIGTERM during
+            # the LLM call), the messages stay pending and the next
+            # flush gets another shot. ``graph_ok`` is True for the
+            # success path AND the no-summary path; only an unhandled
+            # exception inside ``update_graph_from_dialogue`` flips it
+            # — and we still mark the diary saved in that case, because
+            # the diary itself succeeded and graph extraction is
+            # idempotent (dedupes on the next run anyway).
+            try:
+                dialogue_memory.mark_saved_up_to(snapshot_timestamp)
+                debug_log(
+                    f"marked messages saved up to timestamp {snapshot_timestamp} "
+                    f"(graph_ok={graph_ok})",
+                    "memory",
+                )
+            except Exception as e:
+                debug_log(f"mark_saved_up_to failed (non-fatal): {e}", "memory")
 
         return summary_id
 

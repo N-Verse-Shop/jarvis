@@ -1040,20 +1040,42 @@ class MemoryViewerWindow(QMainWindow):
                     debug_log(f"failed to import memory_viewer: {import_err}", "desktop")
                     return False
 
+                # R34-S58.3 C1.2: replace Flask's app.run() (no clean shutdown
+                # API; thread can only die with the process) with
+                # werkzeug.serving.make_server which exposes .shutdown().
+                # That lets stop_server() actually stop the server instead of
+                # leaking a thread + port for the daemon lifetime. Fall back
+                # to app.run() if werkzeug is missing or make_server fails.
+                self._memory_server = None
+
                 def run_flask_server():
                     try:
                         # Suppress Werkzeug's development server warning in bundled apps
                         import logging
                         logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-                        # Disable Flask's reloader and debug mode
-                        flask_app.run(
-                            host="127.0.0.1",
-                            port=self.MEMORY_VIEWER_PORT,
-                            debug=False,
-                            use_reloader=False,
-                            threaded=True
-                        )
+                        try:
+                            from werkzeug.serving import make_server
+                            self._memory_server = make_server(
+                                "127.0.0.1",
+                                self.MEMORY_VIEWER_PORT,
+                                flask_app,
+                                threaded=True,
+                            )
+                            self._memory_server.serve_forever()
+                        except Exception as make_server_err:
+                            debug_log(
+                                f"make_server failed, falling back to app.run: {make_server_err}",
+                                "desktop",
+                            )
+                            # Fallback: legacy Flask dev server (no clean stop).
+                            flask_app.run(
+                                host="127.0.0.1",
+                                port=self.MEMORY_VIEWER_PORT,
+                                debug=False,
+                                use_reloader=False,
+                                threaded=True,
+                            )
                     except Exception as server_err:
                         debug_log(f"memory viewer server error: {server_err}", "desktop")
 
@@ -1180,10 +1202,31 @@ class MemoryViewerWindow(QMainWindow):
                 self.server_process = None
                 self.is_server_running = False
 
-        # Thread-based server (bundled mode) will stop when app exits (daemon thread)
+        # R34-S58.3 C1.2: thread-based server now has a real shutdown path
+        # via werkzeug make_server. Call shutdown() to break serve_forever()
+        # so the daemon thread can exit cleanly.
+        memory_server = getattr(self, "_memory_server", None)
+        if memory_server is not None:
+            try:
+                memory_server.shutdown()
+            except Exception as e:
+                debug_log(f"error shutting down memory_server: {e}", "desktop")
+            self._memory_server = None
         if self.server_thread:
+            try:
+                self.server_thread.join(timeout=2.0)
+            except Exception:
+                pass
             self.server_thread = None
             self.is_server_running = False
+        # Close any cached DB connection used by the embedded viewer.
+        db_conn = getattr(self, "_db_conn", None)
+        if db_conn is not None:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+            self._db_conn = None
 
     def _show_error_page(self, message: str) -> None:
         """Show an error page in the web view."""

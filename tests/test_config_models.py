@@ -157,27 +157,40 @@ class TestModelConsistency:
             vram = info["vram"]
             assert "GB" in vram, f"{model_id} VRAM should specify GB"
 
-    def test_non_default_models_require_more_vram_than_default(self):
-        """Non-default models need more VRAM because the intent judge (gemma4:e2b) runs alongside them.
+    def test_intent_judge_vram_does_not_exceed_chat_vram(self):
+        """Intent-judge model must fit alongside the chat model.
 
-        The default model (gemma4:e2b) shares the intent judge, so its VRAM is the baseline.
-        Other models must load both themselves AND the intent judge, so their VRAM must be higher.
+        R34-S57.1 inverted the previous "chat == intent_judge" coupling:
+        chat is now ``qwen3:8b`` (8GB+ VRAM) and intent judge is
+        ``qwen2.5:3b`` (4GB+ VRAM). The old "every non-default model
+        must have ≥ default VRAM" invariant no longer holds — the
+        meaningful check is that the intent judge can be loaded
+        ALONGSIDE the chat model on the same host, so its VRAM
+        footprint must not exceed the chat model's.
         """
         import re
+        from jarvis.config import get_default_config
 
         def _extract_vram_gb(vram_str: str) -> int:
             match = re.search(r"(\d+)", vram_str)
             assert match, f"Could not parse VRAM value from: {vram_str}"
             return int(match.group(1))
 
-        default_vram = _extract_vram_gb(SUPPORTED_CHAT_MODELS[DEFAULT_CHAT_MODEL]["vram"])
+        cfg = get_default_config()
+        chat_id = cfg["ollama_chat_model"]
+        judge_id = cfg["intent_judge_model"]
 
-        for model_id, info in SUPPORTED_CHAT_MODELS.items():
-            if model_id == DEFAULT_CHAT_MODEL:
-                continue
-            model_vram = _extract_vram_gb(info["vram"])
-            assert model_vram > default_vram, (
-                f"{model_id} VRAM ({info['vram']}) should be higher than default model VRAM "
-                f"({SUPPORTED_CHAT_MODELS[DEFAULT_CHAT_MODEL]['vram']}) because the intent judge "
-                f"(gemma4:e2b) always runs alongside the chat model"
+        assert chat_id in SUPPORTED_CHAT_MODELS, (
+            f"default chat model {chat_id!r} should be in SUPPORTED_CHAT_MODELS"
+        )
+        # Intent judge may be a smaller model not necessarily in the
+        # SUPPORTED_CHAT_MODELS dict (chat-targeted), but for the
+        # canonical default it IS — verify when present.
+        if judge_id in SUPPORTED_CHAT_MODELS:
+            chat_vram = _extract_vram_gb(SUPPORTED_CHAT_MODELS[chat_id]["vram"])
+            judge_vram = _extract_vram_gb(SUPPORTED_CHAT_MODELS[judge_id]["vram"])
+            assert judge_vram <= chat_vram, (
+                f"intent_judge_model {judge_id!r} VRAM ({judge_vram}GB) must "
+                f"not exceed chat_model {chat_id!r} VRAM ({chat_vram}GB) — "
+                f"both run concurrently on the same Ollama host"
             )

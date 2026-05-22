@@ -126,6 +126,16 @@ class DashboardServer:
         self._runner = None
         self._site = None
         self._ws_clients: set = set()
+        # R34-S58.3 B1.2: serialise chat requests. Ollama can only
+        # process one chat at a time on a given model, and pipelining
+        # multiple chats over the same daemon process used to wedge
+        # both — the second request waited on Ollama while still
+        # holding the aiohttp task queue, blocking unrelated endpoints
+        # (state, transcript, audit). One semaphore = one in-flight
+        # chat; subsequent requests get an immediate 429 instead of
+        # piling up. Lazily initialised inside ``_h_chat`` because the
+        # asyncio loop doesn't exist at __init__ time.
+        self._chat_semaphore: Optional[asyncio.Semaphore] = None
 
     # ----- public lifecycle ---------------------------------------
     def start(self) -> None:
@@ -164,7 +174,16 @@ class DashboardServer:
     async def _serve_forever(self, ready: threading.Event) -> None:
         from aiohttp import web
 
-        app = web.Application(middlewares=[self._auth_mw, self._cors_mw])
+        # R34-S58.3 B1.3: framework-level cap on request body size.
+        # 256 KB is well above what any legitimate dashboard endpoint
+        # accepts (chat caps at 8 KB, most CRUD endpoints under 4 KB)
+        # but small enough that an attacker can't queue a multi-GB
+        # body in RAM before our per-endpoint size checks fire. aiohttp
+        # rejects with 413 BEFORE invoking ``json.loads`` / ``.text()``.
+        app = web.Application(
+            middlewares=[self._auth_mw, self._cors_mw],
+            client_max_size=262144,
+        )
         self._register_routes(app)
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1358,6 +1377,25 @@ class DashboardServer:
     # system prompt, and returns the reply. No Pipecat involvement — the
     # text-chat path stays alive even when the voice loop is on the floor.
     async def _h_chat(self, req):
+        from aiohttp import web
+        # R34-S58.3 B1.2: enforce one-in-flight chat per server. Lazy
+        # init because asyncio.Semaphore needs a running loop, which
+        # only exists inside the dashboard thread (not __init__).
+        if self._chat_semaphore is None:
+            self._chat_semaphore = asyncio.Semaphore(1)
+        if self._chat_semaphore.locked():
+            # Another chat is already running — refuse fast rather
+            # than pile up. 429 with Retry-After lets the dashboard
+            # UI back off without surfacing a confusing 5xx.
+            return web.json_response(
+                {"error": "chat busy, try again shortly"},
+                status=429,
+                headers={"Retry-After": "2"},
+            )
+        async with self._chat_semaphore:
+            return await self._h_chat_inner(req)
+
+    async def _h_chat_inner(self, req):
         from aiohttp import web
         try:
             body = await req.json()

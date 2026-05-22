@@ -997,6 +997,27 @@ class PiperTTS:
             self._initialized = True
             return self._voice is not None
 
+    def reload_voice(self, model_path: str, speaker: Optional[int]) -> bool:
+        """R34-S58.3 C4.1: reload the Piper voice with a new model + speaker.
+
+        Called from the dashboard PATCH /api/settings handler when the user
+        changes ``tts_voice`` / ``tts_speaker`` so the next utterance picks
+        up the new voice WITHOUT requiring a daemon restart. Returns True
+        on success, False if init fails (caller falls back to old voice).
+        """
+        with self._init_lock:
+            self.model_path = model_path
+            self.speaker = speaker
+            # Drop the cached voice so _ensure_initialized re-loads.
+            self._voice = None
+            self._initialized = False
+            self._init_error = None
+        try:
+            return self._ensure_initialized()
+        except Exception as e:
+            debug_log(f"PiperTTS.reload_voice failed: {e}", "tts")
+            return False
+
     def start(self) -> None:
         if not self.enabled or self._thread is not None:
             return
@@ -1924,6 +1945,27 @@ class SystemTTS:
     # the daemon lifetime. Class-level lock guards the get-or-build.
     _piper_engines: dict = {}  # speaker_name → cached PiperTTS instance
     _piper_engines_lock = threading.Lock()
+
+    @classmethod
+    def reload_voice_for(cls, lang: str, speaker_name: str) -> bool:
+        """R34-S58.3 C4.1: evict the cached Piper engine for a (lang, speaker)
+        pair so the next ``_get_piper_for`` call rebuilds it with the
+        current model files. Called from the dashboard PATCH /api/settings
+        handler when the user changes ``tts_voice``. Stops + closes the
+        old engine to release its audio stream and ONNX model.
+
+        Returns True if a cached engine was found and evicted, False otherwise.
+        """
+        cache_key = f"{lang}:{speaker_name}"
+        with cls._piper_engines_lock:
+            evicted = cls._piper_engines.pop(cache_key, None)
+        if evicted is not None:
+            try:
+                evicted.stop()
+            except Exception as e:
+                debug_log(f"SystemTTS.reload_voice_for: stop failed: {e}", "tts")
+            return True
+        return False
 
     def _get_piper_for(self, lang: str, speaker_name: str):
         """Get or build a cached PiperTTS engine for the given language.

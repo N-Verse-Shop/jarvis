@@ -278,28 +278,49 @@ def _get_external_ip_via_socket() -> Optional[str]:
     return None
 
 
-def _get_external_ip_automatically() -> Optional[str]:
+def _get_external_ip_automatically(
+    external_lookups_enabled: bool = False,
+) -> Optional[str]:
     """
     Attempt to automatically determine the external IP address using
     privacy-friendly methods in order of preference:
 
-    1. UPnP (query local router) - most privacy-friendly
-    2. Socket connection (determine external interface) - minimal external contact
+    1. UPnP (query local router) - LOCAL only, no external egress
+    2. Socket connection (determine external interface) - reveals daemon to
+       8.8.8.8 / 1.1.1.1 / 208.67.222.222 via UDP connect (no data sent
+       but the address is visible to those resolvers / on-path observers)
+    3. OpenDNS myip.opendns.com — single DNS query reveals daemon to OpenDNS
+
+    R34-S58.3 B4.1: only step (1) — UPnP, which stays on the LAN — runs
+    by default. The socket + OpenDNS probes are gated behind
+    ``external_lookups_enabled`` (settings.location_external_lookups_enabled,
+    default False). Callers that need geolocation should either:
+      * configure ``location_ip_address`` explicitly in settings, or
+      * opt-in by setting ``location_external_lookups_enabled=true``.
 
     Returns:
         External IP address if successful, None otherwise.
     """
-    # Try UPnP first (most privacy-friendly)
+    # Try UPnP first (most privacy-friendly — local router only).
     ip = _get_external_ip_via_upnp()
     if ip:
         return ip
 
-    # Fallback to socket method
+    # R34-S58.3 B4.1: external probes gated. Default OFF — no egress.
+    if not external_lookups_enabled:
+        debug_log(
+            "External IP probes disabled (location_external_lookups_enabled=false). "
+            "Set this to true in config or provide location_ip_address to enable.",
+            "location",
+        )
+        return None
+
+    # Fallback to socket method (reveals daemon to public DNS resolvers).
     ip = _get_external_ip_via_socket()
     if ip:
         return ip
 
-    # Final fallback: single DNS query to OpenDNS (privacy-light)
+    # Final fallback: single DNS query to OpenDNS (privacy-light).
     ip = _resolve_public_ip_via_opendns()
     if ip and not _is_private_ip(ip):
         debug_log(f"Public IP resolved via OpenDNS: {ip}", "location")
@@ -364,7 +385,15 @@ def _download_geolite2_database() -> bool:
 
 
 def _resolve_public_ip_via_opendns(timeout: float = 1.5) -> Optional[str]:
-    """Resolve true public IP via a single DNS query to OpenDNS (myip.opendns.com)."""
+    """Resolve true public IP via a single DNS query to OpenDNS (myip.opendns.com).
+
+    R34-S58.3 B4.2: also verify that the UDP reply came from the
+    resolver we queried. The TID match alone is a 16-bit guess —
+    feasible to forge from a LAN attacker who can race the legitimate
+    reply. Asserting the source IP equals the resolver IP closes the
+    most common spoofing vector (TID prediction without on-path packet
+    capture).
+    """
     try:
         resolver_ip = ("208.67.222.222", 53)
         tid = random.randint(0, 0xFFFF)
@@ -377,7 +406,22 @@ def _resolve_public_ip_via_opendns(timeout: float = 1.5) -> Optional[str]:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(timeout)
             s.sendto(packet, resolver_ip)
-            data, _ = s.recvfrom(512)
+            data, addr_returned = s.recvfrom(512)
+
+        # R34-S58.3 B4.2: source-validate the reply. addr_returned is
+        # (ip, port) — only the IP needs to match; the resolver may
+        # use an ephemeral source port. On mismatch we discard the
+        # packet so an on-LAN forgery doesn't poison our IP cache.
+        if not addr_returned or addr_returned[0] != resolver_ip[0]:
+            try:
+                debug_log(
+                    f"OpenDNS reply source mismatch — got {addr_returned!r}, "
+                    f"expected resolver {resolver_ip[0]}; dropping",
+                    "location",
+                )
+            except Exception:
+                pass
+            return None
 
         if len(data) < 12 or data[0:2] != tid.to_bytes(2, 'big'):
             return None
@@ -408,6 +452,7 @@ def get_location_info(
     auto_detect: bool = True,
     resolve_cgnat_public_ip: bool = True,
     location_cache_minutes: int = 60,
+    external_lookups_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Get location information for an IP address.
 
@@ -417,6 +462,10 @@ def get_location_info(
         auto_detect: Attempt to discover an external IP via UPnP / socket heuristics if neither ip_address nor config_ip given.
         resolve_cgnat_public_ip: If True and a CGNAT (100.64.0.0/10) address is detected, attempt a single DNS query via OpenDNS to discover the true public IP (privacy-light).
         location_cache_minutes: TTL in minutes for cached location lookups persisted to disk.
+        external_lookups_enabled: R34-S58.3 B4.1 — gate ALL non-LAN
+            probes (socket-to-public-DNS, OpenDNS myip query). When
+            False (default), only UPnP (router-local) runs. CGNAT
+            resolution via OpenDNS also requires this to be True.
     """
     if not GEOIP2_AVAILABLE:
         return {"error": "geoip2 library not available"}
@@ -427,7 +476,9 @@ def get_location_info(
             ip_address = config_ip
         elif auto_detect:
             # Try automatic detection using privacy-friendly methods
-            ip_address = _get_external_ip_automatically()
+            ip_address = _get_external_ip_automatically(
+                external_lookups_enabled=external_lookups_enabled,
+            )
             if not ip_address:
                 # Final fallback to local IP (won't work for geolocation)
                 ip_address = _get_local_network_ip()
@@ -439,8 +490,10 @@ def get_location_info(
         return {"error": "No IP address available. Try enabling auto-detection or configure 'location_ip_address' in your config."}
 
     # Mark CGNAT and optionally resolve public IP via OpenDNS if enabled in settings
+    # R34-S58.3 B4.1: CGNAT resolution also goes through OpenDNS — gate
+    # behind the same external-lookups switch.
     cgnat_flag = _is_cgnat_ip(ip_address)
-    if cgnat_flag and resolve_cgnat_public_ip:
+    if cgnat_flag and resolve_cgnat_public_ip and external_lookups_enabled:
         now = datetime.now(timezone.utc)
         needs_resolve = False
         with _cache_lock:
@@ -602,6 +655,7 @@ def get_location_context(
     auto_detect: bool = True,
     resolve_cgnat_public_ip: bool = True,
     location_cache_minutes: int = 60,
+    external_lookups_enabled: bool = False,
 ) -> str:
     """Generate a concise location context string using explicit parameters."""
     return _format_location_context(get_location_info(
@@ -609,6 +663,7 @@ def get_location_context(
         auto_detect=auto_detect,
         resolve_cgnat_public_ip=resolve_cgnat_public_ip,
         location_cache_minutes=location_cache_minutes,
+        external_lookups_enabled=external_lookups_enabled,
     ))
 
 
@@ -618,6 +673,7 @@ def get_location_context_with_timezone(
     auto_detect: bool = True,
     resolve_cgnat_public_ip: bool = True,
     location_cache_minutes: int = 60,
+    external_lookups_enabled: bool = False,
 ) -> tuple[str, Optional[str]]:
     """Return the location context string and the IANA timezone (if known) in one lookup."""
     info = get_location_info(
@@ -625,6 +681,7 @@ def get_location_context_with_timezone(
         auto_detect=auto_detect,
         resolve_cgnat_public_ip=resolve_cgnat_public_ip,
         location_cache_minutes=location_cache_minutes,
+        external_lookups_enabled=external_lookups_enabled,
     )
     tz_name = info.get("timezone") if isinstance(info, dict) else None
     return _format_location_context(info), tz_name
@@ -666,6 +723,7 @@ def get_detailed_location_info(
     auto_detect: bool = True,
     resolve_cgnat_public_ip: bool = True,
     location_cache_minutes: int = 60,
+    external_lookups_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Get detailed location information including coordinates and formatted address."""
     location_info = get_location_info(
@@ -674,6 +732,7 @@ def get_detailed_location_info(
         auto_detect=auto_detect,
         resolve_cgnat_public_ip=resolve_cgnat_public_ip,
         location_cache_minutes=location_cache_minutes,
+        external_lookups_enabled=external_lookups_enabled,
     )
 
     if "error" in location_info:

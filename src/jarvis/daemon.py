@@ -1031,6 +1031,21 @@ def main() -> None:
         except Exception:
             pass
 
+        # R34-S58.3 A3.1: stop the background scheduler thread that runs
+        # housekeeping tasks (events.jsonl rotation, audit-db vacuum,
+        # briefs prune, ollama keepwarm via register_task). Previously
+        # this thread was leaked at shutdown — daemon mode meant the
+        # process died with it, but tests + nested-daemon scenarios kept
+        # an orphan scheduler around. Best-effort, 2s timeout.
+        try:
+            from .listening import loop_workers as _lw
+            _lw.stop(timeout=2.0)
+        except Exception:
+            pass
+        # TODO(R34-S58.3): _keepwarm_ollama_loop in warmup.py has no stop
+        # hook (pure daemon thread; dies with the process). Add a stop
+        # event if/when keepwarm becomes long-running enough to matter.
+
         debug_log("daemon stopped", "jarvis")
         print("👋 Daemon stopped", flush=True)
 

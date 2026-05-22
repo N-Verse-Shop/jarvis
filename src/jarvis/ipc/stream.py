@@ -71,10 +71,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+# R34-S58.3 B2.3: cross-process advisory lock around rotation so two
+# concurrent jarvis processes (e.g. dashboard CLI + daemon) don't both
+# rename the file underneath each other. POSIX-only; the Windows path
+# falls through to single-process locking only.
+try:
+    import fcntl
+    HAVE_FCNTL = True
+except ImportError:
+    HAVE_FCNTL = False
 
 # Single module-level singleton so daemon + threads all write to the
 # same file with a shared write lock.
@@ -115,6 +126,12 @@ class EventStream:
         self._lock = threading.Lock()
         self._seq = 0
         self._enabled = True
+        # R34-S58.3 B2.2: track silent emit failures so a permanently
+        # broken file handle (full disk, perm flip) doesn't go entirely
+        # unseen. ``health()`` surfaces these to callers; we also print
+        # the first error + every 100th subsequent to stderr.
+        self._dropped_emits: int = 0
+        self._last_emit_error: Optional[str] = None
         # Touch file so consumers (Electron fs.watch) don't trip on ENOENT
         if not self.path.exists():
             self.path.touch()
@@ -240,6 +257,25 @@ class EventStream:
                 self._fh.write(line)
                 self._bytes_written += encoded_len
         except Exception as e:
+            # R34-S58.3 B2.2: count + surface silent failures. Debug-log
+            # only fires when debug mode is on, so a permanent write
+            # failure (full disk, perm flip) used to go entirely unseen.
+            # We now bump a counter, expose it via ``health()``, and
+            # mirror the first occurrence + every 100th subsequent to
+            # stderr (visible in the daemon's stdout/log redirect even
+            # without debug mode).
+            self._dropped_emits += 1
+            self._last_emit_error = f"{type(e).__name__}: {e}"
+            if self._dropped_emits == 1 or self._dropped_emits % 100 == 0:
+                try:
+                    print(
+                        f"WARN[ipc] EventStream emit failed "
+                        f"(#{self._dropped_emits}): {self._last_emit_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             # Lazy import so circular-import risk stays low.
             try:
                 from ..debug import debug_log
@@ -247,13 +283,53 @@ class EventStream:
             except Exception:
                 pass
 
+    def health(self) -> dict:
+        """Snapshot of recent emit reliability.
+
+        Cheap accessor — returns a dict copy so callers can't mutate
+        internal state. Useful for the dashboard's /api/health probe
+        and for tests verifying the silent-failure counter increments.
+        """
+        return {
+            "dropped_emits": int(self._dropped_emits),
+            "last_error": self._last_emit_error,
+        }
+
     def _rotate_locked(self) -> None:
         """Caller must hold self._lock.
 
         Shift events.jsonl → events.jsonl.1 → events.jsonl.2 → ...
         Drop oldest beyond MAX_ROTATIONS. Re-opens the persistent
         handle on the fresh file.
+
+        R34-S58.3 B2.3: bracket the rename block in a POSIX fcntl
+        flock against a sidecar ``events.jsonl.rotlock`` file so two
+        concurrent jarvis processes (daemon + ad-hoc CLI tool) don't
+        both rename underneath each other and end up with a torn
+        rotation (e.g. both tried to move .1 → .2). LOCK_NB means
+        we never block — if another process is mid-rotate we just
+        skip this round and try again on the next overflow.
         """
+        # Acquire the cross-process advisory lock (POSIX only).
+        lock_fh = None
+        if HAVE_FCNTL:
+            try:
+                lock_path = self.path.with_suffix(".jsonl.rotlock")
+                lock_fh = open(lock_path, "a+")
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (OSError, BlockingIOError):
+                    # Another process is rotating right now — skip this
+                    # round; we'll try again on the next overflow.
+                    try:
+                        lock_fh.close()
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                # Lock file couldn't be opened (e.g. permission issue) —
+                # fall through to single-process behaviour.
+                lock_fh = None
         try:
             # Close the current handle BEFORE renaming — on Windows
             # rename on an open file fails; on POSIX it works but
@@ -296,6 +372,18 @@ class EventStream:
                 self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
             except Exception:
                 self._fh = None
+        finally:
+            # Release the cross-process advisory lock.
+            if lock_fh is not None:
+                try:
+                    if HAVE_FCNTL:
+                        try:
+                            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                        except OSError:
+                            pass
+                    lock_fh.close()
+                except Exception:
+                    pass
 
     def disable(self) -> None:
         """Stop emitting (used during shutdown so we don't race with

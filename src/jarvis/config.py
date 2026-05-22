@@ -121,7 +121,8 @@ class Settings:
     llm_profile_select_timeout_sec: float
 
     # Profiles & Behavior
-    active_profiles: list[str]
+    # R34-S58.3: active_profiles removed (dead code — see config migration
+    # below which silently drops the legacy key).
     use_stdin: bool
     voice_debug: bool
 
@@ -279,25 +280,17 @@ class Settings:
     # When `tool_selection_strategy == "llm"`, this model does the routing.
     # Empty string means "reuse `ollama_chat_model`" (the default).
     tool_router_model: str
-    # Optional override for the post-turn evaluator LLM. Empty string means
-    # "fall back to intent_judge_model, then ollama_chat_model" (the default).
-    evaluator_model: str
-    # None = auto (on for SMALL models, off for LARGE). Explicit true/false forces.
-    evaluator_enabled: Optional[bool]
+    # R34-S58.3: evaluator removed (was unwired — never called from engine.py).
+    # Task-list planner replaces its per-turn correction role.
     # Upper bound on toolSearchTool invocations per reply turn. The cap
     # prevents a small model from churning through the escape hatch forever
     # when no tool really fits.
     tool_search_max_calls: int
-    # Upper bound on evaluator-driven nudges per reply. Each time the
-    # evaluator says "continue" with a nudge, the nudge is injected into
-    # the next turn's system message. This cap stops nudge ping-pong when
-    # the model keeps producing prose despite the nudge.
-    evaluator_nudge_max: int
     # Optional override for the pre-loop task-list planner model. Empty
     # string means "fall back to tool_router_model → intent_judge_model →
     # ollama_chat_model" (the default). The planner is a small
     # classification-shaped pass so it rides the same small-model chain
-    # as the router and the evaluator.
+    # as the router.
     planner_model: str
     # Whether the pre-loop planner is enabled. True = planner always runs;
     # False = planner never runs (legacy behaviour, with the
@@ -545,7 +538,7 @@ def get_default_config() -> Dict[str, Any]:
         "llm_profile_select_timeout_sec": 30.0,
 
         # Profiles & Behavior
-        "active_profiles": ["developer", "business", "life"],
+        # R34-S58.3: active_profiles removed (dead code).
         "use_stdin": False,
 
         # Screen Capture
@@ -698,16 +691,9 @@ def get_default_config() -> Dict[str, Any]:
         # judge model isn't set. Override to decouple routing from both —
         # useful when you want routing on a dedicated smaller model.
         "tool_router_model": "",
-        # Empty string = reuse intent_judge_model, falling through to
-        # ollama_chat_model only if the judge isn't set. Override to pin the
-        # evaluator to a dedicated small/fast model.
-        "evaluator_model": "",
-        # None = auto (on for small models, off for large). Set true/false to force.
-        "evaluator_enabled": None,
+        # R34-S58.3: evaluator removed (was unwired). Planner replaces it.
         # Cap the number of toolSearchTool invocations per reply.
         "tool_search_max_calls": 3,
-        # Cap the number of evaluator-driven nudges per reply.
-        "evaluator_nudge_max": 2,
         # Task-list planner (see src/jarvis/reply/planner.spec.md). Empty
         # model string = reuse tool_router_model → intent_judge_model →
         # ollama_chat_model.
@@ -836,7 +822,10 @@ def load_settings() -> Settings:
     if ollama_chat_num_predict <= 0 or ollama_chat_num_predict > 8192:
         ollama_chat_num_predict = 220
     use_stdin = bool(merged.get("use_stdin", False))
-    active_profiles = _ensure_list(merged.get("active_profiles"))
+    # R34-S58.3: silently drop legacy `active_profiles` key if present in
+    # the user's config file (dead-code removal — migration is silent so
+    # users don't see an error on upgrade).
+    merged.pop("active_profiles", None)
     tts_enabled = bool(merged.get("tts_enabled", True))
     tts_engine = str(merged.get("tts_engine", "piper")).lower()
     if tts_engine not in ("piper", "chatterbox", "system"):
@@ -1033,13 +1022,10 @@ def load_settings() -> Settings:
     if tool_selection_strategy not in ("all", "keyword", "embedding", "llm"):
         tool_selection_strategy = "llm"
     tool_router_model = str(merged.get("tool_router_model", "") or "").strip()
-    evaluator_model = str(merged.get("evaluator_model", "") or "").strip()
-    _eval_raw = merged.get("evaluator_enabled", None)
-    evaluator_enabled: Optional[bool]
-    if _eval_raw is None:
-        evaluator_enabled = None
-    else:
-        evaluator_enabled = bool(_eval_raw)
+    # R34-S58.3: evaluator removed. Silently drop legacy keys if present.
+    merged.pop("evaluator_model", None)
+    merged.pop("evaluator_enabled", None)
+    merged.pop("evaluator_nudge_max", None)
     planner_model = str(merged.get("planner_model", "") or "").strip()
     planner_enabled = bool(merged.get("planner_enabled", True))
     try:
@@ -1052,12 +1038,6 @@ def load_settings() -> Settings:
         tool_search_max_calls = 3
     if tool_search_max_calls < 0:
         tool_search_max_calls = 0
-    try:
-        evaluator_nudge_max = int(merged.get("evaluator_nudge_max", 2))
-    except (TypeError, ValueError):
-        evaluator_nudge_max = 2
-    if evaluator_nudge_max < 0:
-        evaluator_nudge_max = 0
     location_enabled = bool(merged.get("location_enabled", True))
     location_cache_minutes = int(merged.get("location_cache_minutes", 60))
     location_ip_address_val = merged.get("location_ip_address")
@@ -1119,7 +1099,7 @@ def load_settings() -> Settings:
         llm_profile_select_timeout_sec=llm_profile_select_timeout_sec,
 
         # Profiles & Behavior
-        active_profiles=active_profiles,
+        # R34-S58.3: active_profiles removed.
         use_stdin=use_stdin,
         voice_debug=voice_debug,
 
@@ -1227,10 +1207,7 @@ def load_settings() -> Settings:
         agentic_max_turns=agentic_max_turns,
         tool_selection_strategy=tool_selection_strategy,
         tool_router_model=tool_router_model,
-        evaluator_model=evaluator_model,
-        evaluator_enabled=evaluator_enabled,
         tool_search_max_calls=tool_search_max_calls,
-        evaluator_nudge_max=evaluator_nudge_max,
         planner_model=planner_model,
         planner_enabled=planner_enabled,
         planner_timeout_sec=planner_timeout_sec,

@@ -186,6 +186,12 @@ def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_con
     # 4xx — the existing ``ToolsNotSupportedError`` path needs the
     # first error verbatim, and ``HTTPError`` from a 400 means the
     # request was malformed, not transient.
+    # R34-S58.3 (A1.1): clamp the connect-portion so the wall-clock
+    # ceiling can never exceed roughly 2× the caller's budget.
+    # A 5 s flat connect + a 3 s read deadline would otherwise let the
+    # planner's 6 s plan call spend 8 s before timing out — a near 2.6×
+    # blowup. Floor at 2 s so a healthy network still wins.
+    _connect_timeout = min(5.0, max(2.0, float(timeout_sec)))
     last_exc: Optional[Exception] = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
@@ -193,10 +199,11 @@ def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_con
                 f"{base_url.rstrip('/')}/api/chat",
                 json=payload,
                 # R34-S58.0 perf: (connect, read) split — stale-NAT
-                # socket fails fast at 5 s instead of hanging for
-                # the full request timeout. The retry loop below
-                # already opens a fresh socket on ConnectionError.
-                timeout=(5.0, timeout_sec),
+                # socket fails fast instead of hanging for the full
+                # request timeout. The retry loop below already opens
+                # a fresh socket on ConnectionError / ConnectTimeout.
+                # R34-S58.3: connect-portion clamped to caller's budget.
+                timeout=(_connect_timeout, timeout_sec),
                 # Connection: close removed — see call_llm_streaming
                 # for full rationale. Net effect: hot voice turns
                 # save ~50-100 ms per call by reusing urllib3's
@@ -220,23 +227,33 @@ def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_con
                     return content
                 debug_log(f"call_llm_direct: empty content from response keys={list(data.keys())}", "llm")
             return None
-        except requests.exceptions.Timeout as exc:
+        except requests.exceptions.ReadTimeout as exc:
+            # R34-S58.3 (A1.2): ReadTimeout means the caller's
+            # ``timeout_sec`` budget elapsed — honour it, do not retry.
             last_exc = exc
-            debug_log(f"call_llm_direct: timeout after {timeout_sec}s (attempt {attempt}/{_MAX_RETRIES})", "llm")
-            # Don't retry on timeout — the timeout itself is the
-            # backoff; the caller chose ``timeout_sec``.
+            debug_log(f"call_llm_direct: read-timeout after {timeout_sec}s (attempt {attempt}/{_MAX_RETRIES})", "llm")
             return None
-        except requests.exceptions.ConnectionError as exc:
+        except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout) as exc:
+            # R34-S58.3 (A1.2): ConnectTimeout is a sibling of Timeout
+            # but semantically a stale-NAT failure (no socket established
+            # within the connect-portion deadline). Treat it exactly like
+            # a generic ConnectionError — open a fresh socket on retry.
             last_exc = exc
             if attempt < _MAX_RETRIES:
                 sleep_for = 0.5 * (2 ** (attempt - 1))
                 debug_log(
-                    f"call_llm_direct: connection error attempt {attempt}/{_MAX_RETRIES} — retrying in {sleep_for:.1f}s ({exc})",
+                    f"call_llm_direct: connect error attempt {attempt}/{_MAX_RETRIES} — retrying in {sleep_for:.1f}s ({type(exc).__name__}: {exc})",
                     "llm",
                 )
                 time.sleep(sleep_for)
                 continue
             break
+        except requests.exceptions.Timeout as exc:
+            # Generic Timeout (rare — the specific subclasses above
+            # catch the common cases). Treat as the caller's budget.
+            last_exc = exc
+            debug_log(f"call_llm_direct: timeout after {timeout_sec}s (attempt {attempt}/{_MAX_RETRIES})", "llm")
+            return None
         except Exception as e:
             debug_log(f"call_llm_direct: request failed — {e}", "llm")
             return None
@@ -319,19 +336,23 @@ def call_llm_streaming(
         except Exception:
             pass
         return None
+    # R34-S58.3 (A1.1): clamp the connect-portion to the caller's
+    # budget so a 3 s timeout doesn't permit a 5 s connect tail.
+    _connect_timeout = min(5.0, max(2.0, float(timeout_sec)))
     try:
         with requests.post(
             f"{base_url.rstrip('/')}/api/chat",
             json=payload,
             # R34-S58.0 perf fix: split (connect, read) timeout so a
-            # stale-NAT socket fails fast at the 5s connect deadline
+            # stale-NAT socket fails fast at the connect deadline
             # instead of hanging for the full ``timeout_sec`` window.
             # The existing retry-on-ConnectionError loop then opens a
             # fresh socket on next attempt — cheaper than the broken
             # ``Connection: close`` approach which paid a TLS-style
             # handshake on every streaming reply (~50-100 ms wasted
             # per turn over Tailscale, ~30 s read budget anyway).
-            timeout=(5.0, timeout_sec),
+            # R34-S58.3: connect-portion now clamped (≤5 s, ≥2 s).
+            timeout=(_connect_timeout, timeout_sec),
             stream=True,
             # NOTE: ``Connection: close`` deliberately NOT set here.
             # The streaming chat reply lives for 30+ s read time
@@ -535,6 +556,8 @@ def chat_with_messages(
     # the user's turn with nothing recoverable. Bounded backoff
     # (0.5s, 1s) keeps total wall time under the parent timeout.
     import time as _time
+    # R34-S58.3 (A1.1): clamp connect-portion to caller's budget.
+    _connect_timeout = min(5.0, max(2.0, float(timeout_sec)))
     last_exc: Optional[Exception] = None
     for attempt in range(_MAX_RETRIES):
         # Audit round 20 abort hook: check BEFORE every attempt so a
@@ -557,10 +580,13 @@ def chat_with_messages(
                 f"{base_url.rstrip('/')}/api/chat",
                 json=payload,
                 # R34-S58.0 perf: (connect, read) split — stale-NAT
-                # socket fails fast at 5 s connect instead of hanging
-                # for the full request timeout. See call_llm_streaming
-                # for the full rationale.
-                timeout=(5.0, timeout_sec),
+                # socket fails fast at the connect deadline instead of
+                # hanging for the full request timeout. See
+                # call_llm_streaming for the full rationale.
+                # R34-S58.3 (A1.1): clamp connect-portion to caller's
+                # budget so a short timeout doesn't get bloated by a
+                # fixed 5 s connect tail.
+                timeout=(_connect_timeout, timeout_sec),
                 # Connection: close removed — see streaming path. The
                 # connect-timeout above + the existing retry loop
                 # handles the stale-NAT case without paying a fresh
@@ -583,12 +609,15 @@ def chat_with_messages(
             if isinstance(data, dict):
                 return data
             return None
-        except requests.exceptions.Timeout:
+        except requests.exceptions.ReadTimeout:
+            # R34-S58.3 (A1.2): caller's read budget elapsed — honour it.
             print("  ⏱️ LLM request timed out", flush=True)
             return None
-        except requests.exceptions.ConnectionError as e:
-            # Connection errors are often transient (Ollama restart);
-            # apply the same retry envelope.
+        except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout) as e:
+            # R34-S58.3 (A1.2): ConnectTimeout is a Timeout subclass but
+            # behaves like a transient connection failure (no socket
+            # established within connect-portion deadline). Apply the
+            # same retry envelope as generic ConnectionError.
             last_exc = e
             if attempt < _MAX_RETRIES - 1:
                 _time.sleep(0.5 * (2 ** attempt))
@@ -596,7 +625,11 @@ def chat_with_messages(
             # Audit round 18 fix: scrub URL userinfo from the printed
             # message so a misconfigured ``http://user:pass@host``
             # base_url cannot leak credentials to stdout / log file.
-            print(f"  ❌ LLM connection error: {_sanitise_request_error(e)}", flush=True)
+            print(f"  ❌ LLM connect error: {_sanitise_request_error(e)}", flush=True)
+            return None
+        except requests.exceptions.Timeout:
+            # Generic Timeout fallthrough (rare; ReadTimeout above catches it).
+            print("  ⏱️ LLM request timed out", flush=True)
             return None
         except requests.exceptions.HTTPError as e:
             # Raise a specific error when the model rejects the tools parameter (HTTP 400).
