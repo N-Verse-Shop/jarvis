@@ -1581,10 +1581,24 @@ class VoiceListener(threading.Thread):
                 with self._dialog_history_lock:
                     self._dialog_history.clear()
             # Reset language to RU default and clear any pending states.
+            #
+            # R34-S55.1 Phase 8b (P2 concurrency): the four pending
+            # slots are also touched by the HUD watcher and the
+            # dispatch path at line ~3884 — clearing them WITHOUT the
+            # ``_pending_lock`` (as the prior version did) left a
+            # half-cleared state when force_end_session races with
+            # a concurrent HUD click or voice dispatch. E.g. we null
+            # ``_pending_action`` here while the dispatch path is mid-
+            # snapshot, so the dispatch sees the old reference and
+            # fires the action even though the user just stopped the
+            # session. Lock makes the four-field reset atomic w.r.t.
+            # every other reader/writer of these slots.
             self._active_language = "ru"
-            self._pending_lang_switch = None
-            self._pending_action = None
-            self._pending_upgrade = None
+            with self._pending_lock:
+                self._pending_lang_switch = None
+                self._pending_action = None
+                self._pending_upgrade = None
+                self._pending_confirmation = None
             self.state_manager.force_end_session()
             try:
                 while not self._audio_q.empty():
@@ -3866,19 +3880,37 @@ class VoiceListener(threading.Thread):
         from .action_dispatcher import (
             parse_action, is_confirmation, is_denial,
         )
-        pending = getattr(self, "_pending_action", None)
+        # R34-S55.1 Phase 8b (P2 concurrency double-fire): snapshot
+        # ``pending`` UNDER ``_pending_lock`` and treat it as null if
+        # the slot was cleared between the lock entry and the snapshot.
+        # The prior version read ``_pending_action`` outside the lock,
+        # then re-entered the lock to read ``_pending_confirmation``.
+        # In the race window between those two ops the HUD-watcher path
+        # (``_consume_pending_confirmation_from_hud``) could acquire the
+        # lock, NULL ``_pending_action``, AND execute ``pending.fn()``.
+        # Our captured ``pending`` reference survives the null and we
+        # would then double-fire via the ``is_confirmation`` branch.
+        # Holding the lock for the whole read+clear closes the window;
+        # we release before calling ``pending.fn()`` so the action runs
+        # without holding the lock (preserves the original perf shape
+        # and avoids any cross-thread blocking).
+        with self._pending_lock:
+            pending = self._pending_action
+            hud_choice = self._pending_confirmation
+            # Take ownership of BOTH slots atomically. From this point
+            # on, the HUD watcher and any concurrent dispatch will see
+            # ``_pending_action = None`` and the dispatch path below
+            # uniquely owns ``pending``. This is what makes the double-
+            # fire impossible — without clearing here, the downstream
+            # is_confirmation / is_denial / "user-said-something-new"
+            # branches each naked-clear ``self._pending_action`` AFTER
+            # the lock release, which leaves a window for HUD to
+            # execute against the same pending in parallel.
+            if pending is not None:
+                self._pending_action = None
+            if hud_choice in ("yes", "no"):
+                self._pending_confirmation = None
         if pending is not None:
-            # Audit round 11 fix C1 + round 12 lock fix: HUD ✓/✗ buttons
-            # set ``self._pending_confirmation`` to "yes"/"no". Both the
-            # HUD-watcher helper and this dispatch path consume it; the
-            # read+clear must hold ``_pending_lock`` or a simultaneous
-            # HUD click + voice arrival can both observe "yes", both
-            # clear, both execute → double-fire of the pending action.
-            with self._pending_lock:
-                hud_choice = self._pending_confirmation
-                if hud_choice in ("yes", "no"):
-                    self._pending_confirmation = None
-                    self._pending_action = None
             if hud_choice in ("yes", "no"):
                 if hud_choice == "yes":
                     debug_log(f"executing pending action via HUD: {pending.name}", "voice")

@@ -213,12 +213,22 @@ class DashboardServer:
 
     @staticmethod
     def _safe_compare(a: str, b: str) -> bool:
-        if not a or not b or len(a) != len(b):
-            return False
-        out = 0
-        for x, y in zip(a, b):
-            out |= ord(x) ^ ord(y)
-        return out == 0
+        # R34-S55.1 Phase 8b (P2 auth crypto hygiene): replaced the
+        # hand-rolled byte-compare with stdlib ``hmac.compare_digest``.
+        # The previous implementation:
+        #   1) Returned early on ``len(a) != len(b)`` — leaking token
+        #      length via response timing (microseconds, but observable
+        #      on a LAN with enough samples).
+        #   2) Iterated via ``zip(a, b)`` + ``ord()`` per character —
+        #      pure Python, slower than the C path in ``hmac``, and
+        #      the loop body wasn't reviewed by anyone outside this
+        #      file. ``hmac.compare_digest`` is the canonical primitive,
+        #      audited, constant-time independent of input contents.
+        # ``compare_digest`` handles None/empty by accepting str|bytes;
+        # we coerce ``None`` → ``""`` so empty inputs return False
+        # via the length mismatch rather than raising TypeError.
+        import hmac
+        return hmac.compare_digest(a or "", b or "")
 
     # Paths that must be reachable WITHOUT a token — the SPA shell
     # has to load before the user types one. Everything under /api
@@ -272,8 +282,24 @@ class DashboardServer:
             # CORS allowlist:
             #   • local dev (127.0.0.1 / localhost / file://)
             #   • the public CF-tunnelled origin(s) from env
+            #
+            # R34-S55.1 Phase 8b (P2 DNS-rebinding hardening): the prior
+            # ``startswith("http://127.0.0.1")`` matched
+            # ``http://127.0.0.1.evil.com`` — a DNS-rebinding attack
+            # vector where an attacker-controlled DNS responder returns
+            # the loopback address for a subdomain. The browser sends
+            # ``Origin: http://127.0.0.1.evil.com`` (the original
+            # request URL), which our prefix check used to accept.
+            # Tightening: only accept the bare host OR the host
+            # followed by a port colon — never a host-suffix.
             origin = req.headers.get("Origin", "")
-            ok = origin.startswith(("http://127.0.0.1", "http://localhost", "file://"))
+            ok = (
+                origin == "http://127.0.0.1"
+                or origin == "http://localhost"
+                or origin.startswith("http://127.0.0.1:")
+                or origin.startswith("http://localhost:")
+                or origin.startswith("file://")
+            )
             if not ok and origin:
                 ok = origin in self._public_origin_allowlist()
             if ok:
@@ -1441,13 +1467,32 @@ class DashboardServer:
             pass
         # Best-effort: emit a stream event so audit picks up the
         # text-chat exchange alongside voice turns.
+        #
+        # R34-S55.1 Phase 8b (P2 privacy): scrub user_text + reply_text
+        # through ``scrub_secrets`` BEFORE the emit. The event lands in
+        # events.jsonl AND fans out to every connected WebSocket client
+        # via ``_h_ws_events`` — including connections still alive from
+        # a previously-authenticated browser tab. The 500-char window
+        # is wide enough to carry pasted API keys / OAuth tokens /
+        # passwords / one-time codes. Voice turns route through
+        # ``_safe_user_text`` (which calls the same scrubber), so the
+        # dashboard chat path should match.
         try:
             from ..ipc import get_stream
+            from ..utils.redact import scrub_secrets as _scrub
+            try:
+                safe_user = _scrub(text or "")[:500]
+            except Exception:
+                safe_user = (text or "")[:500]
+            try:
+                safe_reply = _scrub(reply or "")[:500]
+            except Exception:
+                safe_reply = (reply or "")[:500]
             get_stream().emit(
                 "chat_text",
                 source="dashboard",
-                user_text=text[:500],
-                reply_text=(reply or "")[:500],
+                user_text=safe_user,
+                reply_text=safe_reply,
                 model=model,
             )
         except Exception:

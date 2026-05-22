@@ -558,10 +558,47 @@ def register_standby_callback(fn: "Any") -> None:
 
     Idempotent — registering the same callable twice is a no-op so
     processors that get recreated in tests don't pile up duplicates.
+
+    R34-S55.1 Phase 8b (P2 lifetime): the prior ``fn not in
+    _STANDBY_CALLBACKS`` test used object identity. For BOUND METHODS
+    (``self._clear_pending_on_standby``), each ``__init__`` of the
+    owning class produces a fresh bound-method object even though
+    ``__func__`` and the conceptual identity are the same. Across
+    pipeline rebuilds (tests, in-process daemon restart, hot-reload)
+    the list grew monotonically; standby fan-out then called every
+    stale bound method, raising AttributeError on destroyed processors.
+    Errors were swallowed but the list was still unbounded.
+    Defence: also dedupe on the ``(callable.__func__, id(callable.__self__))``
+    pair for bound methods, and use a ``weakref.WeakMethod`` wrapper
+    so destroyed processors' callbacks evict themselves automatically.
     """
+    import weakref
     with _STANDBY_CALLBACKS_LOCK:
-        if fn not in _STANDBY_CALLBACKS:
-            _STANDBY_CALLBACKS.append(fn)
+        # Prune dead weak refs first so the list shrinks naturally.
+        _STANDBY_CALLBACKS[:] = [
+            cb for cb in _STANDBY_CALLBACKS
+            if not (isinstance(cb, weakref.WeakMethod) and cb() is None)
+        ]
+        # If ``fn`` is a bound method, wrap it. Otherwise (plain
+        # function), store directly.
+        try:
+            wrapped: "Any" = weakref.WeakMethod(fn) if hasattr(fn, "__self__") else fn
+        except TypeError:
+            wrapped = fn  # un-weakreferable callable — keep strong ref
+        # Identity for plain functions, (__func__, id(__self__)) for
+        # bound methods.
+        def _same(existing: "Any") -> bool:
+            if existing is wrapped or existing is fn:
+                return True
+            if isinstance(existing, weakref.WeakMethod):
+                resolved = existing()
+                if resolved is None:
+                    return False
+                if hasattr(fn, "__self__"):
+                    return resolved.__func__ is fn.__func__ and resolved.__self__ is fn.__self__
+            return False
+        if not any(_same(cb) for cb in _STANDBY_CALLBACKS):
+            _STANDBY_CALLBACKS.append(wrapped)
 
 
 def _set_standby(value: bool) -> None:
@@ -577,11 +614,18 @@ def _set_standby(value: bool) -> None:
     with _STANDBY_LOCK:
         was, _STANDBY = _STANDBY, value
     if value and not was:
+        import weakref as _weakref
         with _STANDBY_CALLBACKS_LOCK:
             handlers = list(_STANDBY_CALLBACKS)
-        for fn in handlers:
+        for cb in handlers:
+            # Resolve a WeakMethod to its current bound-method, if any.
+            # A dead reference (owning object GC'd) returns None and
+            # we skip — register_standby_callback will prune on next add.
+            resolved = cb() if isinstance(cb, _weakref.WeakMethod) else cb
+            if resolved is None:
+                continue
             try:
-                fn()
+                resolved()
             except Exception:
                 pass
 

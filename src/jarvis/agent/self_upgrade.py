@@ -86,10 +86,20 @@ def write_upgrade_brief(user_request: str) -> Path:
     brief_path = BRIEF_DIR / f"brief-{ts}.md"
 
     # Current git SHA so Claude knows the baseline.
+    #
+    # R34-S55.1 Phase 8b (P2 DoS): added ``timeout=15``. A hung git
+    # invocation (stuck .git/index.lock, stale FS lock from a crashed
+    # gui git tool, NFS-mounted repo with packet loss) would otherwise
+    # block this runner thread indefinitely. The thread is daemonised
+    # so a process restart still works, but the upgrade lock would
+    # stay held and future "self-upgrade" voice commands would silent-
+    # fail forever. 15 s is comfortably above any healthy git
+    # invocation (≤ 100 ms on local FS) and short enough that a real
+    # FS issue surfaces fast.
     try:
         git_sha = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(REPO), text=True,
+            cwd=str(REPO), text=True, timeout=15,
         ).strip()
     except Exception:
         git_sha = "(unknown)"
@@ -303,12 +313,17 @@ def wait_for_completion_and_restart(proc: subprocess.Popen, max_wait_sec: int = 
         return False, f"Самообновление завершилось с ошибкой (код {proc.returncode}). Проверь лог."
 
     # Check if anything actually changed.
+    #
+    # R34-S55.1 Phase 8b (P2 DoS): added ``timeout=15`` — same rationale
+    # as the ``rev-parse`` call above. ``git status --porcelain`` on a
+    # 50K-file working tree is sub-100ms locally; 15 s is a generous
+    # upper bound that still lets us surface a stuck repository fast.
     try:
         status = subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=str(REPO), text=True,
+            ["git", "status", "--porcelain"], cwd=str(REPO), text=True, timeout=15,
         ).strip()
         commits = subprocess.check_output(
-            ["git", "log", "--oneline", "-5"], cwd=str(REPO), text=True,
+            ["git", "log", "--oneline", "-5"], cwd=str(REPO), text=True, timeout=15,
         ).strip()
     except Exception:
         status, commits = "", ""
