@@ -1174,13 +1174,15 @@ class WebSearchTool(Tool):
             return ToolExecutionResult(success=True, reply_text=reply_text)
         except Exception as search_error:
             debug_log(f"search failed: {search_error}", "web")
+            # R34-S53.1 Phase 6c: removed a dead duplicate ``except
+            # Exception`` clause that followed this one. The catch-all
+            # above already covers every Exception subclass, so the
+            # second handler was unreachable — pylint W0705, mypy
+            # ``unreachable`` would both flag it. Removed to keep the
+            # flow honest.
             return ToolExecutionResult(
                 success=False,
                 # R34-S52 H: this reply_text may reach TTS directly on
                 # tool failure — RU-only.
                 reply_text=f"Не удалось выполнить поиск «{search_query}». Возможны проблемы с сетью или сервисом. Попробуй позже или поищи вручную."
             )
-        except Exception as e:  # pragma: no cover (safety net)
-            debug_log(f"error {e}", "web")
-            # R34-S52 H: RU-only TTS fallback.
-            return ToolExecutionResult(success=False, reply_text="Не получилось выполнить поиск в интернете.")

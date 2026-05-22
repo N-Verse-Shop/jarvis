@@ -13,6 +13,7 @@ import math
 import os
 import platform
 import struct
+import subprocess  # R34-S53.1 Phase 6c: was imported only inside _clipboard_paste / _trigger_paste — but _clipboard_snapshot at line ~152 uses subprocess.run too, causing a NameError on every dictation hotkey press on macOS / Linux.
 import sys
 import threading
 import time

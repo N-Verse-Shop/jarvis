@@ -281,7 +281,10 @@ class TestPromptRender:
         store.add("user.coffee", "drinks black coffee")
         store.add("user.lang", "speaks Ukrainian")
         block = render_facts_for_prompt(store)
-        assert block.startswith("Known about you:")
+        # R34-S53.1 Phase 6c: was "Known about you:" — header migrated
+        # to RU ("Что я знаю о тебе:") in S52 Phase 3 when the persona
+        # went RU-only.
+        assert block.startswith("Что я знаю о тебе:")
         assert "black coffee" in block
         assert "Ukrainian" in block
 

@@ -19,7 +19,7 @@ class TestIntentJudgeConfig:
         """Default config has reasonable values."""
         config = IntentJudgeConfig()
         assert config.assistant_name == "Jarvis"
-        assert config.model == "gemma4:e2b"
+        assert config.model == "qwen2.5:3b"
         assert config.timeout_sec == 15.0
         assert config.aliases == []
 
@@ -510,7 +510,7 @@ class TestCreateIntentJudge:
         """Creates judge from config with defaults."""
         mock_cfg = MagicMock()
         mock_cfg.intent_judge_enabled = True
-        mock_cfg.intent_judge_model = "gemma4:e2b"
+        mock_cfg.intent_judge_model = "qwen2.5:3b"
         mock_cfg.ollama_base_url = "http://localhost:11434"
         mock_cfg.intent_judge_timeout_sec = 3.0
         mock_cfg.wake_word = "jarvis"
@@ -519,12 +519,12 @@ class TestCreateIntentJudge:
         judge = create_intent_judge(mock_cfg)
 
         assert judge is not None
-        assert judge.config.model == "gemma4:e2b"
+        assert judge.config.model == "qwen2.5:3b"
 
     def test_always_returns_judge_when_requests_available(self):
         """Always returns judge when requests library is available (per spec)."""
         mock_cfg = MagicMock()
-        mock_cfg.intent_judge_model = "gemma4:e2b"
+        mock_cfg.intent_judge_model = "qwen2.5:3b"
         mock_cfg.ollama_base_url = "http://localhost:11434"
         mock_cfg.intent_judge_timeout_sec = 3.0
         mock_cfg.wake_word = "jarvis"
@@ -540,7 +540,7 @@ class TestWarmUp:
 
     def test_warmup_posts_to_generate_with_keep_alive(self):
         """Warmup issues a /api/generate request that pins the model in memory."""
-        judge = IntentJudge(IntentJudgeConfig(model="gemma4:e2b"))
+        judge = IntentJudge(IntentJudgeConfig(model="qwen2.5:3b"))
         with patch("jarvis.listening.intent_judge.requests") as mock_requests:
             mock_requests.post.return_value = MagicMock(status_code=200)
             ok = judge.warm_up()
@@ -548,7 +548,7 @@ class TestWarmUp:
         assert ok is True
         args, kwargs = mock_requests.post.call_args
         assert args[0].endswith("/api/generate")
-        assert kwargs["json"]["model"] == "gemma4:e2b"
+        assert kwargs["json"]["model"] == "qwen2.5:3b"
         assert kwargs["json"]["keep_alive"] == "30m"
         assert kwargs["json"]["stream"] is False
 

@@ -42,7 +42,10 @@ def test_delete_meal_success(monkeypatch):
     )
     assert isinstance(res, ToolExecutionResult)
     assert res.success is True
-    assert "deleted" in (res.reply_text or "").lower()
+    # R34-S53.1 Phase 6c: reply_text migrated to RU ("Приём пищи
+    # удалён.") in S52 Phase 2. Match the RU stem rather than the
+    # old EN "deleted" substring.
+    assert "удал" in (res.reply_text or "").lower()
 
 
 @pytest.mark.unit
