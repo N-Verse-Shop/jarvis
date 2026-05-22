@@ -4,6 +4,7 @@ PyInstaller spec file for Jarvis Desktop App
 Builds a standalone executable for Windows, macOS, and Linux
 """
 
+import os
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -338,19 +339,36 @@ if sys.platform == 'darwin':
     python_executable = sys.executable
     python_lib_dir = Path(python_executable).parent.parent / 'lib'
 
-    # Try to find OpenSSL in Python's lib directory or common locations
+    # Try to find OpenSSL in Python's lib directory or common locations.
+    # R34-S56.1 Phase 9c (P3): list now covers Intel Homebrew, MacPorts,
+    # conda, and Anaconda installations — the previous Apple-Silicon-
+    # only list silently produced bundles missing libssl on every other
+    # mac dev's machine, which then failed at first https call with
+    # "image not found".
+    homebrew_intel = Path('/usr/local/opt/openssl@3/lib')
+    homebrew_arm = Path('/opt/homebrew/opt/openssl@3/lib')
+    macports = Path('/opt/local/lib')
+    conda_root = Path(os.environ.get('CONDA_PREFIX', '/opt/anaconda3')) / 'lib'
     openssl_candidates = [
-        # Check Python's lib directory (pyenv, virtualenv, etc.)
+        # Check Python's lib directory first (pyenv, virtualenv, etc.)
         python_lib_dir / 'libssl.3.dylib',
         python_lib_dir / 'libcrypto.3.dylib',
-        # Check Homebrew locations (will bundle these into the app)
-        Path('/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib'),
-        Path('/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib'),
+        # Homebrew on Apple Silicon
+        homebrew_arm / 'libssl.3.dylib',
+        homebrew_arm / 'libcrypto.3.dylib',
         Path('/opt/homebrew/lib/libssl.3.dylib'),
         Path('/opt/homebrew/lib/libcrypto.3.dylib'),
-        # Check system locations
+        # Homebrew on Intel
+        homebrew_intel / 'libssl.3.dylib',
+        homebrew_intel / 'libcrypto.3.dylib',
         Path('/usr/local/lib/libssl.3.dylib'),
         Path('/usr/local/lib/libcrypto.3.dylib'),
+        # MacPorts
+        macports / 'libssl.3.dylib',
+        macports / 'libcrypto.3.dylib',
+        # Conda / Anaconda — only if CONDA_PREFIX is exported
+        conda_root / 'libssl.3.dylib',
+        conda_root / 'libcrypto.3.dylib',
     ]
 
     openssl_libs = {
