@@ -351,16 +351,40 @@ class N8NClient:
         active: Optional[bool] = None,
         tags: Optional[List[str]] = None,
         limit: int = 100,
+        max_pages: int = 50,
     ) -> List[Workflow]:
-        """List workflows. Optionally filter by active/tags."""
+        """List workflows. Optionally filter by active/tags.
+
+        R35-S3 F5: paginated. n8n returns ``{"data": [...], "nextCursor": "..."}``
+        and silently caps the page size. The previous implementation read
+        ``data["data"]`` once and discarded ``nextCursor`` → users with
+        >100 workflows had the tail invisible to Jarvis (silent data loss).
+        We now loop on ``nextCursor`` up to ``max_pages`` (safety net
+        against a misbehaving server). 50 pages × 100 = 5000 workflows
+        is far above any sane fleet — but bounded so we never spin
+        forever.
+        """
         params: Dict[str, Any] = {"limit": int(limit)}
         if active is not None:
             params["active"] = "true" if active else "false"
         if tags:
             params["tags"] = ",".join(tags)
-        data = self._request("GET", "/workflows", params=params)
-        items = data.get("data") if isinstance(data, dict) else data
-        return [Workflow.from_api(w) for w in (items or [])]
+        results: List[Workflow] = []
+        cursor: Optional[str] = None
+        for _page in range(max(1, int(max_pages))):
+            if cursor:
+                params["cursor"] = cursor
+            data = self._request("GET", "/workflows", params=params)
+            items = data.get("data") if isinstance(data, dict) else data
+            results.extend(Workflow.from_api(w) for w in (items or []))
+            # Stop on bare-list response shape (older n8n versions) or
+            # when the server signals no further pages.
+            if not isinstance(data, dict):
+                break
+            cursor = data.get("nextCursor") or data.get("next_cursor")
+            if not cursor:
+                break
+        return results
 
     def get_workflow(self, workflow_id: str) -> Workflow:
         """Fetch a single workflow by ID."""

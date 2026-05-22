@@ -1413,12 +1413,62 @@ class DashboardServer:
                 {"ok": False, "error": "text too long (max 8000 chars)"},
                 status=400,
             )
-        # Pull live config so model/url match what the daemon uses.
-        # R34-S30 fix: the previous import was `from ..config import settings`
-        # which doesn't exist — the public API is `load_settings()`. The
-        # ImportError silently swallowed every chat call into the qwen3:8b
-        # default, which (a) ignores `think:false` over the OpenAI shim
-        # and (b) dumps everything to `reasoning` → empty `content`.
+        # R35-S3 F2: route through run_reply_engine so the dashboard
+        # textbox gets the SAME tool affordance as the voice path. The
+        # legacy implementation POSTed straight to Ollama /api/chat
+        # without any `tools=` parameter — meaning n8nAutomation, web
+        # search, mac control, memory, etc. were ALL invisible to the
+        # LLM. Live evidence (Phase A audit): user typed "какие у меня
+        # сейчас автоматизации" and got a confident fabrication about
+        # "CI/CD на GitLab, мониторинг через Prometheus и Grafana"
+        # because the n8n tool was never offered. This block falls back
+        # to the raw Ollama call if the engine can't be set up (e.g.
+        # daemon globals not initialised yet during cold start).
+        try:
+            from ..config import load_settings
+            from ..memory.db import Database
+            from .. import daemon as _daemon_mod
+            from ..reply.engine import run_reply_engine
+            _cfg = load_settings()
+            _db = Database(_cfg.db_path, _cfg.sqlite_vss_path)
+            _dm = getattr(_daemon_mod, "_global_dialogue_memory", None)
+            if _dm is not None:
+                # Run the engine on a worker thread — it's a synchronous
+                # function that holds the GIL for LLM streaming and would
+                # block the dashboard event loop if awaited directly.
+                loop = asyncio.get_running_loop()
+                def _run_engine_sync() -> str:
+                    return run_reply_engine(
+                        _db, _cfg, None,  # tts=None — text-only response
+                        text, _dm,
+                        language=None,
+                        abort_event=None,
+                    ) or ""
+                reply = await loop.run_in_executor(None, _run_engine_sync)
+                # Best-effort: emit a stream event for audit/HUD parity.
+                try:
+                    from ..ipc import get_stream
+                    get_stream().emit(
+                        "dashboard_chat_reply",
+                        text=text[:200],
+                        reply=reply[:200],
+                        path="engine",
+                    )
+                except Exception:
+                    pass
+                return web.json_response({
+                    "ok": True,
+                    "reply": reply,
+                    "model": getattr(_cfg, "ollama_chat_model", "qwen3:8b"),
+                    "path": "engine",
+                })
+        except Exception as exc:
+            log.warning(
+                "chat: engine path failed, falling back to raw Ollama: %r", exc
+            )
+        # ── fallback: raw Ollama (no tools, no memory) ─────────────────
+        # Kept as a safety net so the textbox at least returns SOMETHING
+        # if the engine path errors (cold-start race, db lock, etc.).
         cfg = None
         base_url = "http://127.0.0.1:11434"
         # qwen2.5:3b — chosen because it has no reasoning mode (the

@@ -161,7 +161,21 @@ _STOP_WORDS = frozenset({
     "off", "over", "just", "also", "very", "too", "some", "any", "all",
 })
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+#
+# R35-S3 F4: include Cyrillic letters in the token regex.
+#
+# OLD: r"[a-z0-9]+" — stripped ALL Russian/Ukrainian. The n8nAutomation
+# tool ships a Russian description ("Управляй автоматизациями…") and the
+# user issues Russian queries ("запусти автоматизацию", "какие у меня
+# workflows"). Both sides tokenised to small EN-only fragment sets,
+# yielding tiny overlap → tool selector silently skipped the tool →
+# the LLM had no n8nAutomation in its short-list and confabulated about
+# "CI/CD на GitLab, Prometheus, Grafana" (Phase A live evidence).
+#
+# NEW: include Cyrillic basic range (U+0400-U+04FF) so "автоматизация",
+# "workflow", "запусти" all tokenize. Case-folding via .lower() already
+# handles Cyrillic correctly in Python.
+_TOKEN_RE = re.compile(r"[a-z0-9Ѐ-ӿ]+")
 _CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
 
 

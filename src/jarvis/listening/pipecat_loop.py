@@ -5160,6 +5160,7 @@ async def _interrupt_flag_poller(task: Any) -> None:
     enough that 4 stat-calls/s is dwarfed by the rest of the loop.
     """
     from pathlib import Path as _P
+    import time as _time  # R35-S3 F1: needed for control.json age-guard
     base = _P.home() / "Library/Application Support/jarvis"
     flag = base / "interrupt.flag"
     # R34-S30: ALSO poll a transcription-injection flag so the
@@ -5178,6 +5179,12 @@ async def _interrupt_flag_poller(task: Any) -> None:
     # the same end_session multiple times.
     ctrl_file = base / "control.json"
     _seen_ctl_ts: float = 0.0
+    # R35-S3 F1: ignore stale control.json files left over from a previous
+    # daemon lifecycle. Without this guard, a 9-hour-old end_session flag
+    # would re-engage standby on every daemon restart and the user would
+    # be wake-word-deaf forever. 600 s window is generous — anything older
+    # than 10 minutes is clearly from a prior session.
+    _CTRL_MAX_AGE_S = 600.0
     try:
         # Use late import so a missing pipecat install doesn't break
         # the whole module — _amain only runs when pipecat is loaded.
@@ -5205,7 +5212,22 @@ async def _interrupt_flag_poller(task: Any) -> None:
                     ctl = _json_ctl.loads(raw) if raw.strip() else {}
                     action_ = str(ctl.get("action") or "").lower()
                     ts_ = float(ctl.get("ts") or 0)
-                    if ts_ > _seen_ctl_ts and action_ in (
+                    # R35-S3 F1: age-guard — anything older than 10 minutes
+                    # is from a prior daemon lifecycle and must NOT trigger
+                    # standby (root cause of the cycle-7 wake-word miss).
+                    now_ = _time.time()
+                    _stale = (now_ - ts_) > _CTRL_MAX_AGE_S
+                    if _stale and ts_ > 0:
+                        debug_log(
+                            f"control.json: ignoring stale ts={ts_:.0f} "
+                            f"(age {(now_ - ts_):.0f}s > {_CTRL_MAX_AGE_S:.0f}s) — unlinking",
+                            "pipecat",
+                        )
+                        try:
+                            ctrl_file.unlink()
+                        except Exception:
+                            pass
+                    elif ts_ > _seen_ctl_ts and action_ in (
                         "end_session", "stop_session", "session_end",
                         "standby", "close",
                     ):
@@ -5235,6 +5257,19 @@ async def _interrupt_flag_poller(task: Any) -> None:
                             _write_hud_state_atomic("IDLE", level=0.0)
                         except Exception:
                             pass
+                        # R35-S3 F1: unlink AFTER processing so the next
+                        # daemon restart doesn't re-consume this entry.
+                        # Same pattern as interrupt.flag below. Tolerate
+                        # races with the HUD writer.
+                        try:
+                            ctrl_file.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except Exception as exc:
+                            debug_log(
+                                f"control.json unlink failed: {exc!r}",
+                                "pipecat",
+                            )
                 except Exception as exc:
                     debug_log(
                         f"control.json poll error: {exc!r}",
