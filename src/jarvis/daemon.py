@@ -156,6 +156,33 @@ def is_stop_requested() -> bool:
     return _global_stop_requested
 
 
+def get_dialogue_memory():
+    """Return the live DialogueMemory if the daemon has finished init.
+
+    R35-S3 FIX: ``python -m jarvis.daemon`` runs the module as
+    ``__main__`` — so ``sys.modules['__main__']`` and
+    ``sys.modules['jarvis.daemon']`` are DIFFERENT module objects with
+    independent globals. Code that does ``from .. import daemon`` later
+    (e.g. the dashboard chat handler) gets the `jarvis.daemon` copy,
+    whose ``_global_dialogue_memory`` is None because ``main()`` only
+    ran in the ``__main__`` copy. This helper checks both — it returns
+    whichever module instance actually has the DialogueMemory set.
+    """
+    import sys
+    # Try the calling module's own global first (works when daemon.py
+    # is imported as 'jarvis.daemon' AND main() ran in that copy).
+    if _global_dialogue_memory is not None:
+        return _global_dialogue_memory
+    # Fallback: when launched via 'python -m jarvis.daemon', __main__
+    # holds the populated globals.
+    _main = sys.modules.get("__main__")
+    if _main is not None:
+        dm = getattr(_main, "_global_dialogue_memory", None)
+        if dm is not None:
+            return dm
+    return None
+
+
 def get_tts_engine():
     """Get the global TTS engine for speaking state polling (used by face widget)."""
     return _global_tts_engine

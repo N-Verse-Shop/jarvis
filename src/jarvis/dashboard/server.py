@@ -1455,7 +1455,15 @@ class DashboardServer:
             from ..reply.engine import run_reply_engine
             _cfg = load_settings()
             _db = Database(_cfg.db_path, _cfg.sqlite_vss_path)
-            _dm = getattr(_daemon_mod, "_global_dialogue_memory", None)
+            # R35-S3 FIX (smoke-test follow-up): ``python -m jarvis.daemon``
+            # creates BOTH __main__ and jarvis.daemon module objects.
+            # main() only sets the global in __main__'s copy, so direct
+            # getattr on the imported module returns None. The helper
+            # walks both locations and returns the live DialogueMemory.
+            try:
+                _dm = _daemon_mod.get_dialogue_memory()
+            except Exception:
+                _dm = getattr(_daemon_mod, "_global_dialogue_memory", None)
             if _dm is not None:
                 # Run the engine on a worker thread — it's a synchronous
                 # function that holds the GIL for LLM streaming and would
