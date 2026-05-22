@@ -1329,7 +1329,14 @@ class DashboardServer:
                 import os as _os, signal as _sig
                 _os.kill(_os.getpid(), _sig.SIGTERM)
 
-        asyncio.create_task(_do_restart())
+        # R34-S55.1 Phase 8c (P3 hygiene): retain the task reference.
+        # ``asyncio.create_task`` returns a Task whose only reference is
+        # held by the event loop's _scheduled queue. PEP-3156 / GH-bpo-37658
+        # documents that the loop can drop the task before it runs if no
+        # one keeps a strong reference. In practice the restart happens
+        # in tens of ms so the risk is low, but stashing on a class-level
+        # set ensures durability.
+        self._restart_task = asyncio.create_task(_do_restart())
         # Force HTTP/1.1 Connection: close so the browser treats the
         # response as complete on socket close. Pin Content-Length to
         # avoid any chunked-transfer ambiguity.

@@ -518,6 +518,18 @@ class FactStore:
                 self._conn.close()
             except Exception:
                 pass
+        # R34-S55.1 Phase 8c (P3 hygiene): clear the module-level
+        # singleton pointer so a stray thread mid-shutdown that
+        # calls ``get_facts_store()`` gets a freshly-opened store
+        # instead of a closed-handle ``sqlite3.ProgrammingError`` from
+        # operations on a closed connection. The daemon ``os._exit(0)``
+        # race-out at daemon.py:1075 covers this in practice, but
+        # the in-process test path (and any in-process restart cycle)
+        # depends on this for predictable behaviour.
+        global _GLOBAL_STORE
+        with _GLOBAL_LOCK:
+            if _GLOBAL_STORE is self:
+                _GLOBAL_STORE = None
 
 
 # ---- helpers ----
