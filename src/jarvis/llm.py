@@ -77,10 +77,23 @@ def _validate_base_url(base_url: str) -> None:
         ip = ipaddress.ip_address(host)
     except ValueError:
         # Hostname (non-IP) — best-effort resolve and re-check.
+        # R34-S56.1 Phase 9b (P2): the bare ``socket.gethostbyname``
+        # call can block ~30s on Tailscale NXDOMAIN because mDNS +
+        # search-domain probing has no upper bound on macOS. Wrap it
+        # in a thread + 2s deadline; the SSRF guard fails closed if we
+        # can't resolve in time (cheap, refuses on doubt vs. allows by
+        # default).
         import socket as _socket
+        import concurrent.futures as _cf
+        def _resolve_blocking() -> str:
+            return _socket.gethostbyname(host)
         try:
-            resolved = _socket.gethostbyname(host)
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(_resolve_blocking)
+                resolved = _fut.result(timeout=2.0)
             ip = ipaddress.ip_address(resolved)
+        except _cf.TimeoutError as exc:
+            raise _BaseUrlRejected(f"DNS resolve timed out for {host} after 2s")
         except (OSError, ValueError) as exc:
             raise _BaseUrlRejected(f"could not resolve {host}: {exc}")
     # Tailscale CGNAT 100.64.0.0/10 is officially "Carrier-Grade NAT"
@@ -103,6 +116,16 @@ def _validate_base_url(base_url: str) -> None:
 # server-side analogue of ``Timeout``. Audit round 15 fix F5.
 _RETRYABLE_STATUS = {408, 502, 503, 504}
 _MAX_RETRIES = 3
+
+# R34-S56.1 Phase 9b (P2): Tailscale CGNAT mappings can go stale —
+# urllib3's default keep-alive keeps the dead socket cached in the
+# connection pool, so the *next* request inherits a dead TCP path and
+# stalls for the full ``timeout_sec`` before the kernel notices. Force
+# the server to tear the socket down after each response so every call
+# gets a fresh ARP/route resolution. This is the same fix applied in
+# intent_judge.py + listener.py — keep the headers identical so the
+# behaviour is uniform across modules.
+_OLLAMA_HEADERS = {"Connection": "close"}
 
 
 def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_content: str, timeout_sec: float = 10.0, thinking: bool = False, num_ctx: int = 8192, temperature: Optional[float] = None) -> Optional[str]:
@@ -157,7 +180,12 @@ def call_llm_direct(base_url: str, chat_model: str, system_prompt: str, user_con
     last_exc: Optional[Exception] = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            with requests.post(f"{base_url.rstrip('/')}/api/chat", json=payload, timeout=timeout_sec) as resp:
+            with requests.post(
+                f"{base_url.rstrip('/')}/api/chat",
+                json=payload,
+                timeout=timeout_sec,
+                headers=_OLLAMA_HEADERS,
+            ) as resp:
                 if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
                     sleep_for = 0.5 * (2 ** (attempt - 1))
                     debug_log(
@@ -280,6 +308,7 @@ def call_llm_streaming(
             json=payload,
             timeout=timeout_sec,
             stream=True,
+            headers=_OLLAMA_HEADERS,
         ) as resp:
             resp.raise_for_status()
 
@@ -492,7 +521,12 @@ def chat_with_messages(
                 pass
             return None
         try:
-            with requests.post(f"{base_url.rstrip('/')}/api/chat", json=payload, timeout=timeout_sec) as resp:
+            with requests.post(
+                f"{base_url.rstrip('/')}/api/chat",
+                json=payload,
+                timeout=timeout_sec,
+                headers=_OLLAMA_HEADERS,
+            ) as resp:
                 if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES - 1:
                     try:
                         from .debug import debug_log

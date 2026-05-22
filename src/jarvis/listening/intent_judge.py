@@ -23,6 +23,13 @@ except ImportError:
     REQUESTS_AVAILABLE = False
 
 
+# R34-S56.1 Phase 9b (P2): Connection-close headers for every Ollama
+# POST so urllib3's keep-alive pool doesn't cache a dead Tailscale
+# socket between successive calls. Mirrors the same constant in
+# src/jarvis/llm.py — keep the value identical.
+_OLLAMA_HEADERS = {"Connection": "close"}
+
+
 def warm_up_ollama_model(base_url: str, model: str, timeout: float) -> bool:
     """Ask Ollama to load ``model`` into memory with a 24h keep_alive.
 
@@ -56,6 +63,11 @@ def warm_up_ollama_model(base_url: str, model: str, timeout: float) -> bool:
                 "options": {"num_predict": 1},
             },
             timeout=timeout,
+            # R34-S56.1 Phase 9b (P2): force socket teardown so a stale
+            # Tailscale NAT mapping from the previous warmup doesn't
+            # carry over into the next request (urllib3's default pool
+            # otherwise caches the dead TCP path).
+            headers=_OLLAMA_HEADERS,
         )
         ok = response.status_code == 200
         debug_log(
@@ -429,6 +441,7 @@ Examples (English+Ukrainian+Russian):
                     },
                 },
                 timeout=max(self.config.timeout_sec, 60.0),
+                headers=_OLLAMA_HEADERS,
             )
             ok = response.status_code == 200
             debug_log(
@@ -520,6 +533,7 @@ Examples (English+Ukrainian+Russian):
                     },
                 },
                 timeout=self.config.timeout_sec,
+                headers=_OLLAMA_HEADERS,
             )
 
             if response.status_code != 200:

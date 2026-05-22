@@ -105,6 +105,14 @@ class Settings:
     # ``ollama_chat_model``. See ``intent_complexity_router_enabled``.
     ollama_chat_model_light: str
     intent_complexity_router_enabled: bool
+    # R34-S56.1 Phase 9a (P1): the dashboard advertises these two as
+    # writable + read keys (see dashboard/server.py:_SETTINGS_*), and
+    # pipecat_loop reads them via ``_raw_cfg.get(...)`` — but a
+    # ``cfg.ollama_chat_temperature`` access elsewhere would raise
+    # AttributeError silently because there's no field declared. Pin
+    # them officially so the dataclass matches the dashboard contract.
+    ollama_chat_temperature: float
+    ollama_chat_num_predict: int
     llm_chat_timeout_sec: float
     llm_tools_timeout_sec: float
     # Tight deadline for the cheap distil passes used by memory_digest and
@@ -144,6 +152,11 @@ class Settings:
     tts_piper_noise_scale: float  # Audio variation
     tts_piper_noise_w: float  # Phoneme width variation
     tts_piper_sentence_silence: float  # Post-sentence silence in seconds
+    # R34-S56.1 Phase 9a (P1): canonical short voice id used by Pipecat
+    # loop (e.g. ``ru_RU-ruslan-medium``) — picked by dashboard PATCH.
+    # When None falls through to ``tts_piper_model_path`` or a
+    # hard-coded default. See pipecat_loop._build_pipecat_config.
+    piper_voice: str | None
 
     # Voice Input & Audio
     voice_device: str | None
@@ -185,6 +198,15 @@ class Settings:
     endpoint_silence_ms: int
     max_utterance_ms: int
     tts_max_utterance_ms: int
+    # R34-S56.1 Phase 9a (P1): explicit Silero VAD threshold override
+    # for the Pipecat loop. ``None`` = use the loop's adaptive default
+    # (currently 0.5). Dashboard validates 0.0..1.0.
+    silero_vad_threshold: float | None
+    # R34-S56.1 Phase 9a (P1): the active reply language for prompts,
+    # canned replies, and TTS voice selection. "ru" by default since
+    # R34-S48; pipecat_loop falls back to whisper_language when this
+    # is None. Allowed: "ru" | "uk" | "en" | "de".
+    active_language: str
 
     # UI/UX Features
     tune_enabled: bool
@@ -511,6 +533,12 @@ def get_default_config() -> Dict[str, Any]:
         "ollama_base_url": "http://127.0.0.1:11434",
         "ollama_embed_model": "nomic-embed-text",
         "ollama_chat_model": DEFAULT_CHAT_MODEL,
+        # R34-S56.1 Phase 9a (P1): chat-time tuning knobs — must match
+        # the dashboard's settings panel. 0.4 favours steady RU
+        # responses without crushing variety; 220 tokens covers a
+        # typical voice-reply turn without truncating mid-sentence.
+        "ollama_chat_temperature": 0.4,
+        "ollama_chat_num_predict": 220,
         "llm_chat_timeout_sec": 180.0,
         "llm_tools_timeout_sec": 300.0,
         # Cheap distil passes should fail fast — a hung digest call would
@@ -549,6 +577,10 @@ def get_default_config() -> Dict[str, Any]:
         "tts_piper_noise_scale": 0.8,  # Audio variation (higher = more expressive)
         "tts_piper_noise_w": 1.0,  # Phoneme width variation (higher = more lively)
         "tts_piper_sentence_silence": 0.2,  # Post-sentence silence in seconds
+        # R34-S56.1 Phase 9a (P1): canonical short voice id for Pipecat.
+        # Default keeps the post-R34-S48 Russian male voice; the
+        # dashboard catalog drives user selection.
+        "piper_voice": "ru_RU-ruslan-medium",
 
         # Voice Input & Audio
         "voice_device": None,
@@ -587,6 +619,15 @@ def get_default_config() -> Dict[str, Any]:
         "endpoint_silence_ms": 800,
         "max_utterance_ms": 12000,
         "tts_max_utterance_ms": 3000,  # Shorter timeout during TTS for quick stop detection
+        # R34-S56.1 Phase 9a (P1): None = let pipecat_loop apply its
+        # adaptive default (0.5 currently). Numeric override 0.0..1.0
+        # forces a fixed Silero VAD threshold regardless of the loop's
+        # auto-tuning logic.
+        "silero_vad_threshold": None,
+        # R34-S56.1 Phase 9a (P1): RU-first persona default after S48
+        # migration. Dashboard restricts to ru|uk|en|de. Pipecat loop
+        # uses this to pick canned replies + language-lock prompts.
+        "active_language": "ru",
 
         # UI/UX Features
         "tune_enabled": True,
@@ -757,6 +798,25 @@ def load_settings() -> Settings:
     intent_complexity_router_enabled = bool(
         merged.get("intent_complexity_router_enabled", False)
     )
+    # R34-S56.1 Phase 9a (P1): chat-time tuning knobs surfaced via
+    # dashboard. Coerce defensively — a JSON null in the config used to
+    # raise TypeError at boot (`float(None)`) and crash load_settings.
+    try:
+        _temp_raw = merged.get("ollama_chat_temperature", 0.4)
+        ollama_chat_temperature = 0.4 if _temp_raw is None else float(_temp_raw)
+    except (TypeError, ValueError):
+        ollama_chat_temperature = 0.4
+    # Clamp to a sane range — Ollama accepts 0.0..2.0 but anything
+    # above 1.5 produces unreadable RU output for a voice assistant.
+    if not 0.0 <= ollama_chat_temperature <= 2.0:
+        ollama_chat_temperature = 0.4
+    try:
+        _np_raw = merged.get("ollama_chat_num_predict", 220)
+        ollama_chat_num_predict = 220 if _np_raw is None else int(_np_raw)
+    except (TypeError, ValueError):
+        ollama_chat_num_predict = 220
+    if ollama_chat_num_predict <= 0 or ollama_chat_num_predict > 8192:
+        ollama_chat_num_predict = 220
     use_stdin = bool(merged.get("use_stdin", False))
     active_profiles = _ensure_list(merged.get("active_profiles"))
     tts_enabled = bool(merged.get("tts_enabled", True))
@@ -799,6 +859,19 @@ def load_settings() -> Settings:
     tts_piper_noise_scale = float(merged.get("tts_piper_noise_scale", 0.8))
     tts_piper_noise_w = float(merged.get("tts_piper_noise_w", 1.0))
     tts_piper_sentence_silence = float(merged.get("tts_piper_sentence_silence", 0.2))
+    # R34-S56.1 Phase 9a (P1): piper_voice — short id used by pipecat
+    # loop. Validate the same regex the dashboard PATCH applies so a
+    # hand-edited config can't smuggle in path-traversal patterns.
+    piper_voice_val = merged.get("piper_voice")
+    if piper_voice_val in (None, "", "null"):
+        piper_voice = "ru_RU-ruslan-medium"
+    else:
+        import re as _re_pv
+        _pv = str(piper_voice_val).strip()
+        if _re_pv.fullmatch(r"[a-zA-Z]{2,3}_[A-Z]{2}-[a-zA-Z0-9_]+-[a-z_]+", _pv):
+            piper_voice = _pv
+        else:
+            piper_voice = "ru_RU-ruslan-medium"
 
     voice_device_val = merged.get("voice_device")
     voice_device = None if voice_device_val in (None, "", "default", "system") else str(voice_device_val)
@@ -836,6 +909,26 @@ def load_settings() -> Settings:
     endpoint_silence_ms = int(merged.get("endpoint_silence_ms", 800))
     max_utterance_ms = int(merged.get("max_utterance_ms", 12000))
     tts_max_utterance_ms = int(merged.get("tts_max_utterance_ms", 3000))
+    # R34-S56.1 Phase 9a (P1): silero_vad_threshold — None = let
+    # pipecat_loop pick its own default. Numeric override must sit in
+    # the same 0.0..1.0 band as the dashboard validator.
+    _svt_raw = merged.get("silero_vad_threshold")
+    silero_vad_threshold: float | None
+    if _svt_raw is None or _svt_raw == "" or _svt_raw == "null":
+        silero_vad_threshold = None
+    else:
+        try:
+            _svt = float(_svt_raw)
+            silero_vad_threshold = _svt if 0.0 <= _svt <= 1.0 else None
+        except (TypeError, ValueError):
+            silero_vad_threshold = None
+    # R34-S56.1 Phase 9a (P1): active_language — guarded against
+    # garbage codes that would otherwise leak into prompt selection.
+    _al_raw = merged.get("active_language", "ru")
+    _al = (str(_al_raw).strip().lower() if _al_raw is not None else "ru")
+    if _al not in ("ru", "uk", "en", "de"):
+        _al = "ru"
+    active_language = _al
     sample_rate = int(merged.get("sample_rate", 16000))
     tune_enabled = bool(merged.get("tune_enabled", True))
     hot_window_enabled = bool(merged.get("hot_window_enabled", True))
@@ -998,6 +1091,8 @@ def load_settings() -> Settings:
         ollama_chat_model=ollama_chat_model,
         ollama_chat_model_light=ollama_chat_model_light,
         intent_complexity_router_enabled=intent_complexity_router_enabled,
+        ollama_chat_temperature=ollama_chat_temperature,
+        ollama_chat_num_predict=ollama_chat_num_predict,
         llm_chat_timeout_sec=llm_chat_timeout_sec,
         llm_tools_timeout_sec=llm_tools_timeout_sec,
         llm_digest_timeout_sec=llm_digest_timeout_sec,
@@ -1030,6 +1125,7 @@ def load_settings() -> Settings:
         tts_piper_noise_scale=tts_piper_noise_scale,
         tts_piper_noise_w=tts_piper_noise_w,
         tts_piper_sentence_silence=tts_piper_sentence_silence,
+        piper_voice=piper_voice,
 
         # Voice Input & Audio
         voice_device=voice_device,
@@ -1068,6 +1164,8 @@ def load_settings() -> Settings:
         endpoint_silence_ms=endpoint_silence_ms,
         max_utterance_ms=max_utterance_ms,
         tts_max_utterance_ms=tts_max_utterance_ms,
+        silero_vad_threshold=silero_vad_threshold,
+        active_language=active_language,
 
         # UI/UX Features
         tune_enabled=tune_enabled,

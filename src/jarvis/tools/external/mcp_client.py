@@ -25,6 +25,68 @@ class MCPServerSessionError(RuntimeError):
     to ``MCPClient`` callers.
     """
 
+
+# R34-S56.1 Phase 9b (P2): defensive bounds on MCP-returned schemas.
+# A misbehaving (or malicious) MCP server can hand us back an
+# inputSchema that is megabytes wide, infinitely recursive, or the
+# wrong type entirely — anything we forward unchecked then propagates
+# into the tool router, the registry cache, and eventually the LLM
+# prompt that picks tools. The caps below are deliberately generous
+# (real-world Claude-Desktop / Sourcegraph / Linear servers all sit
+# well under 50 KB / depth 8) so they only trigger on pathological
+# payloads.
+_MCP_SCHEMA_MAX_BYTES = 200_000      # 200 KB serialized JSON
+_MCP_SCHEMA_MAX_DEPTH = 8            # JSON-Schema rarely nests past 4
+
+
+def _sanitize_mcp_schema(schema: Any) -> Optional[Dict[str, Any]]:
+    """Validate + size-cap an MCP-returned input schema.
+
+    Returns ``None`` if the schema is missing, the wrong type, too
+    deep, or too large; otherwise returns the original dict. We
+    deliberately don't try to "fix up" partial schemas — a truncated
+    schema would mislead the LLM router into thinking unknown args
+    are valid. Failing closed forces the tool to surface as
+    "untyped", which the registry treats as a free-form blob.
+    """
+    if schema is None:
+        return None
+    if not isinstance(schema, dict):
+        return None
+
+    # Depth check first — recursive references would blow the stack on
+    # the serialize step otherwise.
+    def _depth(node: Any, level: int = 0) -> int:
+        if level > _MCP_SCHEMA_MAX_DEPTH:
+            return level
+        if isinstance(node, dict):
+            if not node:
+                return level
+            return max((_depth(v, level + 1) for v in node.values()), default=level)
+        if isinstance(node, list):
+            if not node:
+                return level
+            return max((_depth(v, level + 1) for v in node), default=level)
+        return level
+
+    try:
+        if _depth(schema) > _MCP_SCHEMA_MAX_DEPTH:
+            return None
+    except RecursionError:
+        return None
+
+    # Size check — json.dumps will raise on unencodable types (e.g.
+    # callables, custom classes), which is also a fail-closed signal.
+    try:
+        import json as _json
+        encoded = _json.dumps(schema, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if len(encoded.encode("utf-8")) > _MCP_SCHEMA_MAX_BYTES:
+        return None
+
+    return schema
+
 # Static directories to search when a command isn't on the daemon's PATH.
 # macOS GUI-launched processes often miss Homebrew, nvm, fnm, and Volta paths.
 _EXTRA_PATH_DIRS: List[str] = [
@@ -253,11 +315,16 @@ class MCPClient:
             
             result = []
             for t in tools_list:
-                # Handle Tool objects with attributes
+                # Handle Tool objects with attributes.
+                # R34-S56.1 Phase 9b (P2): clamp the inputSchema so a
+                # pathological server can't propagate a 5 MB recursive
+                # JSON into our tool router + registry cache.
                 tool_info = {
                     "name": getattr(t, "name", None),
                     "description": getattr(t, "description", None),
-                    "inputSchema": getattr(t, "inputSchema", None),
+                    "inputSchema": _sanitize_mcp_schema(
+                        getattr(t, "inputSchema", None)
+                    ),
                 }
                 result.append(tool_info)
             return result
@@ -287,11 +354,16 @@ class MCPClient:
         tools_list = getattr(res, "tools", res) if hasattr(res, "tools") else res
         result: List[Dict[str, Any]] = []
         for t in tools_list:
+            # R34-S56.1 Phase 9b (P2): same sanitisation as the async
+            # path — keep the two sites uniform so a server that
+            # passes via one but fails via the other can't sneak in.
             result.append(
                 {
                     "name": getattr(t, "name", None),
                     "description": getattr(t, "description", None),
-                    "inputSchema": getattr(t, "inputSchema", None),
+                    "inputSchema": _sanitize_mcp_schema(
+                        getattr(t, "inputSchema", None)
+                    ),
                 }
             )
         return result

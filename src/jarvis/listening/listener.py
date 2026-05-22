@@ -2805,6 +2805,11 @@ class VoiceListener(threading.Thread):
                 # return in 8-30s. 600 num_predict at 6 tok/s = 100s.
                 timeout=240.0,
                 stream=True,
+                # R34-S56.1 Phase 9b (P2): Connection: close mirrors
+                # llm.py + intent_judge.py — drops stale Tailscale
+                # sockets from urllib3's keep-alive pool between
+                # successive direct-chat replies.
+                headers={"Connection": "close"},
             )
             if response.status_code != 200:
                 debug_log(
@@ -3079,6 +3084,9 @@ class VoiceListener(threading.Thread):
                                     },
                                 },
                                 timeout=90.0,
+                                # R34-S56.1 Phase 9b (P2): Connection:
+                                # close — see top of direct-chat post.
+                                headers={"Connection": "close"},
                             )
                             if r2.status_code == 200:
                                 d2 = r2.json()
@@ -5185,6 +5193,11 @@ class VoiceListener(threading.Thread):
                                     "keep_alive": "24h",
                                 },
                                 timeout=10.0,
+                                # R34-S56.1 Phase 9b (P2): close socket
+                                # so the keepalive itself doesn't
+                                # cache a dead Tailscale path between
+                                # idle ticks (every 60-180s).
+                                headers={"Connection": "close"},
                             )
                             debug_log(f"LLM keepalive ping ok ({_model})", "voice")
                         except Exception as e_inner:
