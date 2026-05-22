@@ -775,7 +775,36 @@ def export_example_config(include_db_path: bool = False) -> Dict[str, Any]:
 
 
 def load_settings() -> Settings:
-    # Load environment for debug toggles and optional config file path only
+    # Load environment for debug toggles, API keys, and optional config file path.
+    #
+    # R35-S2 (env-discovery fix): ``load_dotenv()`` with no args searches
+    # from the CWD upwards — but the LaunchAgent sets WorkingDirectory to
+    # the repo root, so a .env at ``~/.config/jarvis/.env`` was NEVER
+    # picked up. The user reported "I added JARVIS_N8N_API_KEY to .env
+    # but Jarvis says n8n is not configured". Root cause: wrong search
+    # root. Fix: also try the canonical Jarvis config dir, plus repo root,
+    # plus the user's home directory — each layered with override=False
+    # so earlier files (more specific) win over later (more general).
+    # Existing environment vars (set by launchd / shell) ALWAYS win because
+    # of override=False on the first call.
+    _jarvis_cfg_dir = default_config_path().parent  # honours XDG_CONFIG_HOME
+    _candidate_env_files = [
+        Path(os.environ.get("JARVIS_DOTENV_PATH", "")).expanduser() if os.environ.get("JARVIS_DOTENV_PATH") else None,
+        _jarvis_cfg_dir / ".env",  # ~/.config/jarvis/.env (canonical)
+        Path.cwd() / ".env",       # legacy: repo-root .env
+        Path.home() / ".env",      # global home .env
+    ]
+    for _envp in _candidate_env_files:
+        if _envp is None:
+            continue
+        try:
+            if _envp.is_file():
+                load_dotenv(dotenv_path=_envp, override=False)
+        except Exception:
+            # Defensive — never let a bad .env block daemon startup.
+            pass
+    # Also call the default search so any .env in CWD chain still works
+    # for tests / dev runs without explicit JARVIS_DOTENV_PATH.
     load_dotenv(override=False)
 
     # Resolve config path
