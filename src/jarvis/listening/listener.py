@@ -2704,7 +2704,12 @@ class VoiceListener(threading.Thread):
         messages.append({"role": "user", "content": query})
 
         try:
-            t0 = _time.time()
+            # R34-S54.1 Phase 7b: monotonic for elapsed math. The same
+            # NTP-step pitfall S52 H / S53.1 I-3 fixed for the echo-gate
+            # applies to every elapsed-time anchor in this file. ``t0``
+            # is paired with the elapsed read 200+ lines below; both
+            # must use the same clock.
+            t0 = _time.monotonic()
             # STREAMING mode: ollama emits NDJSON, each line is a partial
             # `{"message":{"content":"..."}}`. We accumulate content
             # token-by-token and SPEAK the first complete sentence the
@@ -2902,7 +2907,9 @@ class VoiceListener(threading.Thread):
                         chunk = msg.get("content", "") or ""
                     if chunk:
                         if first_tok_t is None:
-                            first_tok_t = _time.time() - t0
+                            # R34-S54.1 Phase 7b: monotonic — paired
+                            # with t0 above.
+                            first_tok_t = _time.monotonic() - t0
                             debug_log(
                                 f"first token in {first_tok_t:.2f}s",
                                 "voice",
@@ -2948,7 +2955,8 @@ class VoiceListener(threading.Thread):
             if tail and len(tail) >= 2 and not self._stream_abort.is_set():
                 _flush_sentence(tail)
 
-            elapsed = _time.time() - t0
+            # R34-S54.1 Phase 7b: monotonic — paired with t0 above.
+            elapsed = _time.monotonic() - t0
             content = "".join(content_parts).strip()
             # Stash for _dispatch_query so it knows the reply has
             # ALREADY been queued into TTS — it must NOT speak the
@@ -3026,7 +3034,8 @@ class VoiceListener(threading.Thread):
                                 f"Дай СОДЕРЖАТЕЛЬНЫЙ ответ на русском языке на основе этого контекста."},
                         ]
                         try:
-                            t1 = _time.time()
+                            # R34-S54.1 Phase 7b: monotonic for elapsed.
+                            t1 = _time.monotonic()
                             r2 = requests.post(
                                 f"{base_url.rstrip('/')}/api/chat",
                                 json={
@@ -3058,7 +3067,9 @@ class VoiceListener(threading.Thread):
                                     content = self._sanitize_for_piper_uk(c2)
                                     content = self._strip_lazy_prefix(content)
                                     debug_log(
-                                        f"web-search retry ok in {_time.time()-t1:.1f}s",
+                                        # R34-S54.1 Phase 7b: monotonic
+                                        # paired with t1 above.
+                                        f"web-search retry ok in {_time.monotonic()-t1:.1f}s",
                                         "voice",
                                     )
                         except Exception as e:
@@ -3699,7 +3710,12 @@ class VoiceListener(threading.Thread):
         # keepalive thread suppresses its next ping — we're already
         # about to pile prompt-eval work onto Ollama, no need to
         # queue an extra dummy generation behind it.
-        self._last_user_activity_ts = time.time()
+        # R34-S54.1 Phase 7b: monotonic — this anchor is read at the
+        # LLM-keepalive idle check (line ~5097) to compute "how long
+        # since last activity". NTP step would either freeze the
+        # keepalive forever (clock jumped forward) or trigger spurious
+        # pings (clock jumped back). Paired conversion below.
+        self._last_user_activity_ts = time.monotonic()
         # PROVENANCE LIFECYCLE — atomically read-and-clear `_dispatch_source`
         # at the top of dispatch. Previously cleared ONLY inside
         # `_persist_memory_pair`, so early-return paths (lang switch /
@@ -5094,7 +5110,9 @@ class VoiceListener(threading.Thread):
                     # Only ping when we've been idle "long enough" — avoids
                     # double-loading model right after a real query.
                     last_activity = self._last_user_activity_ts or 0.0
-                    if last_activity > 0 and (_time.time() - last_activity) < idle_threshold:
+                    # R34-S54.1 Phase 7b: monotonic — paired with the
+                    # _last_user_activity_ts anchor in _dispatch_query.
+                    if last_activity > 0 and (_time.monotonic() - last_activity) < idle_threshold:
                         _time.sleep(ping_interval)
                         continue
 
@@ -5545,7 +5563,12 @@ class VoiceListener(threading.Thread):
         # warmup output (Whisper + LLMs) is indented under this header to
         # visually group the phase.
         print("  🔥 Warming up models...", flush=True)
-        self._llm_warmup_started_at = time.time()
+        # R34-S54.1 Phase 7b: monotonic — anchor for the warmup deadline
+        # math below. NTP step during warmup (very common right after
+        # mac wake-from-sleep, where the LLM warmup happens) could
+        # either freeze the join (deadline jumped past now) or skip the
+        # wait entirely (deadline jumped behind now).
+        self._llm_warmup_started_at = time.monotonic()
         self._llm_warmup_threads = self._start_llm_warmup()
 
         # Audit round 24 fix (F48): periodic keepalive ping. Even
@@ -5874,9 +5897,11 @@ class VoiceListener(threading.Thread):
         warmup_threads = getattr(self, "_llm_warmup_threads", [])
         if warmup_threads:
             budget = 60.0
-            deadline = getattr(self, "_llm_warmup_started_at", time.time()) + budget
+            # R34-S54.1 Phase 7b: monotonic — paired with the
+            # _llm_warmup_started_at anchor set in the warm-up entry.
+            deadline = getattr(self, "_llm_warmup_started_at", time.monotonic()) + budget
             for t in warmup_threads:
-                remaining = max(0.0, deadline - time.time())
+                remaining = max(0.0, deadline - time.monotonic())
                 t.join(timeout=remaining)
 
             still_warming = any(t.is_alive() for t in warmup_threads)
@@ -6410,7 +6435,10 @@ class VoiceListener(threading.Thread):
             data["partial"] = "true"
 
         try:
-            t0 = time.time()
+            # R34-S54.1 Phase 7b: monotonic — local elapsed measurement
+            # over the HTTP round-trip. Wall-clock is unsafe across NTP
+            # steps mid-request (Mac wakes from sleep, ntpd corrects).
+            t0 = time.monotonic()
             # Timeout 120s — server can take 17-20s for 45s of audio
             # (medium CPU @ 2.7× realtime). Old 60s cap timed out on
             # max-length utterances and dropped real wake-word audio.
@@ -6421,7 +6449,7 @@ class VoiceListener(threading.Thread):
                 data=data,
                 timeout=(10.0, 120.0),
             )
-            elapsed = time.time() - t0
+            elapsed = time.monotonic() - t0
             if r.status_code != 200:
                 debug_log(
                     f"remote whisper HTTP {r.status_code}: {r.text[:200]}",
@@ -6467,9 +6495,14 @@ class VoiceListener(threading.Thread):
             # better to start a fresh one than wait out the hang.
             if getattr(self, "_partial_in_flight", False):
                 in_flight_ts = getattr(self, "_partial_in_flight_ts", 0.0)
-                if in_flight_ts > 0 and (time.time() - in_flight_ts) > 8.0:
+                # R34-S54.1 Phase 7b: monotonic — paired with the
+                # _partial_in_flight_ts anchor below. Wall-clock could
+                # either force-reset a healthy in-flight (NTP jump
+                # forward) or never reset a genuinely stuck one (jump
+                # back) → blocks ALL live captions indefinitely.
+                if in_flight_ts > 0 and (time.monotonic() - in_flight_ts) > 8.0:
                     debug_log(
-                        f"_partial_in_flight stuck for {time.time() - in_flight_ts:.1f}s — force-reset",
+                        f"_partial_in_flight stuck for {time.monotonic() - in_flight_ts:.1f}s — force-reset",
                         "voice",
                     )
                     self._partial_in_flight = False
@@ -6500,7 +6533,9 @@ class VoiceListener(threading.Thread):
                 tail_audio = tail_audio[start_idx:]
             frames_copy = tail_audio
             self._partial_in_flight = True
-            self._partial_in_flight_ts = time.time()  # F67: timeout guard
+            # R34-S54.1 Phase 7b: monotonic — paired with the
+            # 8-second stuck-detection check above. F67 timeout guard.
+            self._partial_in_flight_ts = time.monotonic()
 
             def _remote_partial_run():
                 try:

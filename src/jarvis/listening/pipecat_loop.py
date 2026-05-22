@@ -1611,8 +1611,10 @@ def _make_event_stream_processor():
                     return
                 duration_ms = 0
                 if self._utterance_t0:
+                    # R34-S54.1 Phase 7b: monotonic — see _speak_end_ts
+                    # rationale in JarvisEchoFilterProcessor.__init__.
                     duration_ms = int(
-                        (_time.time() - self._utterance_t0) * 1000
+                        (_time.monotonic() - self._utterance_t0) * 1000
                     )
                 self._utterance_t0 = 0.0
                 self._stream.emit(
@@ -1630,7 +1632,9 @@ def _make_event_stream_processor():
 
             # ── start of user speech → utterance clock ─────────────
             if isinstance(frame, UserStartedSpeakingFrame):
-                self._utterance_t0 = _time.time()
+                # R34-S54.1 Phase 7b: monotonic, paired with the
+                # _utterance_t0 read above.
+                self._utterance_t0 = _time.monotonic()
                 self._stream.emit("vad", speaking=True, level=1.0)
                 return
 
@@ -1692,7 +1696,9 @@ def _make_event_stream_processor():
 
             # ── TTS lifecycle ──────────────────────────────────────
             if isinstance(frame, TTSStartedFrame):
-                self._tts_t0 = _time.time()
+                # R34-S54.1 Phase 7b: monotonic, paired with the
+                # TTSStoppedFrame read below.
+                self._tts_t0 = _time.monotonic()
                 # We don't know the text-to-be-spoken here (Pipecat
                 # passes only context_id); fall back to the last
                 # sentence we observed.
@@ -1706,8 +1712,9 @@ def _make_event_stream_processor():
             if isinstance(frame, TTSStoppedFrame):
                 duration_ms = 0
                 if self._tts_t0:
+                    # R34-S54.1 Phase 7b: monotonic, see TTSStartedFrame.
                     duration_ms = int(
-                        (_time.time() - self._tts_t0) * 1000
+                        (_time.monotonic() - self._tts_t0) * 1000
                     )
                 self._tts_t0 = 0.0
                 self._stream.emit("tts_done", duration_ms=duration_ms)
