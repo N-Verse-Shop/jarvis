@@ -70,7 +70,7 @@ The Voice Input tab includes a device dropdown populated at window open time via
 ## Save Behaviour
 
 - Only keys that differ from `get_default_config()` are written.
-- Existing keys not managed by the UI are preserved (e.g. `mcps`, `active_profiles`, `wake_aliases`, `allowlist_bundles`, `stop_commands`).
+- Existing keys not managed by the UI are preserved (e.g. `mcps`, `wake_aliases`, `allowlist_bundles`, `stop_commands`). (R34-S58.3 removed `active_profiles`.)
 - After save, a dialog confirms success and reminds the user to restart.
 - If the daemon is running when save completes, the tray app offers to restart it.
 
@@ -122,7 +122,6 @@ On save, the `mcps` dict is written to config.json if non-empty, or removed enti
 These fields are managed elsewhere or are too complex for a simple form:
 
 - `db_path` / `sqlite_vss_path` — internal storage paths
-- `active_profiles` — list managed by setup wizard
 - `allowlist_bundles` — list of bundle IDs
 - `wake_aliases` — list of strings (complex editing)
 - `stop_commands` / `stop_command_fuzzy_ratio` — list of strings

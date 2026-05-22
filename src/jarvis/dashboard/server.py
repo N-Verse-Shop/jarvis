@@ -1413,6 +1413,30 @@ class DashboardServer:
                 {"ok": False, "error": "text too long (max 8000 chars)"},
                 status=400,
             )
+        # R35-S3 P2-11: honour the voice-pipeline standby flag for the
+        # dashboard text path too. Without this, a user who pressed the
+        # HUD Close button (= voice silenced) could still drive the
+        # daemon by typing — bypassing the verbal-resume gate. Match
+        # the gate behaviour in pipecat_loop.py:4064/2496 so the
+        # dashboard and voice are consistent. Allow opt-out via a body
+        # field for tests / power users who need to debug while paused.
+        try:
+            from ..listening.pipecat_loop import _is_standby
+            if _is_standby() and not bool(body.get("force_when_standby")):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": (
+                            "Daemon is in STANDBY (voice closed). Say the "
+                            "wake word to resume, or pass force_when_standby=true."
+                        ),
+                    },
+                    status=503,
+                )
+        except Exception:
+            # If standby state can't be queried (cold start, import
+            # failure) we let the request through rather than block.
+            pass
         # R35-S3 F2: route through run_reply_engine so the dashboard
         # textbox gets the SAME tool affordance as the voice path. The
         # legacy implementation POSTed straight to Ollama /api/chat

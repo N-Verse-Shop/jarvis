@@ -63,9 +63,21 @@ _diary_update_callbacks: dict = {
 
 
 def request_stop() -> None:
-    """Request the daemon to stop gracefully. Used by desktop app for QThread shutdown."""
+    """Request the daemon to stop gracefully. Used by desktop app for QThread shutdown.
+
+    R35-S3 P2-25: also signals the Ollama keep-warm loop to exit at its
+    next sleep boundary so the thread doesn't outlive the daemon's
+    file handles (would EBADF when logging into a closing stream).
+    """
     global _global_stop_requested
     _global_stop_requested = True
+    try:
+        from .listening.warmup import request_keepwarm_stop
+        request_keepwarm_stop()
+    except Exception:
+        # Never let shutdown-side imports raise — graceful stop must
+        # always succeed even when warmup module is partially loaded.
+        pass
 
 
 def set_diary_update_callbacks(

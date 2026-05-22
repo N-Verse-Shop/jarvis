@@ -656,11 +656,24 @@ def _set_standby(value: bool) -> None:
     guard, etc.) can clear ephemeral state. Callbacks must be
     fast + exception-safe; we swallow any errors so a single broken
     handler can't block standby from engaging.
+
+    R35-S3 P2-10: emit ``standby`` / ``wake-gate: resuming`` log lines
+    on transitions so the HUD's log-tail watcher (main.js:569-597)
+    picks them up. Phase A found a case where daemon restarted while
+    standby was engaged → HUD had no signal that the daemon was alive
+    and stayed hidden. We now log both transitions explicitly.
     """
     global _STANDBY
     with _STANDBY_LOCK:
         was, _STANDBY = _STANDBY, value
     if value and not was:
+        # OFF → ON
+        try:
+            debug_log("standby engaged — saying wake word will resume", "pipecat")
+            from ..ipc import get_stream
+            get_stream().emit("standby_engaged", source="set_standby")
+        except Exception:
+            pass
         import weakref as _weakref
         with _STANDBY_CALLBACKS_LOCK:
             handlers = list(_STANDBY_CALLBACKS)
@@ -675,6 +688,14 @@ def _set_standby(value: bool) -> None:
                 resolved()
             except Exception:
                 pass
+    elif (not value) and was:
+        # ON → OFF — explicit log so HUD log-tail watcher unhides.
+        try:
+            debug_log("wake-gate: resuming (standby cleared)", "pipecat")
+            from ..ipc import get_stream
+            get_stream().emit("standby_cleared", source="set_standby")
+        except Exception:
+            pass
 
 
 def _is_standby() -> bool:

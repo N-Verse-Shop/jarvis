@@ -247,12 +247,29 @@ def _warmup_piper(voice_id: str, piper_dir: Optional[Path] = None) -> None:
         _log(f"Piper warmup failed: {exc}", "warning")
 
 
+# R35-S3 P2-25: module-level stop signal so daemon.py can cleanly
+# request the loop to exit before joining. Previously the loop only
+# died when the Python process exited, which is fine on launchd kill-9
+# but leaves the thread running during the brief "request_stop()
+# → join voice → join warmup" window on graceful shutdown; that
+# thread could log to a closing stream handler and trip an EBADF.
+_KEEPWARM_STOP_EVENT: Optional[threading.Event] = None
+
+
+def request_keepwarm_stop() -> None:
+    """Signal the keep-warm loop to exit at its next sleep boundary."""
+    global _KEEPWARM_STOP_EVENT
+    if _KEEPWARM_STOP_EVENT is not None:
+        _KEEPWARM_STOP_EVENT.set()
+
+
 def _keepwarm_ollama_loop(
     *,
     base_url: str,
     model: str,
     system_prompt: str,
     interval_s: float = 900.0,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     """Periodically re-prime Ollama's KV cache.
 
@@ -275,12 +292,27 @@ def _keepwarm_ollama_loop(
     R34-S49 we keep only one model loaded (qwen3:8b), so pressure
     is much lower and the eviction window is longer.
 
+    R35-S3 P2-25: ``stop_event`` is honoured between ticks. The
+    daemon registers it via ``warmup_voice_stack``; on shutdown the
+    daemon calls ``request_keepwarm_stop()`` which sets the event,
+    so a sleeping iteration wakes immediately instead of waiting up
+    to 15 minutes. Without this, ``request_stop()`` would return
+    while the keepwarm thread was still pumping Ollama.
+
     Pure daemon thread: any failure logs + continues; we never want
     keep-warm noise to leak into the user-facing voice path.
     """
     while True:
         try:
-            time.sleep(interval_s)
+            if stop_event is not None:
+                # interruptible sleep — returns True if stop requested
+                if stop_event.wait(timeout=interval_s):
+                    _log("Ollama keep-warm stop requested — exiting", "info")
+                    return
+            else:
+                time.sleep(interval_s)
+            if stop_event is not None and stop_event.is_set():
+                return
             _warmup_ollama(
                 base_url=base_url,
                 model=model,
@@ -321,12 +353,17 @@ def warmup_voice_stack(
     ))
     # R34-S42 К4 — periodic keep-warm so qwen3:8b on the CPU box
     # doesn't get evicted between user turns.
+    # R35-S3 P2-25: own a module-level Event so daemon.py can request
+    # a clean stop on shutdown.
+    global _KEEPWARM_STOP_EVENT
+    _KEEPWARM_STOP_EVENT = threading.Event()
     threads.append(threading.Thread(
         target=_keepwarm_ollama_loop,
         kwargs={
             "base_url": ollama_base_url,
             "model": chat_model,
             "system_prompt": system_prompt,
+            "stop_event": _KEEPWARM_STOP_EVENT,
         },
         name="keepwarm-ollama",
         daemon=True,

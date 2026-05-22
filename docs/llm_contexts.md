@@ -8,7 +8,7 @@ Every distinct LLM call in Jarvis, what feeds it, what consumes it, and how it i
 
 - **File**: [src/jarvis/reply/engine.py](src/jarvis/reply/engine.py) — `reply()` and the loop at ~lines 1370-1650; native tool-call path in `chat_with_messages()` (~1424, 1455).
 - **Trigger**: every user message. Runs up to `agentic_max_turns` (default 8) iterations per reply.
-- **Model / gating**: `cfg.ollama_chat_model` (the big model). Not optional. No size branching on the loop itself — size branching affects the digests/evaluator around it.
+- **Model / gating**: `cfg.ollama_chat_model` (the big model). Not optional. No size branching on the loop itself — size branching affects the digests around it. (R34-S57 removed the post-turn evaluator; the loop now terminates on content as soon as the model emits natural language.)
 - **Inputs**:
   - Redacted user query
   - Recent dialogue (last 5 minutes), including in-loop tool-call + tool-role messages from prior replies within the active conversation (tool carryover, `DialogueMemory.record_tool_turn` / `get_recent_turns_with_tools` in [src/jarvis/memory/conversation.py](src/jarvis/memory/conversation.py); per-prompt cap via `cfg.tool_carryover_max_turns` / `tool_carryover_per_entry_chars`; storage cap `_tool_turns_max_storage = 16`; cleared on `stop` signal AND on new-conversation entry; UNTRUSTED WEB EXTRACT fence markers preserved on truncation; both `content` and `tool_calls[*].function.arguments` scrubbed on write)
@@ -79,7 +79,7 @@ Every distinct LLM call in Jarvis, what feeds it, what consumes it, and how it i
 ## 6. Max-Turn Loop Digest
 
 - **File**: [src/jarvis/reply/enrichment.py](src/jarvis/reply/enrichment.py) — `digest_loop_for_max_turns()` (~line 847).
-- **Trigger**: when the loop exhausts `agentic_max_turns` without producing a natural-language reply (e.g. pure tool-call loop). The evaluator no longer drives this — termination on content is immediate.
+- **Trigger**: when the loop exhausts `agentic_max_turns` without producing a natural-language reply (e.g. pure tool-call loop). Pure termination — the post-turn evaluator was removed in R34-S57, so the loop ends as soon as `content` is non-empty.
 - **Model / gating**: `_resolve_loop_digest_model(cfg)` — prefers `intent_judge_model`, falls back to `ollama_chat_model`.
 - **Inputs**: user query + loop activity (tool calls, results summaries, any prose).
 - **System prompt**: `_LOOP_DIGEST_SYSTEM_PROMPT` — caveat-prefixed, user-language, concise.

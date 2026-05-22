@@ -28,7 +28,11 @@ tzdata>=2024.1; sys_platform == "win32"
 miniupnpc==2.2.8
 pytest==8.3.2
 pytest-repeat==0.9.3
-mcp==1.13.1
+# mcp protocol — pinned to 1.13.x for stability. Phase D (R35-S3) noted
+# 1.27.1 is current but the protocol churned a lot (param signatures,
+# tool-schema additions). Upgrade tracked on R36 backlog; bump locally
+# and run full MCP integration tests before raising the floor.
+mcp>=1.13.1,<1.14.0
 piper-tts>=1.3.0,<2.0.0
 pygame>=2.1.0,<3.0.0
 faiss-cpu>=1.7.4,<2.0.0
