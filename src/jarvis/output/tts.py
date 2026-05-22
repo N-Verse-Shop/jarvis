@@ -1456,19 +1456,39 @@ def _detect_language(text: str) -> str:
     """Return one of 'uk'|'ru'|'de'|'en' for the dominant language of `text`.
 
     Strategy:
-      1. If text has UA-only chars (іїєґ) — UA. If RU-only (ёыэъ) — RU.
+      1. If text has DENSE UA-only chars (іїєґ ≥3 OR ≥10% of cyrillic) — UA.
+         If text has RU-only chars (ёыэъ) and no UA-only chars — RU.
       2. Otherwise count distinctive common-word hits. Whichever wins, wins.
       3. Tied / zero Cyrillic-Latin: check German markers, else English.
+
+    R34-S58.1 (бульканн­я fix): a single isolated UA-only character used
+    to flip detection to UA. The user's name "Данило" (UA spelling with
+    "і" instead of RU "и") embedded in an otherwise Russian reply like
+    "Слушаю, Данило" was thus routed to the UA Piper voice. The UA model
+    (uk_UA-ukrainian_tts-medium) has phoneme_type="text" with a phoneme
+    map containing ONLY lowercase Ukrainian letters — every Russian
+    letter is silently dropped during phonemisation, producing the
+    "bulk-bulk gurgling" artifact described in PiperTTS._speak_once.
+    The fix requires UA-density (≥3 absolute OR ≥10% of cyrillic chars)
+    before committing to UA on the character heuristic. Sparse UA chars
+    fall through to the word-scoring stage where Russian function words
+    win cleanly.
     """
     ua_chars = sum(1 for ch in text if ch in _UA_ONLY_CHARS)
     ru_chars = sum(1 for ch in text if ch in _RU_ONLY_CHARS)
     cyr_total = sum(1 for ch in text if 'Ѐ' <= ch <= 'ӿ')
 
     if cyr_total > 0:
-        if ua_chars and not ru_chars:
-            return "uk"
+        # Strong RU signal — RU-only chars present, no UA chars to dispute.
         if ru_chars and not ua_chars:
             return "ru"
+        # UA signal requires DENSITY — ≥3 UA chars OR ≥10% of cyrillic.
+        # This stops a single "і" in "Данило" (proper noun) from flipping
+        # an otherwise Russian sentence to the UA Piper voice (→ bubbling).
+        if ua_chars and not ru_chars:
+            if ua_chars >= 3 or ua_chars / max(1, cyr_total) >= 0.10:
+                return "uk"
+            # else: fall through to word-scoring below.
 
         # Ambiguous Cyrillic — score common words.
         # Tie-break: 'ru' (post May 16 uk→ru migration). Previously 'uk'
