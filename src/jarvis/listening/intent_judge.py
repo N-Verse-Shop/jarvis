@@ -122,7 +122,11 @@ class IntentJudgeConfig:
 
     assistant_name: str = "Jarvis"
     aliases: list = None
-    model: str = "gemma4:e2b"
+    # R34-S52 H: default was ``"gemma4:e2b"`` — a model that doesn't
+    # exist. Production config.json overrides this to ``qwen2.5:3b``,
+    # but the fallback default would silently fail if the config key
+    # were missing or misspelled. Match production default.
+    model: str = "qwen2.5:3b"
     ollama_base_url: str = "http://127.0.0.1:11434"
     timeout_sec: float = 15.0
     thinking: bool = False

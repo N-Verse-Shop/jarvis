@@ -1243,6 +1243,24 @@ async def _play_audio_interruptable(wav_path: Path) -> None:
             _CURRENT_PLAYBACK_PROC = proc
         loop = _asyncio.get_event_loop()
         await loop.run_in_executor(None, proc.wait)
+    except _asyncio.CancelledError:
+        # R34-S52 H: ``CancelledError`` is NOT an ``Exception`` in
+        # Python 3.8+, so the ``except Exception`` below would let it
+        # propagate WITHOUT terminating the subprocess. Result: after
+        # a pipeline-level cancel (Pipecat task.cancel(), daemon
+        # shutdown), the user kept hearing afplay until the WAV
+        # ended naturally. Now: kill the subprocess explicitly and
+        # re-raise so cancellation semantics are preserved.
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                pass
+        raise
     except Exception as exc:
         try:
             debug_log(f"afplay failed: {exc!r}", "pipecat")
@@ -2764,7 +2782,11 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                 self._stream.emit(
                     "sentence",
                     text=text[:1000],
-                    lang="uk",
+                    # R34-S52 H: HUD label must match the actually-spoken
+                    # language. After R34-S48/S51 RU-only pin + _ru_normalise
+                    # at TTS time, the text reaching the user is always RU.
+                    # Mislabelling as UA confused the dashboard locale logic.
+                    lang="ru",
                 )
             except Exception:
                 pass
@@ -3062,7 +3084,14 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                 self._stream.emit(
                     "stt_final",
                     text=text[:500],
-                    lang="uk",
+                    # R34-S52 H: was hardcoded "uk" — but R34-S48 made
+                    # RU the only outbound language, AND the input text
+                    # itself can be either UA or RU (we accept both at
+                    # STT). For HUD labelling consistency with the
+                    # actual reply, mark as RU. If accurate input-side
+                    # language detection is ever needed, plumb
+                    # ``detect_user_language(text)`` here.
+                    lang="ru",
                     confidence=1.0,
                     duration_ms=0,
                 )
@@ -3777,7 +3806,12 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
             self._bot_speaking: bool = False
 
         def _open_hot_window(self) -> None:
-            self._hot_until = _time.time() + hot_window_seconds
+            # R34-S52 H: was ``_time.time()`` (wall-clock). An NTP step
+            # backwards left _hot_until in the future forever (wake-gate
+            # open to ambient speech for hours); an NTP step forwards
+            # closed the window early. Other parts of the file already
+            # use ``_time.monotonic()`` consistently — match that here.
+            self._hot_until = _time.monotonic() + hot_window_seconds
             try:
                 self._stream.emit(
                     "hot_window",
@@ -3788,7 +3822,8 @@ def _make_wake_word_processor(cfg: "PipecatLoopConfig"):
                 pass
 
         def _is_hot(self) -> bool:
-            return _time.time() < self._hot_until
+            # R34-S52 H: paired with _open_hot_window monotonic switch.
+            return _time.monotonic() < self._hot_until
 
         async def process_frame(
             self, frame: "Frame", direction: "FrameDirection"
