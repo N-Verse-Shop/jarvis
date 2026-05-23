@@ -5179,7 +5179,7 @@ class VoiceListener(threading.Thread):
                 from ..config import resolve_chat_model
                 chat_model = resolve_chat_model(self.cfg)
             except Exception:
-                chat_model = getattr(self.cfg, "chat_model", "qwen3:8b")
+                chat_model = getattr(self.cfg, "chat_model", "qwen2.5:3b")  # R35-S16: was qwen3:8b
         if not chat_model:
             debug_log("LLM keepalive: no chat_model resolved — skipping", "voice")
             return

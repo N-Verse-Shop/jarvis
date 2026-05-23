@@ -76,27 +76,29 @@ def check_ollama_endpoint() -> tuple[str, str, str]:
 def check_ollama_models() -> tuple[str, str, str]:
     """Required models present on Ollama server."""
     url = os.environ.get("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-    # Audit round 14 fix: this hardcoded ``gemma2:9b`` drifted off the
-    # actual default (``qwen3:8b`` for chat, ``qwen2.5:3b`` for intent
-    # judge) and meant ``jarvis doctor`` would report "missing" for a
-    # perfectly working install. Read from settings so the check
-    # tracks whatever the user has configured.
+    # R35-S16 — defaults realigned. Primary chat is now qwen2.5:3b
+    # (R35-S13 switch from qwen3:8b due to Ollama 0.23.3 thinking-mode
+    # bug). intent_judge_model is "" (disabled R35-S6 to save 2 GB RAM
+    # on Hetzner). doctor falls back through the settings; if config
+    # load fails entirely it lists qwen2.5:3b as the single required
+    # model (qwen3:8b stays as on-disk alternative but is not preloaded).
     try:
         from .config import load_settings as _load_settings
         _cfg = _load_settings()
         required = [
-            getattr(_cfg, "ollama_chat_model", "qwen3:8b"),
-            getattr(_cfg, "intent_judge_model", "qwen2.5:3b")
-                or getattr(_cfg, "ollama_chat_model", "qwen3:8b"),
+            getattr(_cfg, "ollama_chat_model", "qwen2.5:3b"),
         ]
+        # Only add intent_judge if explicitly configured (R35-S6 disabled).
+        _judge = getattr(_cfg, "intent_judge_model", "") or ""
+        if _judge:
+            required.append(_judge)
         # Deduplicate while preserving order.
         seen: set[str] = set()
         required = [m for m in required if m and not (m in seen or seen.add(m))]
     except Exception:
         # If config load fails (very early boot, malformed JSON),
-        # fall back to the historic doctor list so the check still
-        # tells the user *something*.
-        required = ["qwen3:8b", "qwen2.5:3b"]
+        # fall back to the canonical primary model only.
+        required = ["qwen2.5:3b"]
     try:
         with urllib.request.urlopen(f"{url}/api/tags", timeout=5) as r:
             import json

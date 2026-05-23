@@ -159,7 +159,7 @@ class PipecatLoopConfig:
 
     # LLM ----------------------------------------------------------------------
     ollama_base_url: str = "http://127.0.0.1:11434"
-    chat_model: str = "qwen3:8b"
+    chat_model: str = "qwen2.5:3b"  # R35-S16: was qwen3:8b (R35-S13 model switch — thinking-mode bug on Ollama 0.23.3)
     chat_temperature: float = 0.4
     chat_num_predict: int = 220
     chat_num_ctx: int = 2048
@@ -360,7 +360,7 @@ def from_settings(cfg) -> PipecatLoopConfig:
         stt_mlx_model=getattr(cfg, "whisper_model", "LARGE_V3_TURBO"),
         stt_language=lang,
         ollama_base_url=getattr(cfg, "ollama_base_url", "http://127.0.0.1:11434"),
-        chat_model=str(getattr(cfg, "ollama_chat_model", "qwen3:8b")),
+        chat_model=str(getattr(cfg, "ollama_chat_model", "qwen2.5:3b")),  # R35-S16: was qwen3:8b
         # R34-S42 К4 — Settings dataclass doesn't declare
         # ollama_chat_{num_predict,num_ctx,temperature}, so getattr(cfg,…)
         # silently returned the fallback ALWAYS. Read the live values

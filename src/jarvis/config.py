@@ -13,25 +13,25 @@ from dotenv import load_dotenv
 # This is the authoritative list of officially supported chat models.
 # Other modules should import from here rather than defining their own lists.
 
-# R34-S57 (C-P2.11/12/13): the previous default ``gemma4:e2b`` does
-# NOT exist as an Ollama tag — fresh installs would have downloaded
-# nothing for the judge and silently fallen back to keyword wake
-# detection. Setup wizard already migrated to qwen2.5:3b (intent)
-# and qwen3:8b (chat); align the canonical Settings + dataclass with
-# what production actually runs. Real Gemma tags preserved as
-# secondary options for users who explicitly want them.
+# R35-S16: defaults realigned after R35-S13 model switch. Primary chat
+# is now qwen2.5:3b (15 tok/s on CPU, no thinking-mode overhead) — not
+# qwen3:8b (mandatory thinking in Ollama 0.23.3 burns 100+s before first
+# response token). qwen3:8b stays in the catalogue as an alternative
+# but is no longer the default. Heavy reasoning tasks delegate to the
+# local ``claude`` CLI via ``claudeCodeSpawn`` tool (Max 5x subscription
+# — no Anthropic API charges). See docs/MODEL-ANALYSIS-R35-S12.md.
 SUPPORTED_CHAT_MODELS: Dict[str, Dict[str, str]] = {
-    "qwen3:8b": {
-        "name": "Qwen 3 8B (Default)",
-        "description": "Multilingual, strong RU/UA — ~5GB; recommended for chat over Tailscale to a remote Ollama host",
-        "size": "~5GB",
-        "vram": "8GB+",
-    },
     "qwen2.5:3b": {
-        "name": "Qwen 2.5 3B (Intent / Classifier)",
-        "description": "Lightweight, fast — ~2GB; great for intent-judge / classifier roles",
+        "name": "Qwen 2.5 3B (Default — R35-S13)",
+        "description": "Lightweight, fast (15 tok/s on CPU) — ~2GB; no thinking-mode overhead. Primary chat model since R35-S13.",
         "size": "~2GB",
         "vram": "4GB+",
+    },
+    "qwen3:8b": {
+        "name": "Qwen 3 8B (Heavy/Deprecated as primary)",
+        "description": "Multilingual, strong RU/UA — ~5GB. WARNING: Ollama 0.23.3 ignores think:false, model spends 100+s thinking before reply. Use only with Ollama 0.6+.",
+        "size": "~5GB",
+        "vram": "8GB+",
     },
     "qwen2.5:1.5b": {
         "name": "Qwen 2.5 1.5B (Wake disambiguator)",
@@ -53,10 +53,9 @@ SUPPORTED_CHAT_MODELS: Dict[str, Dict[str, str]] = {
     },
 }
 
-# The default chat model (first in the supported list). R34-S57:
-# was ``gemma4:e2b`` — a non-existent tag. Aligned with the actual
-# production model running on Hetzner.
-DEFAULT_CHAT_MODEL = "qwen3:8b"
+# R35-S16: realigned to qwen2.5:3b (R35-S13 switch). Was qwen3:8b which
+# triggers Ollama 0.23.3 mandatory thinking-mode latency bug.
+DEFAULT_CHAT_MODEL = "qwen2.5:3b"
 
 
 def get_supported_model_ids() -> set[str]:
