@@ -212,17 +212,34 @@ class ClaudeCodeSpawnTool(Tool):
 
     @property
     def description(self) -> str:
-        # Description is what the keyword router scores against — pack in
-        # every trigger word a Russian/Ukrainian/English user might say.
+        # R35-S15: description doubles as keyword-router scoring corpus AND
+        # quality-tier signal. Triggers for BOTH coding tasks AND general
+        # "I want a thoughtful, high-quality answer" queries — both route
+        # to Claude Sonnet 4.6 via the local CLI (Max 5x subscription).
         return (
+            # Coding triggers (R35-S7 baseline)
             "Создать сайт, написать код, реализовать программу, исправить баг, "
             "написать скрипт, сделать ревью кода, разработать приложение, "
             "построить лендинг, сгенерировать компонент, создать проект, "
             "написати програму, виправити код, створити сайт, побудувати, "
             "розробити, реалізувати, code review, build, fix bug, write code, "
             "generate component, create project, landing page, app, website. "
-            "Делегирует задачу разработки в локальный Claude Code CLI "
-            "(использует подписку Claude Max, не Anthropic API)."
+            # Quality / depth triggers (R35-S15 — explicit escalation)
+            "Деталь, детально, ретельно, глибоко, професійно, якісно, "
+            "ґрунтовно, подумай добре, проаналізуй уважно, складна задача, "
+            "обґрунтуй, поясни детально, опиши повністю, дай якісну відповідь, "
+            "через клода, claude, deep, detail, thorough, professional, "
+            "carefully, analyse, complex task, в деталях, глубоко, "
+            "обоснуй, объясни подробно, через клод, сложная задача. "
+            # Strategic / planning triggers
+            "Архітектура, стратегія, план, дорожня карта, рекомендація, "
+            "архитектура, стратегия, план, дорожная карта, рекомендация. "
+            # Mechanism note
+            "Делегирует ЛЮБОЙ запрос, требующий качественного ответа, "
+            "в локальный Claude Code CLI (Claude Sonnet 4.6 через "
+            "подписку Claude Max — НЕ Anthropic API, без доп. расходов). "
+            "Используй для сложных задач: код, архитектура, анализ, "
+            "стратегические решения, длинные ответы."
         )
 
     @property
