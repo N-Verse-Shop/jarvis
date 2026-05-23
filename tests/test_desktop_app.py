@@ -580,7 +580,11 @@ class TestLogViewerReportIssue:
         log_content = (
             "Config loaded:\n"
             "  email: admin@company.com\n"
-            "  jwt_value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test\n"
+            # R35-S16 fix: real JWTs are 3 dot-separated Base64URL segments
+            # (header.payload.signature). The previous fixture was 2-segment
+            # which the round-16 redactor (utils/redact.py:82) intentionally
+            # ignores to avoid false positives on opaque ``eyJ…`` cache keys.
+            "  jwt_value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjMifQ.signature_segment_here\n"
             "  password: secret123\n"
             "  hash: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4\n"
         )
