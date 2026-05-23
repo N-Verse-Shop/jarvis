@@ -243,8 +243,15 @@ If a tool's description says it has a default for some argument (for example get
 SELF-CONTAINED TOOL ARGUMENTS:
 Whenever you call any tool with a free-form text argument (a search query, lookup string, question field — whatever the tool names it), the string you pass MUST be a self-contained restatement of the user's intent. Resolve pronouns, ellipsis, and implicit references from earlier turns yourself — the tool does NOT see the conversation history, it only sees the argument you pass. If the previous turn was about "Harry Styles" and the user now asks "what are his most famous songs?", the argument must be something like "Harry Styles most famous songs", NOT "what are his most famous songs". Prefer a compact keyword phrase over a conversational sentence. Never pass the user's literal utterance through when it contains unresolved pronouns, "that", "those", "it", "his", "her", "their", or similar references. This applies to every tool — webSearch, Wikipedia, MCP tools, all of them."""
 
-# Repeat the constraints twice for better instruction-following in small models
-TOOL_CONSTRAINTS_SMALL = _TOOL_CONSTRAINTS_BASE + "\n\n" + _TOOL_CONSTRAINTS_BASE
+# R35-S14: ONE COPY only. The previous version sent _TOOL_CONSTRAINTS_BASE
+# twice (~8.6 KB total) for "better instruction-following in small models".
+# Measured cost on qwen2.5:3b at 80 tok/s prompt-eval: each duplicate was
+# ~1500 tokens = ~18 seconds of CPU PER reply turn. With 1-8 turns per
+# query, the duplication was adding 18-150s of latency. qwen2.5:3b (Sep
+# 2024 release) follows the single-copy instructions reliably — verified
+# manually. If we ever regress to a smaller model that NEEDS repetition,
+# reinstate by appending "\n\n" + _TOOL_CONSTRAINTS_BASE.
+TOOL_CONSTRAINTS_SMALL = _TOOL_CONSTRAINTS_BASE
 
 
 # =============================================================================
