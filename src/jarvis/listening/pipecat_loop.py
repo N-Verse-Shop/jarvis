@@ -204,6 +204,15 @@ class PipecatLoopConfig:
     # the NVIDIA model can be switched without a code change.
     nvidia_nim_chat_model: str = "meta/llama-3.3-70b-instruct"
 
+    # R35-S28: when False, fast-path PC-control commands execute
+    # immediately instead of speaking "Подтверждаешь?" and waiting for a
+    # yes/no. Default True (safe for a shared install); the owner sets it
+    # False in config.json for friction-free hands-free operation. The
+    # fast-path command surface is inherently limited to non-destructive
+    # ops (open app, search, screenshot, volume, media, notes, lock) —
+    # there is no delete/rm pattern — so direct execution is low-risk.
+    voice_confirm_actions: bool = True
+
     # Misc fields filled at runtime by ``from_settings``.
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -416,6 +425,8 @@ def from_settings(cfg) -> PipecatLoopConfig:
         # R35-S27: keep_alive is config-driven (ollama_chat_keep_alive).
         # Long default suits the Hetzner CPU backend (30-60s reloads).
         chat_keep_alive=str(_raw_cfg.get("ollama_chat_keep_alive") or "24h"),
+        # R35-S28: voice action confirmation toggle (default True = safe).
+        voice_confirm_actions=bool(_raw_cfg.get("voice_confirm_actions", True)),
         piper_voice_id=str(
             _piper_voice_override
             or getattr(cfg, "piper_voice", None)
@@ -3318,7 +3329,10 @@ def _make_fast_path_processor(cfg: "PipecatLoopConfig | None" = None):
                     return
 
                 # Invasive action → ask for confirmation, do NOT exec.
-                if action.name not in _SAFE_ACTIONS_NO_CONFIRM:
+                # R35-S28: ``voice_confirm_actions=false`` in config skips
+                # this gate entirely so commands run hands-free.
+                _confirm_actions = getattr(cfg, "voice_confirm_actions", True)
+                if action.name not in _SAFE_ACTIONS_NO_CONFIRM and _confirm_actions:
                     self._pending_action = (action, _t_conf.monotonic())
                     desc = (action.description or action.name).strip()
                     # R34-S48 — Russian-only confirmation prompts.
