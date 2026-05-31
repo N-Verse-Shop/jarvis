@@ -2312,6 +2312,60 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             except Exception:
                 pass
             t0_call = _time.monotonic()
+            # R35-S25: multi-provider tier ladder. Tries Groq → Cerebras
+            # → NVIDIA NIM → SambaNova in order, each with 8 s timeout.
+            # First one to return a reply wins. All silently skipped if
+            # no env key set. Privacy keyword gate forces Hetzner Ollama
+            # (EU) for client-sensitive turns. Ladder is fast (TTFT 200-
+            # 800 ms warm on Groq) and resilient (cold NIM doesn't block).
+            try:
+                from ..llm_providers import call_tier_ladder
+                from ..nvidia_nim import _is_privacy_sensitive, DEFAULT_PRIVACY_KEYWORDS
+                privacy_terms = tuple(
+                    getattr(cfg, "privacy_keywords", DEFAULT_PRIVACY_KEYWORDS)
+                )
+                if _is_privacy_sensitive(text, privacy_terms):
+                    debug_log(
+                        "direct_chat: privacy keyword → Ollama (skip cloud tiers)",
+                        "pipecat",
+                    )
+                else:
+                    import asyncio as _async_inner
+                    nim_model = getattr(
+                        cfg, "nvidia_nim_chat_model",
+                        "meta/llama-3.3-70b-instruct",
+                    )
+                    loop_inner = _async_inner.get_event_loop()
+                    def _run_ladder() -> tuple:
+                        return call_tier_ladder(
+                            system_prompt=sys_prompt,
+                            user_content=text,
+                            messages_history=history_msgs,
+                            per_provider_timeout_sec=8.0,
+                            temperature=float(getattr(cfg, "chat_temperature", 0.3)),
+                            max_tokens=effective_num_predict,
+                            model_overrides={"nim": nim_model},
+                        )
+                    cloud_reply, cloud_name = await loop_inner.run_in_executor(
+                        None, _run_ladder
+                    )
+                    if cloud_reply:
+                        debug_log(
+                            f"direct_chat: {cloud_name} OK {len(cloud_reply)}ch in "
+                            f"{_time.monotonic()-t0_call:.2f}s",
+                            "pipecat",
+                        )
+                        return cloud_reply
+                    debug_log(
+                        "direct_chat: all cloud tiers failed — fallback to Ollama",
+                        "pipecat",
+                    )
+            except Exception as _tier_exc:
+                debug_log(
+                    f"direct_chat: tier ladder raised "
+                    f"{type(_tier_exc).__name__}: {_tier_exc} — fallback to Ollama",
+                    "pipecat",
+                )
             try:
                 async with session.post(ollama_url, json=payload) as resp:
                     if resp.status != 200:

@@ -121,6 +121,7 @@ def call_llm_nim_streaming(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     abort_event: Optional[threading.Event] = None,
+    messages_history: Optional[List[Dict[str, str]]] = None,
 ) -> Optional[str]:
     """Stream a chat completion from NVIDIA NIM. OpenAI-compatible.
 
@@ -147,6 +148,10 @@ def call_llm_nim_streaming(
     messages: List[Dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
+    # R35-S25: voice path uses last 2-4 message pairs for context. Insert
+    # between system and current user so it reads "system, hist..., user".
+    if messages_history:
+        messages.extend(messages_history)
     messages.append({"role": "user", "content": user_content})
 
     payload: Dict[str, Any] = {
