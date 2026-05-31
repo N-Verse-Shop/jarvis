@@ -17,8 +17,18 @@ function authHeaders() {
 }
 
 async function api(path, opts = {}) {
+  // R35-S32 FIX: callers pass `body` as a plain object (persona PUT,
+  // settings PATCH). Without JSON.stringify, fetch coerces it to the
+  // string "[object Object]" → the server's req.json() throws → HTTP 400
+  // "invalid JSON body". Stringify any non-string body here so EVERY
+  // object-body caller works. Callers that already pass a JSON string
+  // (facts/chat) are left untouched (typeof === "string").
+  const o = { ...opts };
+  if (o.body != null && typeof o.body !== "string") {
+    o.body = JSON.stringify(o.body);
+  }
   const res = await fetch(path, {
-    ...opts,
+    ...o,
     headers: { ...authHeaders(), "Content-Type": "application/json", ...(opts.headers || {}) },
   });
   if (res.status === 401) {
