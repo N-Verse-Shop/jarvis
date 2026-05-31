@@ -783,9 +783,50 @@ async function loadSettings() {
     document.getElementById("set-wake-fuzzy-val").textContent = (data.wake_fuzzy_ratio ?? 0.68).toFixed(2);
     document.getElementById("set-hot-window-val").textContent = data.hot_window_seconds ?? 3;
     document.getElementById("set-endpoint-val").textContent = data.endpoint_silence_ms ?? 700;
+    // R35-S31: auto-render the advanced model/privacy/Claude/behaviour
+    // controls from the backend schema.
+    renderExtraSettings(data._schema || [], data);
   } catch (exc) {
     settingsToast(`Завантажити не вдалося: ${exc.message || exc}`, "error");
   }
+}
+
+// R35-S31: schema-driven settings. The backend returns ``_schema`` (a
+// list of {key,label,type,group,options,min,max}); we render grouped
+// cards so EVERY exposed setting is editable without hand-writing HTML.
+function _escAttr(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function renderField(f, val) {
+  const id = `setx-${f.key}`;
+  const common = `id="${id}" data-key="${f.key}" data-type="${f.type}" class="setting-input"`;
+  let ctrl;
+  if (f.type === "bool") {
+    const checked = (val === true || val === "true" || val === 1) ? "checked" : "";
+    ctrl = `<input type="checkbox" ${common} ${checked} />`;
+  } else if (f.type === "enum") {
+    ctrl = `<select ${common}>` + (f.options || [])
+      .map(o => `<option value="${_escAttr(o)}" ${String(val) === o ? "selected" : ""}>${_escAttr(o)}</option>`)
+      .join("") + `</select>`;
+  } else if (f.type === "int") {
+    ctrl = `<input type="number" ${common} value="${_escAttr(val)}" min="${f.min ?? ""}" max="${f.max ?? ""}" />`;
+  } else {
+    ctrl = `<input type="text" ${common} value="${_escAttr(val)}" />`;
+  }
+  return `<label class="setting"><span class="setting-label">${_escAttr(f.label)}</span>${ctrl}</label>`;
+}
+function renderExtraSettings(schema, data) {
+  const host = document.getElementById("settings-extra");
+  if (!host) return;
+  const groups = {};
+  schema.forEach(f => { (groups[f.group] ||= []).push(f); });
+  host.innerHTML = Object.entries(groups).map(([g, fields]) =>
+    `<div class="card settings-card"><h3>${_escAttr(g)}</h3>` +
+    fields.map(f => renderField(f, data[f.key])).join("") +
+    `</div>`
+  ).join("");
 }
 
 function settingsToast(message, level = "ok") {
@@ -844,6 +885,21 @@ async function saveSettings() {
     whisper_language: strOrUndef("set-whisper-lang"),
     ollama_chat_model: strOrUndef("set-chat-model"),
   };
+  // R35-S31: collect the auto-rendered advanced controls.
+  document.querySelectorAll("#settings-extra [data-key]").forEach(el => {
+    const key = el.getAttribute("data-key");
+    const type = el.getAttribute("data-type");
+    if (type === "bool") {
+      patch[key] = !!el.checked;            // always send (true OR false)
+    } else if (type === "int") {
+      if (el.value === "" || el.value === null) return;
+      const v = parseInt(el.value, 10);
+      if (Number.isFinite(v)) patch[key] = v;
+    } else {
+      const v = (el.value || "").trim();
+      if (v) patch[key] = v;
+    }
+  });
   // Strip undefined so the server doesn't reject "key: undefined".
   Object.keys(patch).forEach(k => patch[k] === undefined && delete patch[k]);
   if (Object.keys(patch).length === 0) {

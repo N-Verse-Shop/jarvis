@@ -1111,6 +1111,18 @@ class DashboardServer:
         "voice_engine",
         "tts_enabled",
         "silero_vad_threshold",
+        # R35-S31: full model/privacy/behaviour control surface.
+        "ollama_base_url",
+        "ollama_chat_keep_alive",
+        "ollama_chat_num_ctx",
+        "tts_rate",
+        "nvidia_nim_chat_model",
+        "mistral_chat_model",
+        "privacy_llm",
+        "claude_spawn_model",
+        "claude_effort",
+        "complex_free_model",
+        "voice_confirm_actions",
     )
     # Subset of the above that the dashboard is allowed to WRITE.
     # We deliberately keep this tighter than the read set — changing
@@ -1131,6 +1143,36 @@ class DashboardServer:
         "voice_device",
         "ollama_chat_model",
         "silero_vad_threshold",
+        # R35-S31: model/privacy/behaviour control surface.
+        "ollama_base_url",
+        "ollama_chat_keep_alive",
+        "ollama_chat_num_ctx",
+        "ollama_chat_num_predict",
+        "tts_rate",
+        "nvidia_nim_chat_model",
+        "mistral_chat_model",
+        "privacy_llm",
+        "claude_spawn_model",
+        "claude_effort",
+        "complex_free_model",
+        "voice_confirm_actions",
+    )
+    # R35-S31: schema drives the dashboard's auto-rendered controls.
+    # Each entry: key, label (RU/UA UI), type (text|int|enum|bool),
+    # group, and (for enum) options / (for int) min,max.
+    _SETTINGS_SCHEMA = (
+        {"key": "ollama_chat_num_predict", "label": "Ollama: макс токенів відповіді", "type": "int", "group": "Моделі", "min": 10, "max": 1000},
+        {"key": "ollama_chat_num_ctx", "label": "Ollama: контекст num_ctx", "type": "int", "group": "Моделі", "min": 256, "max": 8192},
+        {"key": "ollama_base_url", "label": "Ollama URL (приватний/офлайн бекенд)", "type": "text", "group": "Моделі"},
+        {"key": "ollama_chat_keep_alive", "label": "Ollama keep_alive (24h, 5m…)", "type": "text", "group": "Моделі"},
+        {"key": "nvidia_nim_chat_model", "label": "NVIDIA NIM модель", "type": "text", "group": "Моделі"},
+        {"key": "mistral_chat_model", "label": "Mistral модель (EU, приватне)", "type": "text", "group": "Приватність"},
+        {"key": "privacy_llm", "label": "Бекенд приватних запитів", "type": "enum", "group": "Приватність", "options": ["auto", "mistral", "ollama"]},
+        {"key": "claude_spawn_model", "label": "Claude модель (складні задачі)", "type": "enum", "group": "Claude / Геній", "options": ["opus", "sonnet", "haiku"]},
+        {"key": "claude_effort", "label": "Claude reasoning effort", "type": "enum", "group": "Claude / Геній", "options": ["low", "medium", "high", "xhigh", "max"]},
+        {"key": "complex_free_model", "label": "Безкоштовна модель fallback", "type": "text", "group": "Claude / Геній"},
+        {"key": "voice_confirm_actions", "label": "Питати підтвердження дій", "type": "bool", "group": "Поведінка"},
+        {"key": "tts_rate", "label": "Швидкість голосу (TTS rate)", "type": "int", "group": "Голос", "min": 80, "max": 400},
     )
     # Per-key validators — return the coerced value or raise ValueError.
     @staticmethod
@@ -1187,6 +1229,63 @@ class DashboardServer:
             if len(s) > 120:
                 raise ValueError("ollama_chat_model too long")
             return s
+        # ── R35-S31: model / privacy / behaviour settings ─────────────
+        if key in ("nvidia_nim_chat_model", "mistral_chat_model", "complex_free_model"):
+            s = str(s).strip()
+            if not _re.fullmatch(r"[a-zA-Z0-9._:\-/]+", s):
+                raise ValueError(f"{key} has invalid chars")
+            if ".." in s or s.startswith("/") or len(s) > 120:
+                raise ValueError(f"{key} invalid (traversal / too long)")
+            return s
+        if key == "claude_spawn_model":
+            s = str(s).strip()
+            if not _re.fullmatch(r"[a-zA-Z0-9._\-]+", s) or len(s) > 60:
+                raise ValueError("claude_spawn_model invalid (e.g. opus|sonnet|haiku)")
+            return s
+        if key == "claude_effort":
+            s = str(s).strip().lower()
+            if s not in ("low", "medium", "high", "xhigh", "max"):
+                raise ValueError("claude_effort must be low|medium|high|xhigh|max")
+            return s
+        if key == "privacy_llm":
+            s = str(s).strip().lower()
+            if s not in ("auto", "mistral", "ollama"):
+                raise ValueError("privacy_llm must be auto|mistral|ollama")
+            return s
+        if key == "ollama_base_url":
+            s = str(s).strip()
+            if not _re.fullmatch(r"https?://[\w.\-]+(:\d+)?(/[\w./\-]*)?", s) or len(s) > 200:
+                raise ValueError("ollama_base_url must be a http(s) URL")
+            return s
+        if key == "ollama_chat_keep_alive":
+            s = str(s).strip()
+            if not _re.fullmatch(r"-?\d+[smhd]?", s) or len(s) > 12:
+                raise ValueError("ollama_chat_keep_alive like '24h', '5m', '0', '-1'")
+            return s
+        if key == "ollama_chat_num_ctx":
+            v = int(s)
+            if not 256 <= v <= 8192:
+                raise ValueError("ollama_chat_num_ctx must be 256..8192")
+            return v
+        if key == "ollama_chat_num_predict":
+            v = int(s)
+            if not 10 <= v <= 1000:
+                raise ValueError("ollama_chat_num_predict must be 10..1000")
+            return v
+        if key == "tts_rate":
+            v = int(s)
+            if not 80 <= v <= 400:
+                raise ValueError("tts_rate must be 80..400")
+            return v
+        if key == "voice_confirm_actions":
+            if isinstance(s, bool):
+                return s
+            sv = str(s).strip().lower()
+            if sv in ("true", "1", "yes", "on"):
+                return True
+            if sv in ("false", "0", "no", "off"):
+                return False
+            raise ValueError("voice_confirm_actions must be boolean")
         raise ValueError(f"{key} is not a writable setting")
 
     async def _h_settings_get(self, req):
@@ -1215,6 +1314,8 @@ class DashboardServer:
             {"id": "ru_RU-irina-medium", "label": "Ирина (RU, женский, medium)"},
         ]
         out["_writable_keys"] = list(self._SETTINGS_WRITE_KEYS)
+        # R35-S31: schema for the auto-rendered "advanced" controls.
+        out["_schema"] = [dict(s) for s in self._SETTINGS_SCHEMA]
         return web.json_response(out)
 
     async def _h_settings_patch(self, req):
