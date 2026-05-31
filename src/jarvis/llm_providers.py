@@ -84,6 +84,24 @@ PROVIDERS: Tuple[_Provider, ...] = (
 )
 
 
+# R35-S29: Mistral AI — EU-hosted (Paris), GDPR-compliant, OpenAI-compatible.
+# Deliberately NOT in the PROVIDERS ladder above: that ladder serves
+# NON-private turns where Groq (US, 0.3s) is the right default. Mistral is
+# reserved for the PRIVACY path — client-sensitive turns (IBONS/Werkvertrag)
+# that must avoid US clouds. Its EU GPU API answers in ~0.5-1s (vs the
+# self-hosted Hetzner CPU box's 40-100s). Activated by ``JARVIS_MISTRAL_KEY``.
+# Data residency note: this sends the (keyword-flagged) prompt to Mistral,
+# a third-party EU processor — more private than US clouds, less private
+# than the fully self-hosted Hetzner Ollama. The privacy_llm config knob
+# chooses between them.
+MISTRAL_PROVIDER: _Provider = _Provider(
+    name="mistral",
+    base_url="https://api.mistral.ai/v1",
+    env_key_var="JARVIS_MISTRAL_KEY",
+    default_model="mistral-small-latest",
+)
+
+
 def _get_key(provider: _Provider) -> Optional[str]:
     """Read API key for ``provider`` from environment. None if absent."""
     val = os.environ.get(provider.env_key_var, "").strip()

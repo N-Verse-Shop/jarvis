@@ -204,6 +204,14 @@ class PipecatLoopConfig:
     # the NVIDIA model can be switched without a code change.
     nvidia_nim_chat_model: str = "meta/llama-3.3-70b-instruct"
 
+    # R35-S29: privacy-path LLM backend selector.
+    #   "auto"    → Mistral EU API if JARVIS_MISTRAL_KEY present, else Ollama
+    #   "mistral" → force Mistral (falls back to Ollama if no key)
+    #   "ollama"  → force self-hosted Hetzner Ollama (no third party at all)
+    privacy_llm: str = "auto"
+    # Mistral model id used on the privacy path (EU-hosted, GDPR).
+    mistral_chat_model: str = "mistral-small-latest"
+
     # R35-S28: when False, fast-path PC-control commands execute
     # immediately instead of speaking "Подтверждаешь?" and waiting for a
     # yes/no. Default True (safe for a shared install); the owner sets it
@@ -427,6 +435,11 @@ def from_settings(cfg) -> PipecatLoopConfig:
         chat_keep_alive=str(_raw_cfg.get("ollama_chat_keep_alive") or "24h"),
         # R35-S28: voice action confirmation toggle (default True = safe).
         voice_confirm_actions=bool(_raw_cfg.get("voice_confirm_actions", True)),
+        # R35-S29: privacy-path backend selector + Mistral model id.
+        privacy_llm=str(_raw_cfg.get("privacy_llm") or "auto"),
+        mistral_chat_model=str(
+            _raw_cfg.get("mistral_chat_model") or "mistral-small-latest"
+        ),
         piper_voice_id=str(
             _piper_voice_override
             or getattr(cfg, "piper_voice", None)
@@ -2394,8 +2407,64 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                     getattr(cfg, "privacy_keywords", None) or DEFAULT_PRIVACY_KEYWORDS
                 )
                 if _is_privacy_sensitive(text, privacy_terms):
+                    # R35-S29: private turn → must avoid US clouds (Groq/etc).
+                    # Prefer Mistral's EU API (Paris, GDPR, ~0.5-1s) when a key
+                    # is present and privacy_llm allows it; otherwise fall to
+                    # the self-hosted Hetzner Ollama (maximally private — data
+                    # never leaves our own box — but slow on CPU). privacy_llm:
+                    #   "auto"    → Mistral if key present, else Ollama (default)
+                    #   "mistral" → force Mistral (no key → Ollama fallback)
+                    #   "ollama"  → force self-hosted only (never third-party)
+                    privacy_llm = str(getattr(cfg, "privacy_llm", "auto")).lower()
+                    if privacy_llm in ("auto", "mistral"):
+                        try:
+                            from ..llm_providers import (
+                                MISTRAL_PROVIDER,
+                                call_provider_streaming,
+                                _get_key as _get_mistral_key,
+                            )
+                            if _get_mistral_key(MISTRAL_PROVIDER):
+                                import asyncio as _async_m
+                                m_model = (
+                                    getattr(cfg, "mistral_chat_model", None)
+                                    or MISTRAL_PROVIDER.default_model
+                                )
+                                def _run_mistral():
+                                    return call_provider_streaming(
+                                        provider=MISTRAL_PROVIDER,
+                                        chat_model=m_model,
+                                        system_prompt=sys_prompt,
+                                        user_content=text,
+                                        messages_history=history_msgs,
+                                        timeout_sec=8.0,
+                                        temperature=float(
+                                            getattr(cfg, "chat_temperature", 0.3)
+                                        ),
+                                        max_tokens=effective_num_predict,
+                                    )
+                                m_reply = await _async_m.get_event_loop().run_in_executor(
+                                    None, _run_mistral
+                                )
+                                if m_reply:
+                                    debug_log(
+                                        f"direct_chat: mistral(EU) privacy OK "
+                                        f"{len(m_reply)}ch in "
+                                        f"{_time.monotonic()-t0_call:.2f}s",
+                                        "pipecat",
+                                    )
+                                    return m_reply
+                                debug_log(
+                                    "direct_chat: mistral(EU) empty → Ollama",
+                                    "pipecat",
+                                )
+                        except Exception as _mexc:
+                            debug_log(
+                                f"direct_chat: mistral privacy raised "
+                                f"{type(_mexc).__name__}: {_mexc} → Ollama",
+                                "pipecat",
+                            )
                     debug_log(
-                        "direct_chat: privacy keyword → Ollama (skip cloud tiers)",
+                        "direct_chat: privacy keyword → Ollama (self-hosted EU)",
                         "pipecat",
                     )
                 else:
