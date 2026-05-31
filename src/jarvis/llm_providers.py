@@ -64,7 +64,10 @@ PROVIDERS: Tuple[_Provider, ...] = (
         name="cerebras",
         base_url="https://api.cerebras.ai/v1",
         env_key_var="JARVIS_CEREBRAS_KEY",
-        default_model="llama-3.3-70b",
+        # R35-S26: Cerebras free tier only exposes gpt-oss-120b + zai-glm-4.7
+        # (no Llama 3.3 on personal tier). gpt-oss-120b benchmarks: TTFT
+        # 21ms total on second call (basically instant). Wins the ladder.
+        default_model="gpt-oss-120b",
     ),
     _Provider(
         name="nim",
@@ -135,6 +138,12 @@ def call_provider_streaming(
         "temperature": float(temperature),
         "max_tokens": int(max_tokens),
     }
+    # R35-S26: gpt-oss-* and nemotron-3-super-* default to high reasoning
+    # budget which eats the user-visible output budget. Force low so the
+    # final answer comes back in standard ``content`` within max_tokens.
+    # Llama / Mistral / etc. ignore this param silently.
+    if "gpt-oss" in chat_model.lower() or "nemotron-3-super" in chat_model.lower():
+        payload["reasoning_effort"] = "low"
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
