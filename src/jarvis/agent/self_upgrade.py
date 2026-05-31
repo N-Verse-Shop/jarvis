@@ -237,8 +237,18 @@ def spawn_claude(brief_path: Path) -> subprocess.Popen | None:
     # for risky tools — at minimum the user must approve them manually
     # in a separate terminal. Better: route this through a dedicated
     # gated approval UI before spawn (TODO).
+    # R35-S30: self-upgrade rewrites Jarvis's own code — run it on the
+    # STRONGEST Claude model (Opus) for max-quality changes. Covered by the
+    # Max subscription (no API charge). Config-driven (claude_spawn_model).
+    _spawn_model = "opus"
+    try:
+        from ..config import load_config as _lc
+        _spawn_model = str((_lc() or {}).get("claude_spawn_model") or "opus")
+    except Exception:
+        pass
     cmd = [
         claude_bin,
+        "--model", _spawn_model,
         "--max-turns", "60",
         "--print",  # non-interactive
         f"Read {brief_path} and execute the task described inside. "

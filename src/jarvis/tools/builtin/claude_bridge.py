@@ -90,6 +90,66 @@ _CLAUDE_BIN_CANDIDATES = [
 ]
 
 
+def _claude_cfg(key: str, default: str) -> str:
+    """Read a claude-spawn config key from config.json, best-effort.
+
+    R35-S30 — lets the user pin the model / reasoning effort used for
+    complex tasks without touching code. Never raises: a broken config
+    falls back to ``default`` (quality-first).
+    """
+    try:
+        from ...config import load_config
+        val = (load_config() or {}).get(key)
+        return str(val) if val else default
+    except Exception:
+        return default
+
+
+def _complex_free_fallback(prompt: str) -> Optional[str]:
+    """R35-S30: strongest FREE model when the Claude CLI is unavailable.
+
+    When ``claude`` is missing or its weekly Opus limit is hit, complex
+    tasks would otherwise hard-fail. Instead we answer with the strongest
+    free cloud model we can reach — Cerebras ``gpt-oss-120b`` (120B), then
+    the full Groq→Cerebras→NIM ladder. Text-only (not agentic file edits),
+    but it keeps Jarvis a genius for hard reasoning questions. Returns the
+    answer text, or ``None`` if every provider is unreachable.
+    """
+    sys_prompt = (
+        "You are an elite senior software engineer and analyst. Think "
+        "carefully and give a thorough, correct, actionable answer."
+    )
+    try:
+        from ...llm_providers import (
+            PROVIDERS,
+            call_provider_streaming,
+            call_tier_ladder,
+            _get_key,
+        )
+        model = _claude_cfg("complex_free_model", "gpt-oss-120b")
+        cerebras = next((p for p in PROVIDERS if p.name == "cerebras"), None)
+        if cerebras is not None and _get_key(cerebras) is not None:
+            r = call_provider_streaming(
+                provider=cerebras,
+                chat_model=model,
+                system_prompt=sys_prompt,
+                user_content=prompt,
+                timeout_sec=60.0,
+                max_tokens=1500,
+            )
+            if r:
+                return r
+        reply, _who = call_tier_ladder(
+            system_prompt=sys_prompt,
+            user_content=prompt,
+            per_provider_timeout_sec=30.0,
+            max_tokens=1500,
+        )
+        return reply
+    except Exception:
+        return None
+
+
 def _find_claude_binary() -> Optional[Path]:
     """Resolve ``claude`` CLI path. Returns None if not installed."""
     # Try PATH first.
@@ -318,6 +378,16 @@ class ClaudeCodeSpawnTool(Tool):
         # Resolve binary.
         claude_bin = _find_claude_binary()
         if claude_bin is None:
+            # R35-S30: Claude CLI missing → don't hard-fail. Answer with the
+            # strongest FREE cloud model (gpt-oss-120b / ladder) so complex
+            # reasoning still works (text-only, not agentic file edits).
+            fb = _complex_free_fallback(prompt)
+            if fb:
+                return ToolExecutionResult(
+                    success=True,
+                    reply_text=fb,
+                    error_message=None,
+                )
             return ToolExecutionResult(
                 success=False,
                 reply_text=None,
@@ -357,7 +427,17 @@ class ClaudeCodeSpawnTool(Tool):
             "--add-dir",
             str(workdir),
         ]
-        effort = args.get("effort")
+        # R35-S30: complex tasks must run on the STRONGEST Claude model for
+        # max quality. The Max subscription covers Opus (no API charge), and
+        # Claude only ever runs with internet anyway, so there's no reason to
+        # use a weaker default. Config-driven (claude_spawn_model, default
+        # "opus"); tool-arg ``model`` overrides per call.
+        _claude_model = args.get("model") or _claude_cfg("claude_spawn_model", "opus")
+        if _claude_model:
+            cmd += ["--model", str(_claude_model)]
+        # Default reasoning effort to "high" for quality (was: only when the
+        # caller passed it). Caller / config can still dial it down.
+        effort = args.get("effort") or _claude_cfg("claude_effort", "high")
         if effort in {"low", "medium", "high", "xhigh", "max"}:
             cmd += ["--effort", str(effort)]
         agent = args.get("agent")
