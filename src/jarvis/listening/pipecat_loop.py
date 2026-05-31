@@ -413,6 +413,9 @@ def from_settings(cfg) -> PipecatLoopConfig:
         chat_temperature=float(_raw_cfg.get("ollama_chat_temperature", 0.4)),
         chat_num_predict=int(_raw_cfg.get("ollama_chat_num_predict", 220)),
         chat_num_ctx=int(_raw_cfg.get("ollama_chat_num_ctx", 2048)),
+        # R35-S27: keep_alive is config-driven (ollama_chat_keep_alive).
+        # Long default suits the Hetzner CPU backend (30-60s reloads).
+        chat_keep_alive=str(_raw_cfg.get("ollama_chat_keep_alive") or "24h"),
         piper_voice_id=str(
             _piper_voice_override
             or getattr(cfg, "piper_voice", None)
@@ -2101,6 +2104,12 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
     model = cfg.chat_model
     num_predict = int(cfg.chat_num_predict)
     num_ctx = int(cfg.chat_num_ctx)
+    # R35-S27: keep_alive now config-driven (was hardcoded "24h"). On the
+    # Hetzner CPU backend reloads cost 30-60s so we keep it long; a fast
+    # local GPU backend could instead use a short value to reclaim idle
+    # RAM. The Groq tier ladder serves 95%+ of turns, so this Ollama tier
+    # is only the rare client-private / offline fallback.
+    keep_alive = str(getattr(cfg, "chat_keep_alive", "24h") or "24h")
 
     # System prompt assembled the same way as the regular Pipecat
     # path so behaviour stays consistent. We import the helper
@@ -2325,10 +2334,10 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
                 # anyway).
                 "stream": False,
                 "think": False,
-                # R34-S39 — pass keep_alive so the model stays in VRAM
-                # between turns. Without this, after ~5min idle Ollama
-                # unloads qwen3:8b → next turn pays 30-60s reload.
-                "keep_alive": "24h",
+                # R34-S39/R35-S27 — keep_alive holds the model in VRAM
+                # between turns. Config-driven now (ollama_chat_keep_alive);
+                # short on the local Metal backend so idle RAM is reclaimed.
+                "keep_alive": keep_alive,
                 "options": {
                     "num_predict": effective_num_predict,
                     "num_ctx": num_ctx,
