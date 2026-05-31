@@ -443,6 +443,11 @@ class DashboardServer:
             body=index_path.read_bytes(),
             content_type="text/html",
             charset="utf-8",
+            # R35-S33: never cache the HTML shell so the browser always
+            # revalidates and picks up new ?v= asset versions. Without
+            # this the browser cached index.html → stale app.js → users
+            # never saw new dashboard features/fixes until a hard reload.
+            headers={"Cache-Control": "no-cache, must-revalidate"},
         )
 
     @staticmethod
@@ -1123,6 +1128,7 @@ class DashboardServer:
         "claude_effort",
         "complex_free_model",
         "voice_confirm_actions",
+        "privacy_keywords",
     )
     # Subset of the above that the dashboard is allowed to WRITE.
     # We deliberately keep this tighter than the read set — changing
@@ -1156,6 +1162,7 @@ class DashboardServer:
         "claude_effort",
         "complex_free_model",
         "voice_confirm_actions",
+        "privacy_keywords",
     )
     # R35-S31: schema drives the dashboard's auto-rendered controls.
     # Each entry: key, label (RU/UA UI), type (text|int|enum|bool),
@@ -1168,6 +1175,7 @@ class DashboardServer:
         {"key": "nvidia_nim_chat_model", "label": "NVIDIA NIM модель", "type": "text", "group": "Моделі"},
         {"key": "mistral_chat_model", "label": "Mistral модель (EU, приватне)", "type": "text", "group": "Приватність"},
         {"key": "privacy_llm", "label": "Бекенд приватних запитів", "type": "enum", "group": "Приватність", "options": ["auto", "mistral", "ollama"]},
+        {"key": "privacy_keywords", "label": "Приватні ключові слова (по одному на рядок)", "type": "list", "group": "Приватність"},
         {"key": "claude_spawn_model", "label": "Claude модель (складні задачі)", "type": "enum", "group": "Claude / Геній", "options": ["opus", "sonnet", "haiku"]},
         {"key": "claude_effort", "label": "Claude reasoning effort", "type": "enum", "group": "Claude / Геній", "options": ["low", "medium", "high", "xhigh", "max"]},
         {"key": "complex_free_model", "label": "Безкоштовна модель fallback", "type": "text", "group": "Claude / Геній"},
@@ -1286,6 +1294,27 @@ class DashboardServer:
             if sv in ("false", "0", "no", "off"):
                 return False
             raise ValueError("voice_confirm_actions must be boolean")
+        if key == "privacy_keywords":
+            # Accept a list, or newline/comma-separated text from the UI.
+            if isinstance(s, (list, tuple)):
+                items = [str(x).strip() for x in s]
+            elif isinstance(s, str):
+                items = [x.strip() for x in s.replace(",", "\n").splitlines()]
+            else:
+                raise ValueError("privacy_keywords must be a list or text")
+            items = [x for x in items if x]
+            if len(items) > 300:
+                raise ValueError("too many privacy_keywords (max 300)")
+            for x in items:
+                if len(x) > 80:
+                    raise ValueError("a privacy keyword is too long (max 80 chars)")
+            # Dedup case-insensitively, preserve order.
+            seen, deduped = set(), []
+            for x in items:
+                if x.lower() not in seen:
+                    seen.add(x.lower())
+                    deduped.append(x)
+            return deduped
         raise ValueError(f"{key} is not a writable setting")
 
     async def _h_settings_get(self, req):

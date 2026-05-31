@@ -822,6 +822,9 @@ function renderField(f, val) {
       .join("") + `</select>`;
   } else if (f.type === "int") {
     ctrl = `<input type="number" ${common} value="${_escAttr(val)}" min="${f.min ?? ""}" max="${f.max ?? ""}" />`;
+  } else if (f.type === "list") {
+    const text = Array.isArray(val) ? val.join("\n") : (val || "");
+    ctrl = `<textarea ${common} rows="6" placeholder="один термін на рядок">${_escAttr(text)}</textarea>`;
   } else {
     ctrl = `<input type="text" ${common} value="${_escAttr(val)}" />`;
   }
@@ -901,6 +904,8 @@ async function saveSettings() {
     const type = el.getAttribute("data-type");
     if (type === "bool") {
       patch[key] = !!el.checked;            // always send (true OR false)
+    } else if (type === "list") {
+      patch[key] = (el.value || "").split("\n").map(x => x.trim()).filter(Boolean);
     } else if (type === "int") {
       if (el.value === "" || el.value === null) return;
       const v = parseInt(el.value, 10);
