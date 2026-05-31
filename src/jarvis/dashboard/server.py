@@ -59,6 +59,97 @@ def _dashboard_data_dir() -> Path:
     return base / "jarvis"
 
 
+# ── R35-S34: Nexus Brain vault helpers for the 3D brain graph ──────────
+def _brain_vault_root() -> Path:
+    """Root of the Obsidian "Nexus Brain" vault Jarvis reads from."""
+    env = os.environ.get("JARVIS_BRAIN_VAULT")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / "Documents" / "Nexus-Brain"
+
+
+# ``[[Target]]`` / ``[[Target|alias]]`` / ``[[Target#heading]]`` — group 1
+# is the link target (note title), stripped of any alias/anchor.
+_WIKILINK_RE = __import__("re").compile(r"\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]")
+_BRAIN_VAULT_MAX_NOTES = 500
+_BRAIN_NOTE_MAX_BYTES = 256 * 1024
+
+
+def _scan_vault_notes(
+    root: Path, *, limit: int = _BRAIN_VAULT_MAX_NOTES
+) -> tuple[list[dict], bool]:
+    """Walk the vault, newest-first, capped at ``limit`` notes.
+
+    Returns ``(notes, truncated)``. Each note is
+    ``{rel, title, mtime, size, links}`` where ``links`` are the raw
+    wikilink targets found in the body. Obsidian / git internals are
+    skipped to keep the walk cheap.
+    """
+    if not root.is_dir():
+        return [], False
+    collected: list[tuple[float, int, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if any(seg in dirpath for seg in ("/.obsidian", "/.git", "/.trash")):
+            dirnames[:] = []
+            continue
+        for fn in filenames:
+            if not fn.lower().endswith((".md", ".markdown")):
+                continue
+            fp = Path(dirpath) / fn
+            try:
+                st = fp.stat()
+            except OSError:
+                continue
+            collected.append((st.st_mtime, st.st_size, fp))
+    collected.sort(key=lambda t: t[0], reverse=True)
+    truncated = len(collected) > limit
+    notes: list[dict] = []
+    for mtime, size, fp in collected[:limit]:
+        try:
+            rel = str(fp.relative_to(root))
+        except ValueError:
+            continue
+        links: list[str] = []
+        if size <= _BRAIN_NOTE_MAX_BYTES:
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+                links = [m.group(1).strip() for m in _WIKILINK_RE.finditer(text)]
+            except OSError:
+                links = []
+        notes.append({
+            "rel": rel,
+            "title": fp.stem,
+            "mtime": mtime,
+            "size": size,
+            "links": links,
+        })
+    return notes, truncated
+
+
+def _read_vault_note(root: Path, rel: str) -> Optional[str]:
+    """Read one vault note, sandboxed under ``root`` + size-capped.
+
+    Mirrors the skill-reference loader's symlink/escape defence: resolve
+    the target and refuse anything that climbs out of the vault.
+    """
+    try:
+        target = (root / rel).resolve(strict=True)
+        vault_root = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        target.relative_to(vault_root)
+    except ValueError:
+        return None
+    if target.suffix.lower() not in (".md", ".markdown", ".txt"):
+        return None
+    try:
+        with open(target, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(_BRAIN_NOTE_MAX_BYTES)
+    except OSError:
+        return None
+
+
 _TOKEN_PATH = _dashboard_data_dir() / "dashboard-token"
 
 
@@ -420,6 +511,10 @@ class DashboardServer:
         # voice pipeline without going through the microphone.
         app.router.add_post("/api/voice/inject", self._h_voice_inject)
         app.router.add_get("/api/brain", self._h_brain)
+        # R35-S34: per-node document/content for the 3D brain graph.
+        # ``id`` is a query param (e.g. ?id=note:50-Daily/x.md) so vault
+        # paths with slashes don't trip percent-encoding in the path.
+        app.router.add_get("/api/brain/node", self._h_brain_node)
         # OPTIONS fallback for every route (CORS preflight)
         app.router.add_route("OPTIONS", "/{tail:.*}", self._h_options)
 
@@ -1850,6 +1945,112 @@ class DashboardServer:
         self._brain_cache = {"ts": now, "data": data}
         return web.json_response(data)
 
+    async def _h_brain_node(self, req):
+        """Full info + document content for a single brain-graph node.
+
+        ``id`` (query param) is ``<kind>:<rest>`` — e.g. ``skill:humanizer``,
+        ``fact:user.coffee``, ``note:50-Daily/2026-05-31.md``,
+        ``tool:open_url``. Vault reads are sandboxed under the vault root.
+        """
+        from aiohttp import web
+        node_id = (req.query.get("id") or "").strip()
+        kind, _, rest = node_id.partition(":")
+
+        if kind == "skill":
+            from ..skills import get_skill_store
+            s = await asyncio.to_thread(
+                lambda: get_skill_store().get_skill(rest)
+            )
+            if s is None:
+                return web.json_response({"error": "not_found"}, status=404)
+            return web.json_response({
+                "id": node_id, "kind": "skill", "title": s.name,
+                "subtitle": s.description,
+                "tags": list(s.tags or []),
+                "fields": {
+                    "risk": s.risk, "version": s.version,
+                    "tools": list(s.tools or []), "path": str(s.path),
+                },
+                "content": s.content, "content_type": "markdown",
+            })
+
+        if kind == "fact":
+            from ..memory.facts import get_facts_store
+            store = get_facts_store()
+            now = time.time()
+            rows = await asyncio.to_thread(
+                lambda: store.by_key(rest, limit=25)
+            )
+            exact = [f for f in rows if getattr(f, "key", None) == rest]
+            rows = exact or rows
+            if not rows:
+                return web.json_response({"error": "not_found"}, status=404)
+            body = "\n".join(
+                f"- {f.value}  ·  score {f.score(now=now):.2f}  ·  hits {f.hits}"
+                for f in rows
+            )
+            return web.json_response({
+                "id": node_id, "kind": "fact", "title": rest,
+                "subtitle": f"{len(rows)} value(s) remembered",
+                "fields": {
+                    "source": getattr(rows[0], "source", ""),
+                    "confidence": getattr(rows[0], "confidence", ""),
+                },
+                "content": body, "content_type": "markdown",
+            })
+
+        if kind == "tool":
+            from ..capabilities import gate_summary
+            gates = await asyncio.to_thread(gate_summary)
+            gate, active = None, None
+            for g, info in (gates or {}).items():
+                if rest in (info.get("tools") or []):
+                    gate, active = g, bool(info.get("active"))
+                    break
+            note = (
+                f" — gated by `{gate}` ({'open' if active else 'closed'})."
+                if gate else "."
+            )
+            return web.json_response({
+                "id": node_id, "kind": "tool", "title": rest,
+                "subtitle": "Tool / action Jarvis can call",
+                "fields": {
+                    "gate": gate or "—",
+                    "gate_open": active if active is not None else "—",
+                },
+                "content": f"Tool **{rest}**{note}",
+                "content_type": "markdown",
+            })
+
+        if kind == "note":
+            text = await asyncio.to_thread(
+                lambda: _read_vault_note(_brain_vault_root(), rest)
+            )
+            if text is None:
+                return web.json_response({"error": "not_found"}, status=404)
+            title = rest.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            return web.json_response({
+                "id": node_id, "kind": "note", "title": title,
+                "subtitle": rest, "fields": {"path": rest},
+                "content": text, "content_type": "markdown",
+            })
+
+        if kind in ("core", "hub"):
+            labels = {
+                "core": "Jarvis Core", "hub:skills": "Skills",
+                "hub:tools": "Tools", "hub:memory": "Memory",
+                "hub:vault": "Nexus Brain",
+            }
+            return web.json_response({
+                "id": node_id, "kind": "hub",
+                "title": labels.get(node_id, node_id),
+                "subtitle": "Cluster hub",
+                "content": "Cluster hub linking nodes of this category.",
+                "content_type": "markdown", "fields": {},
+            })
+
+        return web.json_response({"error": "unknown_kind"}, status=404)
+
     def _brain_snapshot(self) -> dict:
         """Build the brain-view payload. Runs in a thread to keep the
         event loop free during DB reads."""
@@ -1885,7 +2086,7 @@ class DashboardServer:
         try:
             from ..memory.facts import get_facts_store
             store = get_facts_store()
-            facts = store.by_key("", limit=80) if store else []
+            facts = store.by_key("", limit=200) if store else []
         except Exception:
             facts = []
         if facts:
@@ -1946,9 +2147,138 @@ class DashboardServer:
                 # Firing rate normalized 0..1 over the last 5 min.
                 "firing_rate": min(1.0, total / 60.0),
             })
+        # ── R35-S34: assemble an Obsidian-style node-link graph ──────
+        # Reuses the records already gathered above (skills, facts,
+        # by_tool) and adds capability gates + the Nexus Brain vault.
+        # Topology: a central ``core`` hub → 4 category hubs → leaves.
+        nodes: list[dict] = []
+        links: list[dict] = []
+        seen: set[str] = set()
+
+        def _node(nid, label, group, *, val=1.0, heat=0.0, kind=None, meta=None):
+            if nid in seen:
+                return
+            seen.add(nid)
+            nodes.append({
+                "id": nid,
+                "label": str(label)[:64],
+                "group": group,
+                "kind": kind or group,
+                "val": round(float(val), 3),
+                "heat": round(float(heat), 3),
+                "meta": meta or {},
+            })
+
+        def _link(src, dst, kind="member", value=1.0):
+            if src in seen and dst in seen and src != dst:
+                links.append({
+                    "source": src, "target": dst,
+                    "kind": kind, "value": float(value),
+                })
+
+        _node("core", "Jarvis", "core", val=14.0, kind="core",
+              meta={"role": "daemon core"})
+        for hid, hlabel in (
+            ("hub:skills", "Skills"),
+            ("hub:tools", "Tools"),
+            ("hub:memory", "Memory"),
+            ("hub:vault", "Nexus Brain"),
+        ):
+            _node(hid, hlabel, "hub", val=7.0, kind="hub")
+            _link("core", hid, kind="hub", value=3.0)
+
+        # Per-tool heat from recent audit usage (last 5 min).
+        max_ct = max(by_tool.values()) if by_tool else 0
+
+        def _tool_heat(name: str) -> float:
+            return (by_tool.get(name, 0) / max_ct) if max_ct else 0.0
+
+        # Skills + their declared tools.
+        for sk in skills:
+            nm = getattr(sk, "name", None) or "?"
+            nid = f"skill:{nm}"
+            sk_tools = list(getattr(sk, "tools", []) or [])
+            _node(nid, nm, "skill", val=2.0 + 0.4 * len(sk_tools), kind="skill",
+                  meta={
+                      "risk": str(getattr(sk, "risk", "low") or "low").lower(),
+                      "description": (getattr(sk, "description", "") or "")[:200],
+                      "tags": list(getattr(sk, "tags", []) or [])[:10],
+                  })
+            _link(nid, "hub:skills", kind="member")
+            for tnm in sk_tools:
+                tid = f"tool:{tnm}"
+                _node(tid, tnm, "tool", val=1.5, heat=_tool_heat(tnm), kind="tool")
+                _link(tid, "hub:tools", kind="member")
+                _link(nid, tid, kind="uses", value=1.0)
+
+        # Capability gates → their tools.
+        try:
+            from ..capabilities import gate_summary
+            gates = gate_summary() or {}
+        except Exception:
+            gates = {}
+        for gate, info in gates.items():
+            for tnm in (info.get("tools") or []):
+                tid = f"tool:{tnm}"
+                ct = by_tool.get(tnm, 0)
+                _node(tid, tnm, "tool", val=1.5 + ct, heat=_tool_heat(tnm),
+                      kind="tool",
+                      meta={"gate": gate, "active": bool(info.get("active"))})
+                _link(tid, "hub:tools", kind="member")
+
+        # Any audited tool not already represented.
+        for tnm, ct in by_tool.items():
+            tid = f"tool:{tnm}"
+            _node(tid, tnm, "tool", val=1.5 + ct, heat=_tool_heat(tnm), kind="tool")
+            _link(tid, "hub:tools", kind="member")
+
+        # Memory facts.
+        now_ts = time.time()
+        for f in facts:
+            key = getattr(f, "key", "?")
+            nid = f"fact:{key}"
+            try:
+                score = float(f.score(now=now_ts))
+            except Exception:
+                score = 1.0
+            _node(nid, key, "fact", val=1.0 + min(score, 4.0), kind="fact",
+                  meta={"value": (getattr(f, "value", "") or "")[:200]})
+            _link(nid, "hub:memory", kind="member")
+
+        # Nexus Brain vault notes + their wikilink edges (Obsidian-style).
+        try:
+            vnotes, vault_truncated = _scan_vault_notes(_brain_vault_root())
+        except Exception:
+            vnotes, vault_truncated = [], False
+        title_to_id: dict[str, str] = {}
+        for n in vnotes:
+            nid = f"note:{n['rel']}"
+            _node(nid, n["title"], "note", val=1.5, kind="note",
+                  meta={"rel": n["rel"], "size": n["size"]})
+            _link(nid, "hub:vault", kind="member")
+            title_to_id.setdefault(n["title"].lower(), nid)
+        for n in vnotes:
+            src = f"note:{n['rel']}"
+            for lk in n["links"]:
+                tgt = title_to_id.get(lk.lower())
+                if tgt:
+                    _link(src, tgt, kind="wikilink", value=1.0)
+
+        out["nodes"] = nodes
+        out["links"] = links
+        out["meta"] = {
+            "vault_truncated": vault_truncated,
+            "vault_notes": len(vnotes),
+            "groups": {
+                g: sum(1 for nd in nodes if nd["group"] == g)
+                for g in ("core", "hub", "skill", "tool", "fact", "note")
+            },
+        }
         out["totals"] = {
             "neurons": sum(len(r["neurons"]) for r in out["regions"]),
             "regions": len(out["regions"]),
+            "nodes": len(nodes),
+            "links": len(links),
         }
         return out
 

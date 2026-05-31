@@ -1124,177 +1124,357 @@ async function interruptJarvis() {
   }
 }
 
-// ─── Brain View (R34-S27) ─────────────────────────────────────────
-// Canvas2D animated visualization of skills + memory + tool firing.
-// Polls /api/brain at 5s TTL, renders nodes per region as glowing
-// orbs that pulse when their region has recent activity. Designed
-// to look like the @KZZY47 "Kronos" UI without the marketing
-// dishonesty: every neuron is a real piece of state Jarvis tracks.
-const _brainState = {
-  raf: null,
-  timer: null,
-  data: null,
-  t0: 0,
+// ─── Brain Graph (R34-S27 · 3D rebuild R35-S34) ───────────────────
+// A real 3D force-directed knowledge graph (Obsidian-style) of
+// everything Jarvis knows / can do / uses: skills, tools, memory
+// facts and the Nexus Brain vault (wikilink edges). Built on the
+// vendored 3d-force-graph (three.js). Live activity from /ws/events
+// shoots particles along the links of whatever Jarvis is using.
+const BRAIN_COLORS = {
+  core: "#ffffff", hub: "#6C63FF", skill: "#00D4FF",
+  tool: "#FFD166", fact: "#06D6A0", note: "#FF6B9D",
 };
-async function _fetchBrain() {
+const BRAIN_GROUP_LABELS = {
+  core: "Core", hub: "Clusters", skill: "Skills",
+  tool: "Tools", fact: "Memory", note: "Vault",
+};
+const _brain = {
+  graph: null, socket: null, reconnectMs: 1000,
+  linksByNode: {}, nodesById: {}, spinTimer: null, built: false, _chipT: null,
+};
+
+function _hex2rgb(h) {
+  const m = h.replace("#", "");
+  return [parseInt(m.slice(0, 2), 16), parseInt(m.slice(2, 4), 16), parseInt(m.slice(4, 6), 16)];
+}
+function _mixHex(a, b, t) {
+  const ca = _hex2rgb(a), cb = _hex2rgb(b);
+  const c = ca.map((v, i) => Math.round(v + (cb[i] - v) * t));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+function _brainNodeColor(n) {
+  const base = BRAIN_COLORS[n.group] || "#8a90b8";
+  return (n.heat && n.heat > 0.05) ? _mixHex(base, "#ff8a00", Math.min(1, n.heat)) : base;
+}
+function _brainLinkColor(l) {
+  switch (l.kind) {
+    case "wikilink": return "#FF6B9D";
+    case "uses": return "#FFD166";
+    case "hub": return "#6C63FF";
+    default: return "#8a90b8";
+  }
+}
+function _brainSize() {
+  const el = document.getElementById("brain-graph");
+  if (!el) return [800, 520];
+  return [el.clientWidth || 800, el.clientHeight || 520];
+}
+
+// Deterministic camera framing — zoomToFit() proved unreliable here
+// (the force layout overshoots, and fit picked wildly wrong distances).
+// We compute the node bounding sphere and place the camera so it fits
+// with a small margin, looking at the centre of mass.
+function _brainFitCamera(ms) {
+  const G = _brain.graph;
+  if (!G) return;
+  const ns = G.graphData().nodes;
+  if (!ns.length) return;
+  let cx = 0, cy = 0, cz = 0;
+  for (const n of ns) { cx += n.x || 0; cy += n.y || 0; cz += n.z || 0; }
+  cx /= ns.length; cy /= ns.length; cz /= ns.length;
+  let maxR = 1;
+  for (const n of ns) {
+    const r = Math.hypot((n.x || 0) - cx, (n.y || 0) - cy, (n.z || 0) - cz);
+    if (r > maxR) maxR = r;
+  }
+  const fov = ((G.camera() && G.camera().fov) || 50) * Math.PI / 180;
+  const dist = (maxR / Math.tan(fov / 2)) * 1.25 + 30;
+  try {
+    G.cameraPosition({ x: cx, y: cy, z: cz + dist }, { x: cx, y: cy, z: cz }, ms || 0);
+  } catch (_) {}
+}
+
+function _brainEnsureGraph() {
+  if (_brain.graph) return _brain.graph;
+  const el = document.getElementById("brain-graph");
+  if (!el || typeof window.ForceGraph3D !== "function") return null;
+  const [w, h] = _brainSize();
+  const G = window.ForceGraph3D()(el)
+    .width(w).height(h)
+    .backgroundColor("#05060f")
+    .showNavInfo(false)
+    .nodeId("id")
+    .nodeVal((n) => (n.group === "core" ? 5 : n.group === "hub" ? 3 : Math.min(n.val || 1, 2.2)))
+    .nodeRelSize(2.0)
+    .nodeOpacity(0.9)
+    .nodeResolution(18)
+    .nodeColor(_brainNodeColor)
+    .nodeLabel((n) => `<div class="g-tip"><b>${escapeHtml(n.label)}</b><span>${escapeHtml(n.kind || n.group)}</span></div>`)
+    .linkColor(_brainLinkColor)
+    .linkOpacity(0.32)
+    .linkWidth((l) => (l.kind === "hub" ? 1.4 : 0.5))
+    .linkDirectionalParticles((l) => (l.kind === "hub" ? 2 : 0))
+    .linkDirectionalParticleWidth(1.8)
+    .linkDirectionalParticleSpeed(0.006)
+    .linkDirectionalParticleColor(() => "#00D4FF")
+    .cooldownTicks(220)
+    .d3VelocityDecay(0.55)
+    .onEngineStop(() => _brainFitCamera(400))
+    .onNodeClick(_brainOpenNode)
+    .onNodeDragEnd((n) => { n.fx = n.x; n.fy = n.y; n.fz = n.z; })
+    .onBackgroundClick(_brainCloseDrawer);
+  // Spread the graph out: strong repulsion + long hub spokes so the
+  // clusters separate into readable lobes instead of one dense ball.
+  try {
+    G.d3Force("charge").strength(-55);
+    G.d3Force("link").distance((l) => (l.kind === "hub" ? 45 : 22)).strength(0.85);
+  } catch (_) {}
+  _brain.graph = G;
+  return G;
+}
+
+async function _brainFetch() {
   try {
     const data = await api("/api/brain");
-    if (data && data.regions) {
-      _brainState.data = data;
-      const tot = data.totals || {};
-      document.getElementById("brain-totals").textContent =
-        `${tot.neurons || 0} neurons · ${tot.regions || 0} regions`;
-      _renderBrainLegend(data);
-    }
+    _brainBuild(data);
   } catch (e) {
     console.warn("brain fetch:", e);
+    _brainShowEmpty("Не вдалося завантажити граф.");
   }
 }
-function _renderBrainLegend(data) {
+
+function _brainShowEmpty(msg) {
+  const empty = document.getElementById("brain-empty");
+  const gel = document.getElementById("brain-graph");
+  if (empty) { empty.hidden = !msg; empty.textContent = msg || ""; }
+  if (gel) gel.style.visibility = msg ? "hidden" : "visible";
+}
+
+function _brainBuild(data) {
+  const G = _brainEnsureGraph();
+  if (!G) { _brainShowEmpty("3D-рушій не завантажився."); return; }
+  const nodes = (data.nodes || []).map((n) => ({ ...n }));
+  const links = (data.links || []).map((l) => ({ ...l }));
+  if (!nodes.length) { _brainShowEmpty("Поки немає даних для графа."); return; }
+  _brainShowEmpty("");
+  // Index for live particle emission + lookups.
+  const byNode = {}, byId = {};
+  for (const n of nodes) byId[n.id] = n;
+  for (const l of links) {
+    (byNode[l.source] = byNode[l.source] || []).push(l);
+    (byNode[l.target] = byNode[l.target] || []).push(l);
+  }
+  _brain.linksByNode = byNode;
+  _brain.nodesById = byId;
+  G.graphData({ nodes, links });
+  _brain.built = true;
+  const tot = data.totals || {};
+  const meta = data.meta || {};
+  const trunc = meta.vault_truncated ? " · vault обрізано" : "";
+  document.getElementById("brain-totals").textContent =
+    `${tot.nodes || nodes.length} вузлів · ${tot.links || links.length} звʼязків${trunc}`;
+  _brainRenderLegend(data);
+  // Track the settling layout with a self-stopping fit loop. Robust
+  // regardless of whether the engine emits tick/stop events (it often
+  // doesn't here), and recomputes the bounding sphere each pass so the
+  // camera ends framed on the final, contracted graph.
+  if (_brain._fitTimer) clearInterval(_brain._fitTimer);
+  let fits = 0;
+  _brain._fitTimer = setInterval(() => {
+    _brainFitCamera(0);
+    if (++fits >= 22) { clearInterval(_brain._fitTimer); _brain._fitTimer = null; }
+  }, 400);
+}
+
+function _brainRenderLegend(data) {
   const el = document.getElementById("brain-legend");
   if (!el) return;
-  const palette = _brainPalette();
-  el.innerHTML = (data.regions || [])
-    .map((r, idx) => {
-      const c = palette(idx);
-      return `<span class="brain-legend-item">
-        <span class="brain-dot" style="background:${c}"></span>
-        ${escapeHtml(r.label)} · ${r.neurons.length}
-      </span>`;
-    })
+  const groups = (data.meta && data.meta.groups) || {};
+  const order = ["core", "hub", "skill", "tool", "fact", "note"];
+  el.innerHTML = order
+    .filter((g) => groups[g])
+    .map((g) => `<span class="brain-legend-item">
+      <span class="brain-dot" style="background:${BRAIN_COLORS[g]}"></span>
+      ${BRAIN_GROUP_LABELS[g]} · ${groups[g]}
+    </span>`)
     .join("");
 }
-function _brainPalette() {
-  const colors = [
-    "#6C63FF", "#00D4FF", "#FF6B9D", "#FFD166",
-    "#06D6A0", "#EF476F", "#118AB2", "#073B4C",
-  ];
-  return (i) => colors[i % colors.length];
+
+function _brainFmtField(v) {
+  if (Array.isArray(v)) return v.join(", ");
+  if (v === true) return "так";
+  if (v === false) return "ні";
+  return String(v);
 }
-function _brainDraw() {
-  const canvas = document.getElementById("brain-canvas");
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  // R34-S57 (C-P2.3): the context is already scaled by DPR, so all
-  // draw math must use LOGICAL pixels (rect.width / rect.height),
-  // not the device-pixel buffer size (canvas.width / canvas.height).
-  // Otherwise everything renders at 2× position on Retina and orbs
-  // overshoot the visible canvas.
-  const rect = canvas.getBoundingClientRect();
-  const W = rect.width;
-  const H = rect.height;
-  // Background fade for trailing motion blur
-  ctx.fillStyle = "rgba(5, 6, 16, 0.18)";
-  ctx.fillRect(0, 0, W, H);
-  if (!_brainState.data) {
-    _brainState.raf = requestAnimationFrame(_brainDraw);
+
+async function _brainOpenNode(node) {
+  if (!node) return;
+  const d = document.getElementById("brain-drawer");
+  if (d) d.hidden = false;
+  document.getElementById("brain-drawer-kind").textContent = node.kind || node.group || "";
+  document.getElementById("brain-drawer-title").textContent = node.label || node.id;
+  document.getElementById("brain-drawer-sub").textContent = "Завантаження…";
+  document.getElementById("brain-drawer-tags").innerHTML = "";
+  document.getElementById("brain-drawer-fields").innerHTML = "";
+  document.getElementById("brain-drawer-content").textContent = "";
+  // Fly the camera to the clicked node.
+  try {
+    const G = _brain.graph;
+    const dist = 90;
+    const r = 1 + dist / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
+    G.cameraPosition({ x: (node.x || 0) * r, y: (node.y || 0) * r, z: (node.z || 0) * r }, node, 800);
+  } catch (_) {}
+  try {
+    const info = await api("/api/brain/node?id=" + encodeURIComponent(node.id));
+    document.getElementById("brain-drawer-kind").textContent = info.kind || "";
+    document.getElementById("brain-drawer-title").textContent = info.title || node.label;
+    document.getElementById("brain-drawer-sub").textContent = info.subtitle || "";
+    document.getElementById("brain-drawer-tags").innerHTML = (info.tags || [])
+      .map((t) => `<span class="chip">${escapeHtml(t)}</span>`).join("");
+    document.getElementById("brain-drawer-fields").innerHTML = Object.entries(info.fields || {})
+      .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(_brainFmtField(v))}</dd>`)
+      .join("");
+    document.getElementById("brain-drawer-content").textContent = info.content || "";
+  } catch (e) {
+    document.getElementById("brain-drawer-sub").textContent = "";
+    document.getElementById("brain-drawer-content").textContent = "Не вдалося завантажити вміст.";
+  }
+}
+function _brainCloseDrawer() {
+  const d = document.getElementById("brain-drawer");
+  if (d) d.hidden = true;
+}
+
+// ── live activity: particles along the links of whatever Jarvis uses
+const _BRAIN_CORE_TYPES = new Set([
+  "state", "wake_word", "stt_final", "sentence", "tts_start",
+  "bot_started_speaking", "dashboard_chat_reply", "direct_chat_reply",
+  "voice_inject", "hot_window",
+]);
+const _BRAIN_IGNORE_TYPES = new Set([
+  "pipecat_audio_rms", "heartbeat", "log", "vad",
+]);
+
+function _brainEventNodeIds(ev) {
+  const ids = [];
+  const t = ev.type || "";
+  if (ev.tool) ids.push("tool:" + ev.tool);
+  if (ev.skill) ids.push("skill:" + ev.skill);
+  if (ev.key) ids.push("fact:" + ev.key);
+  if (_BRAIN_CORE_TYPES.has(t)) ids.push("core");
+  return ids;
+}
+
+function _brainOnEvent(ev) {
+  const t = ev.type || "";
+  if (_BRAIN_IGNORE_TYPES.has(t)) return;
+  const chip = document.getElementById("brain-live");
+  if (chip) {
+    chip.textContent = ev.state ? `${t}: ${ev.state}` : t;
+    chip.classList.add("hot");
+    clearTimeout(_brain._chipT);
+    _brain._chipT = setTimeout(() => chip.classList.remove("hot"), 1200);
+  }
+  const G = _brain.graph;
+  if (!G || !_brain.built) return;
+  for (const id of _brainEventNodeIds(ev)) {
+    const ls = _brain.linksByNode[id];
+    if (!ls) continue;
+    let n = 0;
+    for (const l of ls) {
+      try { G.emitParticle(l); } catch (_) {}
+      if (++n >= 8) break;
+    }
+  }
+}
+
+function _brainConnectWS() {
+  if (_brain.socket && _brain.socket.readyState !== WebSocket.CLOSED) return;
+  const token = localStorage.getItem(TOKEN_KEY);
+  const url = new URL("/ws/events", window.location.href);
+  url.protocol = url.protocol.replace("http", "ws");
+  url.searchParams.set("token", token);
+  const sock = new WebSocket(url.toString());
+  _brain.socket = sock;
+  sock.addEventListener("open", () => { _brain.reconnectMs = 1000; });
+  sock.addEventListener("message", (e) => {
+    try { _brainOnEvent(JSON.parse(e.data)); } catch (_) {}
+  });
+  sock.addEventListener("close", () => {
+    const delay = _brain.reconnectMs;
+    _brain.reconnectMs = Math.min(_brain.reconnectMs * 2, 30000);
+    setTimeout(() => {
+      const active = document.getElementById("view-brain").classList.contains("active");
+      if (active && document.visibilityState !== "hidden") _brainConnectWS();
+    }, delay);
+  });
+}
+function _brainDisconnectWS() {
+  try { _brain.socket?.close(); } catch (_) {}
+  _brain.socket = null;
+  _brain.reconnectMs = 1000;
+}
+
+function _brainResize() {
+  if (!_brain.graph) return;
+  if (!document.getElementById("view-brain").classList.contains("active")) return;
+  const [w, h] = _brainSize();
+  try { _brain.graph.width(w).height(h); } catch (_) {}
+}
+window.addEventListener("resize", _brainResize);
+
+function _brainToggleSpin() {
+  const btn = document.getElementById("brain-spin");
+  if (_brain.spinTimer) {
+    clearInterval(_brain.spinTimer);
+    _brain.spinTimer = null;
+    btn?.classList.remove("active");
     return;
   }
-  const t = (performance.now() - _brainState.t0) / 1000;
-  const palette = _brainPalette();
-  const regions = _brainState.data.regions || [];
-  // Polar layout: regions evenly distributed around the centre,
-  // neurons stretched radially out from each region anchor.
-  const cx = W / 2, cy = H / 2;
-  regions.forEach((region, ri) => {
-    const angle = (ri / Math.max(1, regions.length)) * Math.PI * 2 - Math.PI / 2;
-    const r0 = Math.min(W, H) * 0.18;
-    const ax = cx + Math.cos(angle) * r0;
-    const ay = cy + Math.sin(angle) * r0;
-    const color = palette(ri);
-    const firing = Math.max(0, Math.min(1, region.firing_rate || 0));
-    const pulse = 0.55 + 0.45 * Math.sin(t * (1.5 + firing * 4) + ri);
-    // Region anchor: bigger glow on higher firing
-    ctx.beginPath();
-    const ar = 8 + firing * 16 + pulse * 6;
-    ctx.fillStyle = color;
-    ctx.globalAlpha = 0.85;
-    ctx.arc(ax, ay, ar, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 0.18;
-    ctx.arc(ax, ay, ar * 2.3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-    // Region label
-    ctx.fillStyle = "#aab0d4";
-    ctx.font = "12px ui-sans-serif, system-ui, -apple-system, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(region.label, ax, ay - ar - 8);
-    // Neurons radiating outward
-    const neurons = region.neurons || [];
-    const ringRadius = Math.min(W, H) * 0.28;
-    neurons.forEach((n, ni) => {
-      const spread = Math.PI * 0.7;
-      const localAngle = angle + ((ni - neurons.length / 2) / Math.max(1, neurons.length)) * spread;
-      const d = ringRadius * (0.6 + 0.4 * ((ni + ri) % 7) / 7);
-      const nx = ax + Math.cos(localAngle) * d * 0.6;
-      const ny = ay + Math.sin(localAngle) * d * 0.6;
-      // Connection line region→neuron
-      ctx.strokeStyle = color;
-      ctx.globalAlpha = 0.18;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(ax, ay);
-      ctx.lineTo(nx, ny);
-      ctx.stroke();
-      // Neuron dot
-      const w = Math.max(0.5, Math.min(3, n.weight || 1));
-      const flicker = 0.7 + 0.3 * Math.sin(t * 3 + ni * 0.6 + ri);
-      ctx.fillStyle = color;
-      ctx.globalAlpha = 0.6 + 0.4 * flicker;
-      ctx.beginPath();
-      ctx.arc(nx, ny, 2 + w * 0.8, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    ctx.globalAlpha = 1;
-  });
-  _brainState.raf = requestAnimationFrame(_brainDraw);
+  btn?.classList.add("active");
+  _brain.spinTimer = setInterval(() => {
+    const G = _brain.graph;
+    if (!G) return;
+    try {
+      const p = G.cameraPosition();
+      const r = Math.hypot(p.x, p.z) || 1;
+      const a = Math.atan2(p.x, p.z) + 0.0035;
+      G.cameraPosition({ x: r * Math.sin(a), z: r * Math.cos(a) });
+    } catch (_) {}
+  }, 33);
 }
 function startBrainView() {
-  // Resize canvas to actual pixel size so we get crisp rendering.
-  const canvas = document.getElementById("brain-canvas");
-  if (canvas) {
-    const rect = canvas.getBoundingClientRect();
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
-    // R34-S57 (C-P2.3): canvas DPR fix.
-    // The original code set ``canvas.width = rect.width * dpr``,
-    // applied ``ctx.scale(dpr, dpr)``, then IMMEDIATELY reset
-    // ``canvas.width = canvas.width / dpr`` — assigning to
-    // ``canvas.width`` RESETS the 2D context state (including the
-    // scale transform) and snaps the buffer back to logical
-    // pixels. Net effect: every byte of DPR work was thrown away
-    // and the canvas rendered at logical resolution, so orbs
-    // looked blurry on Retina + Hi-DPI displays.
-    //
-    // Correct pattern: set the backing-store size in device px,
-    // pin the CSS box to the logical px, scale the context ONCE.
-    canvas.width = Math.floor(rect.width * dpr);
-    canvas.height = Math.floor(rect.height * dpr);
-    canvas.style.width = `${rect.width}px`;
-    canvas.style.height = `${rect.height}px`;
-    canvas.getContext("2d").scale(dpr, dpr);
+  const G = _brainEnsureGraph();
+  if (!G) { _brainShowEmpty("3D-рушій не завантажився."); return; }
+  try { G.resumeAnimation && G.resumeAnimation(); } catch (_) {}
+  requestAnimationFrame(_brainResize);
+  if (!_brain.built) _brainFetch();
+  _brainConnectWS();
+  const refresh = document.getElementById("brain-refresh");
+  if (refresh && !refresh._wired) {
+    refresh._wired = true;
+    refresh.addEventListener("click", _brainFetch);
   }
-  _brainState.t0 = performance.now();
-  _fetchBrain();
-  if (_brainState.timer) clearInterval(_brainState.timer);
-  _brainState.timer = setInterval(_fetchBrain, 5000);
-  if (_brainState.raf) cancelAnimationFrame(_brainState.raf);
-  _brainState.raf = requestAnimationFrame(_brainDraw);
-  const btn = document.getElementById("brain-refresh");
-  if (btn && !btn._wired) {
-    btn._wired = true;
-    btn.addEventListener("click", _fetchBrain);
+  const spin = document.getElementById("brain-spin");
+  if (spin && !spin._wired) {
+    spin._wired = true;
+    spin.addEventListener("click", _brainToggleSpin);
+  }
+  const close = document.getElementById("brain-drawer-close");
+  if (close && !close._wired) {
+    close._wired = true;
+    close.addEventListener("click", _brainCloseDrawer);
   }
 }
 function stopBrainView() {
-  if (_brainState.timer) {
-    clearInterval(_brainState.timer);
-    _brainState.timer = null;
+  _brainDisconnectWS();
+  if (_brain.spinTimer) {
+    clearInterval(_brain.spinTimer);
+    _brain.spinTimer = null;
+    document.getElementById("brain-spin")?.classList.remove("active");
   }
-  if (_brainState.raf) {
-    cancelAnimationFrame(_brainState.raf);
-    _brainState.raf = null;
-  }
+  if (_brain._fitTimer) { clearInterval(_brain._fitTimer); _brain._fitTimer = null; }
+  try { _brain.graph?.pauseAnimation?.(); } catch (_) {}
 }
 
 // Boot

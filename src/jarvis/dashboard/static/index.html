@@ -7,7 +7,7 @@
     <meta name="theme-color" content="#6C63FF" />
     <meta name="description" content="Jarvis Control Room · Powered by Nexus Studio" />
     <title>Jarvis · Nexus Studio</title>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=R35-S33" />
+    <link rel="stylesheet" href="/dashboard/styles.css?v=R35-S34" />
     <!-- favicon: Nexus indigo→cyan gradient with stylised J -->
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236C63FF'/%3E%3Cstop offset='1' stop-color='%2300D4FF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='8' y='8' width='84' height='84' rx='20' fill='url(%23g)'/%3E%3Cpath d='M52 28 L52 62 Q52 74 40 74 Q28 74 28 62' stroke='%23fff' stroke-width='8' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
   </head>
@@ -464,22 +464,30 @@
         </div>
       </section>
 
-      <!-- view: brain (R34-S27) -->
+      <!-- view: brain (R34-S27 · 3D graph R35-S34) -->
       <section class="view" id="view-brain">
         <div class="view-toolbar">
-          <h2>Brain View</h2>
+          <h2>Brain Graph</h2>
           <div class="filters">
             <span id="brain-totals" class="subtle">—</span>
+            <span id="brain-live" class="brain-live" title="live activity">idle</span>
+            <button id="brain-spin" class="ghost" title="Toggle auto-rotate">◎ Spin</button>
             <button id="brain-refresh" class="ghost">⟳ Refresh</button>
           </div>
         </div>
-        <div class="card glass" id="brain-card">
-          <canvas id="brain-canvas" width="1200" height="600"
-                  style="display:block;width:100%;height:60vh;
-                         background: radial-gradient(ellipse at center,
-                           #0d0f1c 0%, #050610 100%);
-                         border-radius:12px;"></canvas>
+        <div class="brain-stage glass">
+          <div id="brain-graph" class="brain-graph"></div>
+          <div id="brain-empty" class="brain-empty" hidden></div>
           <div id="brain-legend" class="brain-legend"></div>
+          <aside id="brain-drawer" class="brain-drawer" hidden>
+            <button class="close-x" id="brain-drawer-close">×</button>
+            <span class="brain-drawer-kind" id="brain-drawer-kind">—</span>
+            <h3 id="brain-drawer-title">—</h3>
+            <div class="subtle brain-drawer-sub" id="brain-drawer-sub"></div>
+            <div class="brain-drawer-tags" id="brain-drawer-tags"></div>
+            <dl class="kv brain-drawer-fields" id="brain-drawer-fields"></dl>
+            <pre class="md brain-drawer-content" id="brain-drawer-content"></pre>
+          </aside>
         </div>
       </section>
 
@@ -501,6 +509,8 @@
       </footer>
     </div>
 
-    <script type="module" src="/dashboard/app.js?v=R35-S33"></script>
+    <!-- 3D knowledge-graph engine (bundles three.js); sets window.ForceGraph3D -->
+    <script src="/dashboard/vendor/3d-force-graph.min.js?v=1.80.0"></script>
+    <script type="module" src="/dashboard/app.js?v=R35-S34"></script>
   </body>
 </html>
