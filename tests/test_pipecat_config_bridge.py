@@ -101,9 +101,47 @@ def test_from_settings_clamps_endpoint_silence():
     # call endpoint).
     loop_short = from_settings(_make_cfg(endpoint_silence_ms=5))
     assert loop_short.vad_min_silence_ms == 150
-    # Insanely long → cap at 2s.
+    # Insanely long → cap at 5s. R34-S43 bumped the ceiling 2000→5000ms
+    # (user explicitly requested 2-3s pause-tolerance for thoughtful
+    # speech); this assertion was left stale at 2000 until R35-S26.
     loop_long = from_settings(_make_cfg(endpoint_silence_ms=10_000))
-    assert loop_long.vad_min_silence_ms == 2000
+    assert loop_long.vad_min_silence_ms == 5000
+
+
+def test_from_settings_wires_privacy_keywords_union():
+    """R35-S26 — config.json privacy_keywords must AUGMENT the built-in
+    defaults (union), never replace them, and never be silently dropped
+    (the dataclass-gap bug this test pins down: before R35-S26 the field
+    didn't exist on PipecatLoopConfig so getattr always hit the fallback
+    and the user's config terms never took effect)."""
+    from jarvis.nvidia_nim import DEFAULT_PRIVACY_KEYWORDS
+
+    loop = from_settings(_make_cfg(privacy_keywords=["AcmeCorp", "проект-X"]))
+    kw = set(loop.privacy_keywords)
+    # User's terms are present …
+    assert "AcmeCorp" in kw and "проект-X" in kw
+    # … AND every built-in security/default term survives the union.
+    assert set(DEFAULT_PRIVACY_KEYWORDS) <= kw
+
+
+def test_from_settings_privacy_defaults_when_config_empty():
+    """No privacy_keywords in config → the built-in defaults still apply
+    (gate can never be silently disabled)."""
+    from jarvis.nvidia_nim import DEFAULT_PRIVACY_KEYWORDS
+
+    # Built-in defaults are always a subset (from_settings also merges
+    # the machine's real config.json, which can only ADD terms).
+    loop = from_settings(_make_cfg())
+    assert set(DEFAULT_PRIVACY_KEYWORDS) <= set(loop.privacy_keywords)
+
+
+def test_from_settings_wires_nim_model():
+    """nvidia_nim_chat_model flows from config.json; falls back to the
+    canonical default when absent."""
+    loop = from_settings(_make_cfg(nvidia_nim_chat_model="meta/llama-3.1-8b-instruct"))
+    assert loop.nvidia_nim_chat_model == "meta/llama-3.1-8b-instruct"
+    loop_default = from_settings(_make_cfg())
+    assert loop_default.nvidia_nim_chat_model == "meta/llama-3.3-70b-instruct"
 
 
 def test_from_settings_falls_back_to_whisper_language():

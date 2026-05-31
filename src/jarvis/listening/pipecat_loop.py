@@ -187,6 +187,23 @@ class PipecatLoopConfig:
     # (RU vs UA) — same logic as legacy ``_sanitize_for_piper_uk``.
     active_language: str = "ru"
 
+    # Multi-provider cloud LLM (R35-S25/S26) -----------------------------------
+    # Privacy keyword gate: any user turn whose text contains one of
+    # these substrings skips ALL cloud tiers and routes straight to the
+    # EU Hetzner Ollama. ``from_settings`` populates this as the UNION of
+    # the built-in ``DEFAULT_PRIVACY_KEYWORDS`` and the user's
+    # ``config.json`` ``privacy_keywords`` — config AUGMENTS the defaults,
+    # it never replaces them, so built-in security terms (token / secret /
+    # password / GoBD …) always apply even if the user lists only
+    # client-specific names. The empty default here is intentional: the
+    # runtime gate in ``_call_ollama`` falls back to
+    # ``DEFAULT_PRIVACY_KEYWORDS`` whenever this tuple is empty, so the
+    # privacy gate can never be silently disabled by a misconfig.
+    privacy_keywords: tuple[str, ...] = ()
+    # NIM tier model id (tier 3 of the ladder). Read from config.json so
+    # the NVIDIA model can be switched without a code change.
+    nvidia_nim_chat_model: str = "meta/llama-3.3-70b-instruct"
+
     # Misc fields filled at runtime by ``from_settings``.
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -354,6 +371,32 @@ def from_settings(cfg) -> PipecatLoopConfig:
     except Exception:
         _raw_cfg = {}
     _piper_voice_override = _raw_cfg.get("piper_voice")
+    # R35-S26: wire the privacy gate + NIM model id off the raw config.
+    # The voice tier ladder reads these from the cfg object; without
+    # populating them here ``getattr(cfg, …)`` silently used hardcoded
+    # fallbacks ALWAYS and the user's config.json values never took
+    # effect (same dataclass-gap bug the chat_num_predict comment above
+    # describes). UNION the user's privacy_keywords with the built-in
+    # defaults so adding client-specific terms AUGMENTS — never removes —
+    # the built-in security keywords. ``dict.fromkeys`` dedups while
+    # preserving order.
+    try:
+        from ..nvidia_nim import DEFAULT_PRIVACY_KEYWORDS as _DPK
+    except Exception:
+        _DPK = ()
+    # Prefer the Settings object (so tests can inject via from_settings)
+    # then the raw merged config.json (the daemon path — Settings is a
+    # frozen dataclass that doesn't declare these newer keys), then the
+    # built-in defaults.
+    _cfg_priv = getattr(cfg, "privacy_keywords", None)
+    if not _cfg_priv:
+        _cfg_priv = _raw_cfg.get("privacy_keywords") or []
+    _priv_union = tuple(dict.fromkeys(list(_DPK) + list(_cfg_priv)))
+    _nim_model = str(
+        getattr(cfg, "nvidia_nim_chat_model", None)
+        or _raw_cfg.get("nvidia_nim_chat_model")
+        or "meta/llama-3.3-70b-instruct"
+    )
     return PipecatLoopConfig(
         input_device_index=resolved_in_idx,
         output_device_index=getattr(cfg, "output_device_index", None),
@@ -381,6 +424,8 @@ def from_settings(cfg) -> PipecatLoopConfig:
         vad_threshold=vad_threshold,
         vad_min_silence_ms=silence_ms,
         active_language=lang,
+        privacy_keywords=_priv_union,
+        nvidia_nim_chat_model=_nim_model,
         extra={
             "voice_engine": getattr(cfg, "voice_engine", "legacy"),
             "remote_whisper_url": getattr(cfg, "whisper_remote_url", ""),
@@ -2321,8 +2366,12 @@ def _make_direct_chat_processor(cfg: "PipecatLoopConfig"):
             try:
                 from ..llm_providers import call_tier_ladder
                 from ..nvidia_nim import _is_privacy_sensitive, DEFAULT_PRIVACY_KEYWORDS
+                # ``or DEFAULT_PRIVACY_KEYWORDS`` is the safety net: even if
+                # cfg carries an empty tuple (older dataclass / misconfig),
+                # the gate falls back to the built-in keyword set rather
+                # than treating every turn as non-private.
                 privacy_terms = tuple(
-                    getattr(cfg, "privacy_keywords", DEFAULT_PRIVACY_KEYWORDS)
+                    getattr(cfg, "privacy_keywords", None) or DEFAULT_PRIVACY_KEYWORDS
                 )
                 if _is_privacy_sensitive(text, privacy_terms):
                     debug_log(
