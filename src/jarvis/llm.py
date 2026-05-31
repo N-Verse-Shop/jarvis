@@ -40,6 +40,11 @@ class ToolsNotSupportedError(Exception):
 _VALIDATED_URLS: set[str] = set()
 _HOSTNAME_ALLOW_LIST = frozenset({
     "localhost", "ollama", "ollama.local",
+    # R35-S23: NVIDIA NIM API — public LLM endpoint, verified by
+    # tier-1 inference platform identity. We allowlist by exact host
+    # name (not wildcard) so a typo'd subdomain (e.g.
+    # ``integrate-api.nvidia.com`` with a hyphen) still fails closed.
+    "integrate.api.nvidia.com",
 })
 
 
